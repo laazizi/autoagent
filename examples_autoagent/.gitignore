@@ -1,0 +1,4 @@
+# Artefacts produits par les démos à l'exécution
+outils_generes/
+trace_demo.jsonl
+__pycache__/
