@@ -1,0 +1,14 @@
+2026-07-08 09:01:12 INFO  server started on :8080
+2026-07-08 09:01:45 INFO  user alice logged in
+2026-07-08 09:02:03 ERROR database connection timeout
+2026-07-08 09:02:10 INFO  retrying connection
+2026-07-08 09:02:31 ERROR database connection timeout
+2026-07-08 09:03:02 WARN  slow query (1.9s) on /api/orders
+2026-07-08 09:03:40 ERROR payment gateway returned 502
+2026-07-08 09:04:11 INFO  user bob logged in
+2026-07-08 09:04:55 ERROR database connection timeout
+2026-07-08 09:05:20 INFO  cache warmed
+2026-07-08 09:06:37 ERROR payment gateway returned 502
+2026-07-08 09:07:02 INFO  user alice logged out
+2026-07-08 09:08:19 ERROR invalid session token for user carol
+2026-07-08 09:09:00 INFO  nightly export finished

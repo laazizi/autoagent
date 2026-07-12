@@ -1,4 +1,6 @@
 # Artefacts produits par les démos à l'exécution
 outils_generes/
 trace_demo.jsonl
+trace_rdv.jsonl
+memoire_demo/
 __pycache__/

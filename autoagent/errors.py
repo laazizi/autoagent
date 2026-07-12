@@ -1,6 +1,8 @@
 __all__ = [
     "AgentCancelled",
+    "ApprovalRequired",
     "AutoAgentError",
+    "MCPError",
     "MaxStepsExceeded",
     "ProviderError",
     "TokenBudgetExceeded",
@@ -45,6 +47,33 @@ class ProviderError(AutoAgentError):
         super().__init__(message)
         self.status_code = status_code
         self.retryable = retryable
+
+
+class ApprovalRequired(AutoAgentError):
+    """Raised BY a ``tool_policy`` hook to pause the run for human approval.
+
+    The agent loop catches it before ANY tool of the turn has executed,
+    attaches a resumable snapshot, and re-raises to the host:
+
+    Attributes (attached by the loop):
+        state: ``RunState`` snapshot — feed it to ``Agent.resume`` once
+            the human has decided. On resume the pending tool calls go
+            through the policy AGAIN: an unapproved call pauses again
+            (idempotent), a rejected one should get a ``str`` verdict so
+            the model sees the refusal and re-plans.
+        calls: The turn's pending ``ToolCall`` list (nothing executed).
+    """
+
+
+class MCPError(AutoAgentError):
+    """Raised when an MCP server interaction fails.
+
+    Covers transport failures (server not launchable, closed pipe,
+    response timeout) and JSON-RPC error responses (the code and message
+    are included in the text). A tool result flagged ``isError`` is NOT
+    an ``MCPError`` — it raises ``ToolError`` so the registry surfaces
+    it to the LLM as an ordinary tool error.
+    """
 
 
 class ToolError(AutoAgentError):

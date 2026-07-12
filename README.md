@@ -78,16 +78,47 @@ someone else's abstraction stack instead of your own code.
 | **`token_budget`** | hard cap on a run's cumulative token usage (`TokenBudgetExceeded`); per-call `TokenUsage` on results and `done` events — never invented, only what the provider reports |
 | **`parallel_tool_calls`** | opt-in: multiple tool calls in one turn execute on a thread pool (I/O-bound latency win), transcript order stays deterministic |
 | **`Orchestrator`** | for host-driven flows (guided forms, CATI questionnaires): *your* state machine decides every step; the LLM only interprets answers and rephrases prompts |
+| **`MCPClient`** | mount any MCP server's tools as ordinary agent tools (stdio transport, zero dependencies): `mcp.mount(agent, prefix=, include=)` — server schemas validated by the registry before every call |
+| **`OTelTraceExporter`** | the trace tree becomes real OpenTelemetry spans (`agent.run → llm → tool.<name>`) for Jaeger / Tempo / Langfuse / Phoenix; `opentelemetry-api` is an *optional* extra, the core stays dependency-free |
+| **`RunState` + `resume`** | durable runs: a JSON checkpoint after every completed step; resume after a crash, a restart, or past a raised `max_steps` / `token_budget` (`exc.state` is ready to resume) |
+| **`tool_policy`** | one hook for allow / deny / **human approval** / quota-audit, checked for every tool call *before* any side effect; a crashing policy denies (fail-closed); `ApprovalRequired` pauses the run with a resumable snapshot |
 | **`EvolutionRuntime`** | let an agent modify a live project: read state, propose a module, run validation, roll back on failure |
 
 ## Quickstart
 
 ```bash
+pip install autoagent-core            # installs as `import autoagent`
+# or from source:
 git clone <this-repo>
 cd autoagent
 pip install jsonschema        # the core's only extra; examples may need more
 export GEMINI_API_KEY=...     # or OPENAI_API_KEY / ANTHROPIC_API_KEY / DEEPSEEK_API_KEY
+python examples/demo_autoagent.py      # the demo below (French prompts/comments)
 ```
+
+The demo that carries the argument — one scenario, two files:
+
+**[`examples/demo_autoagent.py`](examples/demo_autoagent.py)** (55 lines of code) is a
+**three-agent hierarchy**: an orchestrator delegates two log files to two specialist
+agents (`as_tool()`), **cross-checks their findings against each other** (each
+gateway-502 server error must match one FAILED payment), audits the raw files with its
+own tools when in doubt, then **saves its validated report through a `ProjectWorkspace`**
+fenced to `_out/` + markdown only. The whole delegation tree lands in one trace file via
+a shared `TraceEmitter` — and the script ends by proving the fence deterministically,
+attempting what an agent might: `../demo_autoagent.py` → *Path escapes workspace*,
+`virus.exe` → *extension blocked*, `C:/Windows/x.md` → *absolute paths not allowed*.
+Boundaries you can demo, because they're code.
+
+**[`examples/demo_pure_python.py`](examples/demo_pure_python.py)** (164 lines of code) is
+the **same system with no library** — same model, same three agents, same validated
+answer. Everything the library did for free, hand-rolled and annotated: the generic agent
+loop, every tool schema, the provider wire format + retries, delegation with its failure
+contract, the write fence, and a trace tree (without secret redaction).
+
+| same behavior, same answer | with autoagent | pure Python |
+|---|---|---|
+| lines of code | **55** | **164** |
+| …that you must maintain per provider | no (4 providers included) | yes |
 
 ### A tool-using agent with memory, tracing, and a verification hook
 
@@ -169,6 +200,75 @@ supervisor.add_tool(expert.as_tool(
 agent = Agent(provider, token_budget=50_000)   # hard cap per run — TokenBudgetExceeded beyond
 result = agent.run("…")
 print(result.usage.total_tokens)               # provider-reported, never invented
+```
+
+### Mount an MCP server's tools (two lines)
+
+The entire MCP tool ecosystem, without wrappers — the server runs as a local
+subprocess (stdio) and each of its tools becomes a regular autoagent tool,
+validated against the server's own JSON Schema before anything is sent:
+
+```python
+from autoagent import MCPClient
+
+with MCPClient(["npx", "-y", "@modelcontextprotocol/server-filesystem", "."]) as mcp:
+    mcp.mount(agent, prefix="fs_", include={"read_text_file", "list_directory"})
+    agent.run("List the project files and summarize the README.")
+# isError results surface as tool errors (the model reacts, nothing crashes);
+# transport failures raise MCPError with the server's stderr attached.
+# Prefer include={...}: mounting 3 precise tools beats mounting 40.
+```
+
+### Survive crashes: checkpoint / resume
+
+```python
+import json, pathlib
+from autoagent import RunState
+
+CKPT = pathlib.Path("run_state.json")
+result = agent.run(mission, checkpoint=lambda s: CKPT.write_text(json.dumps(s.to_dict())))
+
+# …process died? restart and continue where it stopped:
+state = RunState.from_dict(json.loads(CKPT.read_text()))
+result = agent.resume(state)
+
+# Budget ran out mid-run? The exception carries a ready-to-resume snapshot:
+# except TokenBudgetExceeded as exc: agent.token_budget *= 2; agent.resume(exc.state)
+```
+
+### Approval gates: pause on sensitive tools, resume after a human decides
+
+```python
+from autoagent import Agent, ApprovalRequired
+
+def policy(ctx):                                   # every tool call passes here first
+    if "filesystem.write" not in (ctx.spec.permissions if ctx.spec else []):
+        return None                                # allow
+    if ctx.call.id not in approvals:               # your store, keyed by call id
+        raise ApprovalRequired(f"{ctx.call.name}({ctx.call.arguments})")
+
+agent = Agent(provider, tool_policy=policy)
+try:
+    result = agent.run("Clean up the old logs.")
+except ApprovalRequired as exc:
+    save(exc.state.to_dict())                      # nothing executed yet — resumable JSON
+    notify_operator(exc.calls)
+# …operator approves → agent.resume(state) runs the tool exactly once and finishes.
+# Return a str from the policy to DENY with a reason the model can react to.
+# A crashing policy DENIES (fail-closed): this hook is a security boundary.
+```
+
+### See your runs in Jaeger / Langfuse (OpenTelemetry)
+
+```python
+from autoagent import TraceEmitter, OTelTraceExporter   # pip install autoagent[otel]
+
+with OTelTraceExporter() as exporter:                     # uses the global OTel tracer
+    trace = TraceEmitter(file="trace.jsonl", on_event=exporter)   # JSONL + OTel spans
+    agent = Agent(provider, trace=trace)
+    agent.run("…")
+# agent.run → llm → tool.<name>, with durations, statuses and redacted payloads.
+# A broken OTel backend can never break the agent loop.
 ```
 
 ## Recipes
@@ -297,9 +397,12 @@ excellent at what they do:
 | **Observability** | typed trace events + **built-in secret redaction**, zero deps | LangSmith (SaaS) | ext. | ext. | OpenAI tracing | basic |
 | **Streaming** | ✅ sync iterators (`run_stream`, text deltas + tool events, SSE in all providers) | ✅ | ✅ | ✅ | ✅ | partial |
 | **Async (asyncio)** | ❌ sync by design — wrap with threads (`asyncio.to_thread`) | ✅ | ✅ | ✅ | ✅ | partial |
-| **Multi-agent** | ✅ minimal primitive: `agent.as_tool()` (supervisor → specialist delegation, shared trace tree); no crew/choreography DSL | ✅ graphs | ✅ core feature | ✅ core feature | ✅ handoffs | ❌ |
+| **Multi-agent** | ✅ minimal primitive: `agent.as_tool()` (supervisor → specialist delegation, shared trace tree); no crew/choreography DSL | ✅ graphs | ✅ core feature | ✅ core feature | ✅ handoffs | ✅ `managed_agents` (hierarchical) |
 | **Memory / RAG** | buffer + **incremental summarizing memory** + lexical recall built-in; vector store = bring your own (2-method protocol) | ✅ full RAG stack | ✅ | partial | partial | partial |
 | **Multi-provider routing** | ✅ per-request (text → cheap model, images → vision model) | via config | via LiteLLM | via config | ❌ OpenAI-first | via LiteLLM |
+| **MCP tools** | ✅ zero-dep stdio client, server schemas validated locally | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Durable runs (checkpoint/resume)** | ✅ JSON `RunState` per step, `resume()` after crash or raised budget | ✅ LangGraph checkpointers | ✅ Flows `@persist` | partial (state save/load) | ✅ `RunState` to/from JSON + HITL interruptions | ❌ |
+| **OpenTelemetry export** | ✅ optional extra, spans mirror the trace tree | via ext. | via ext. | ✅ | via ext. (tracing processors) | ✅ via openinference |
 | **Best when** | you want to **own and audit** the loop; embed agents in an existing app; strict tool bounding | you want the ecosystem | role-played crews fast | conversational multi-agent research | you're all-in on OpenAI | HF ecosystem, code agents |
 
 ### When you should NOT use autoagent
@@ -330,7 +433,7 @@ that's the niche this library is built for.
 ## Project status
 
 Used in production internally (survey/phone-bot supervision at Alyce). API surface is
-small and stable; version-tagged features are documented in [the developer guide](../autoagent-dev-doc.md).
+small and stable; version-tagged features are documented in [the developer guide](autoagent-dev-doc.md).
 Contributions welcome — especially provider adapters, `Memory` backends, and sandbox hardening.
 
 ## License

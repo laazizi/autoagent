@@ -13,13 +13,24 @@ calls are stateless and can be issued concurrently.
 
 from __future__ import annotations
 
-__version__ = "0.9.0"
+__version__ = "0.11.0"
 
-from .agent import Agent, AgentResult, AgentTurnContext, PostTurnHook
+from .agent import (
+    Agent,
+    AgentResult,
+    AgentTurnContext,
+    CheckpointHook,
+    PostTurnHook,
+    RunState,
+    ToolPolicy,
+    ToolPolicyContext,
+)
 from .dynamic import DynamicToolBuilder, ToolBuildRequest
 from .errors import (
     AgentCancelled,
+    ApprovalRequired,
     AutoAgentError,
+    MCPError,
     MaxStepsExceeded,
     TokenBudgetExceeded,
     ProviderError,
@@ -28,7 +39,9 @@ from .errors import (
 )
 from .evolution import EVOLUTION_CAPABILITIES, EvolutionRuntime, enable_software_evolution
 from .logging import get_logger
+from .mcp import MCPClient
 from .memory import BufferMemory, Memory, SummarizingMemory
+from .otel import OTelTraceExporter
 from .orchestrator import (
     InterpretOutcome,
     Orchestrator,
@@ -68,9 +81,12 @@ __all__ = [
     "AgentCancelled",
     "AgentResult",
     "AgentTurnContext",
+    "ApprovalRequired",
     "AnthropicProvider",
     "AutoAgentError",
     "BufferMemory",
+    "CheckpointHook",
+    "RunState",
     "SummarizingMemory",
     "DeepSeekProvider",
     "DynamicToolBuilder",
@@ -81,11 +97,14 @@ __all__ = [
     "LLMResponse",
     "ImageAttachment",
     "InterpretOutcome",
+    "MCPClient",
+    "MCPError",
     "MaxStepsExceeded",
     "TokenBudgetExceeded",
     "Memory",
     "Message",
     "ModelConfig",
+    "OTelTraceExporter",
     "OnEvent",
     "OpenAIProvider",
     "Orchestrator",
@@ -102,6 +121,8 @@ __all__ = [
     "ToolBuildRequest",
     "ToolCall",
     "ToolError",
+    "ToolPolicy",
+    "ToolPolicyContext",
     "ToolRegistry",
     "ToolSpec",
     "ToolValidationError",

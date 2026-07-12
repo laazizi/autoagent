@@ -1,0 +1,1391 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Constructeur autoagent — assemble ton agent, récupère le code Python</title>
+<style>
+  /* ── Type : choix délibéré de stacks système (aucune police CDN, aucun
+       fallback silencieux). Grotesque système pour l'UI, mono native pour
+       tout ce qui est code — cohérent avec un outil de dev. ── */
+  :root{
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "Cascadia Code", "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+
+    /* Neutres biaisés bleu (choisis, pas hérités) */
+    --bg:        #10131c;
+    --panel:     #171b28;
+    --panel-2:   #1e2333;
+    --line:      #2b3145;
+    --line-soft: #232838;
+    --ink:       #e8ebf4;
+    --ink-soft:  #a3abc2;
+    --ink-faint: #6b7488;
+
+    /* Couleurs de catégorie = carte des modules (teintes bijou sourdes, même famille) */
+    --c-core:  #6172f3;  /* Agent — la colonne vertébrale */
+    --c-tool:  #d9922b;  /* Outils */
+    --c-safe:  #35a86e;  /* Workspace — les garde-fous */
+    --c-mem:   #9b6cf2;  /* Mémoire */
+    --c-trace: #33a0c4;  /* Trace — observabilité */
+    --c-multi: #d75a86;  /* Sous-agent — multi-agent */
+    --c-hook:  #e07b3c;  /* Vérification */
+    --c-flow:  #5b7a99;  /* Orchestrator — flux piloté par l'hôte */
+    --c-run:   #17a89a;  /* Lancer */
+
+    --shadow: 0 1px 0 rgba(255,255,255,.03), 0 10px 30px rgba(0,0,0,.35);
+    --radius: 12px;
+  }
+  @media (prefers-color-scheme: light){
+    :root{
+      --bg:#eef0f5; --panel:#ffffff; --panel-2:#f4f6fb; --line:#d5dae6;
+      --line-soft:#e4e8f1; --ink:#1a1f2e; --ink-soft:#4b5468; --ink-faint:#8892a6;
+      --shadow: 0 1px 2px rgba(20,25,40,.06), 0 12px 28px rgba(30,40,70,.10);
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#10131c; --panel:#171b28; --panel-2:#1e2333; --line:#2b3145;
+    --line-soft:#232838; --ink:#e8ebf4; --ink-soft:#a3abc2; --ink-faint:#6b7488;
+    --shadow: 0 1px 0 rgba(255,255,255,.03), 0 10px 30px rgba(0,0,0,.35);
+  }
+  :root[data-theme="light"]{
+    --bg:#eef0f5; --panel:#ffffff; --panel-2:#f4f6fb; --line:#d5dae6;
+    --line-soft:#e4e8f1; --ink:#1a1f2e; --ink-soft:#4b5468; --ink-faint:#8892a6;
+    --shadow: 0 1px 2px rgba(20,25,40,.06), 0 12px 28px rgba(30,40,70,.10);
+  }
+
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:var(--sans); font-size:14px; line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+  }
+  h1,h2,h3{margin:0; text-wrap:balance}
+  button{font-family:inherit; cursor:pointer}
+  a{color:var(--c-core)}
+
+  /* ── En-tête ── */
+  header{
+    display:flex; align-items:center; gap:16px; flex-wrap:wrap;
+    padding:14px 20px; border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg, var(--panel), var(--panel-2));
+  }
+  .brand{display:flex; align-items:baseline; gap:12px; margin-right:auto}
+  .brand .logo{
+    font-family:var(--mono); font-weight:700; letter-spacing:-.5px;
+    font-size:19px; color:var(--ink);
+    padding:3px 9px; border:1px solid var(--line); border-radius:8px;
+    background:var(--bg);
+  }
+  .brand .logo b{color:var(--c-core)}
+  .brand .tag{color:var(--ink-soft); font-size:13px}
+  .toolbar{display:flex; gap:8px; flex-wrap:wrap; align-items:center}
+  .btn{
+    background:var(--panel-2); color:var(--ink); border:1px solid var(--line);
+    padding:7px 12px; border-radius:8px; font-size:13px; font-weight:600;
+    transition:border-color .15s, background .15s, transform .05s;
+  }
+  .btn:hover{border-color:var(--ink-faint)}
+  .btn:active{transform:translateY(1px)}
+  .btn.primary{background:var(--c-core); border-color:var(--c-core); color:#fff}
+  .btn.ghost{background:transparent}
+  .btn:focus-visible, .chip:focus-visible, .field :focus-visible, .paletteItem:focus-visible{
+    outline:2px solid var(--c-core); outline-offset:2px;
+  }
+  .sel-theme{display:flex; gap:2px; border:1px solid var(--line); border-radius:8px; overflow:hidden}
+  .sel-theme button{background:var(--panel-2); border:0; padding:7px 10px; font-size:12px; color:var(--ink-soft)}
+  .sel-theme button[aria-pressed="true"]{background:var(--c-core); color:#fff}
+  .menu-wrap{position:relative}
+  #preset-btn{white-space:nowrap}
+  .menu{
+    position:absolute; top:calc(100% + 4px); left:0; z-index:150;
+    min-width:250px; max-height:70vh; overflow-y:auto;
+    background:var(--panel); border:1px solid var(--line); border-radius:10px;
+    box-shadow:var(--shadow); padding:6px; display:none;
+  }
+  .menu.open{display:block}
+  .menu-item{
+    display:block; width:100%; text-align:left; background:transparent; border:0;
+    color:var(--ink); padding:8px 10px; border-radius:7px; font-size:13px; font-weight:600;
+    white-space:nowrap;
+  }
+  .menu-item:hover, .menu-item:focus-visible{background:var(--panel-2); outline:none}
+
+  /* ── Grille principale ── */
+  main{
+    display:grid; grid-template-columns:270px minmax(320px,1fr) minmax(340px,1fr);
+    gap:0; height:calc(100vh - 61px); min-height:480px;
+  }
+  .col{display:flex; flex-direction:column; min-width:0; min-height:0}
+  .col + .col{border-left:1px solid var(--line)}
+  .col-head{
+    padding:12px 16px; border-bottom:1px solid var(--line-soft);
+    display:flex; align-items:center; gap:8px; flex-shrink:0;
+  }
+  .col-head h2{font-size:12px; letter-spacing:.09em; text-transform:uppercase; color:var(--ink-soft); font-weight:700}
+  .col-head .hint{font-size:11.5px; color:var(--ink-faint); margin-left:auto}
+  .col-body{overflow-y:auto; padding:14px; flex:1; min-height:0}
+
+  /* ── Palette ── */
+  .cat{margin-bottom:16px}
+  .cat h3{
+    font-size:11px; letter-spacing:.08em; text-transform:uppercase;
+    color:var(--ink-faint); font-weight:700; margin-bottom:8px; padding-left:2px;
+  }
+  .paletteItem{
+    display:flex; align-items:center; gap:10px; width:100%; text-align:left;
+    background:var(--panel-2); border:1px solid var(--line); border-left:4px solid var(--cat);
+    border-radius:9px; padding:9px 11px; margin-bottom:7px; color:var(--ink);
+    transition:transform .06s, border-color .15s, box-shadow .15s;
+  }
+  .paletteItem:hover{border-color:var(--cat); box-shadow:0 3px 12px rgba(0,0,0,.18)}
+  .paletteItem:active{cursor:grabbing}
+  .paletteItem[aria-disabled="true"]{opacity:.4; pointer-events:none}
+  .paletteItem .pi-name{font-weight:700; font-size:13px}
+  .paletteItem .pi-sub{font-size:11px; color:var(--ink-faint); display:block; margin-top:1px}
+  .paletteItem .dot{width:9px; height:9px; border-radius:50%; background:var(--cat); flex-shrink:0}
+  .paletteItem .txt{min-width:0}
+  .wire-note{
+    font-size:11.5px; color:var(--ink-soft); background:var(--panel-2);
+    border:1px dashed var(--line); border-radius:9px; padding:10px 12px; line-height:1.55;
+  }
+  .wire-note b{color:var(--ink)}
+
+  /* Icône info + infobulle */
+  .pi-wrap{position:relative}
+  .pi-wrap .paletteItem{padding-right:30px}
+  .pi-info{
+    position:absolute; top:8px; right:9px; width:17px; height:17px; border-radius:50%;
+    display:grid; place-items:center; font-size:11px; font-weight:700; font-family:var(--mono);
+    color:var(--ink-faint); border:1px solid var(--line); background:var(--bg); cursor:help; z-index:3;
+    transition:color .12s, background .12s, border-color .12s;
+  }
+  .pi-info:hover, .pi-info:focus-visible{color:#fff; background:var(--cat); border-color:var(--cat); outline:none}
+  #tt{
+    position:fixed; z-index:200; max-width:264px; background:var(--panel); color:var(--ink);
+    border:1px solid var(--line); border-left:3px solid var(--cat); border-radius:10px;
+    padding:11px 13px; box-shadow:var(--shadow); font-size:12px; line-height:1.5;
+    opacity:0; pointer-events:none; transition:opacity .12s;
+  }
+  #tt.show{opacity:1}
+  #tt b{display:block; font-size:12.5px; margin-bottom:2px; color:var(--ink)}
+  #tt .api{display:block; font-family:var(--mono); font-size:10.5px; color:var(--cat); margin-bottom:7px; word-break:break-word}
+  #tt p{margin:0; color:var(--ink-soft)}
+
+  /* ── Canvas / stack ── */
+  #stack{display:flex; flex-direction:column; gap:0; min-height:100%}
+  .drop-empty{
+    border:2px dashed var(--line); border-radius:var(--radius);
+    padding:34px 20px; text-align:center; color:var(--ink-faint); font-size:13px;
+  }
+  .drop-empty strong{color:var(--ink-soft); display:block; margin-bottom:4px; font-size:14px}
+  .insert-line{height:0; border-top:2px solid var(--c-core); margin:4px 2px; border-radius:2px}
+
+  .block{
+    background:var(--panel); border:1px solid var(--line);
+    border-left:5px solid var(--cat); border-radius:var(--radius);
+    margin-bottom:12px; box-shadow:var(--shadow); overflow:hidden;
+  }
+  .block.dragging{opacity:.5}
+  .block-head{
+    display:flex; align-items:center; gap:9px; padding:9px 11px;
+    background:linear-gradient(90deg, color-mix(in srgb, var(--cat) 14%, transparent), transparent 70%);
+    border-bottom:1px solid var(--line-soft);
+  }
+  .grip{cursor:grab; color:var(--ink-faint); font-size:15px; line-height:1; padding:2px; letter-spacing:-2px}
+  .grip:active{cursor:grabbing}
+  .block-head .b-name{font-weight:700; font-size:13.5px}
+  .block-head .b-cat{
+    font-family:var(--mono); font-size:10.5px; color:var(--cat);
+    border:1px solid color-mix(in srgb, var(--cat) 45%, var(--line));
+    padding:1px 6px; border-radius:20px; font-weight:600;
+  }
+  .block-head .b-actions{margin-left:auto; display:flex; gap:3px}
+  .icon-btn{
+    background:transparent; border:1px solid transparent; color:var(--ink-faint);
+    border-radius:6px; width:26px; height:26px; font-size:14px; line-height:1;
+    display:grid; place-items:center;
+  }
+  .icon-btn:hover{background:var(--panel-2); color:var(--ink); border-color:var(--line)}
+  .icon-btn.danger:hover{color:#ff6b6b}
+  .block-body{padding:11px 12px; display:grid; gap:10px}
+  .field{display:flex; flex-direction:column; gap:4px}
+  .field.row{flex-direction:row; align-items:center; gap:8px}
+  .field label{font-size:11px; color:var(--ink-soft); font-weight:600; letter-spacing:.02em}
+  .field .f-hint{font-size:10.5px; color:var(--ink-faint)}
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:10px}
+  .grid3{display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px}
+  input[type=text], input[type=number], textarea, select{
+    background:var(--bg); color:var(--ink); border:1px solid var(--line);
+    border-radius:7px; padding:7px 9px; font-size:12.5px; font-family:var(--mono);
+    width:100%; resize:vertical;
+  }
+  input:focus, textarea:focus, select:focus{outline:2px solid var(--c-core); outline-offset:0; border-color:var(--c-core)}
+  textarea{line-height:1.45; min-height:56px}
+  .field.check{flex-direction:row; align-items:center; gap:8px}
+  .field.check input{width:auto}
+  .field.check label{font-size:12.5px; color:var(--ink)}
+
+  /* ── Code ── */
+  .code-wrap{flex:1; min-height:0; display:flex; flex-direction:column}
+  .code-scroll{flex:1; overflow:auto; min-height:0}
+  pre#code{
+    margin:0; padding:16px 18px; font-family:var(--mono); font-size:12.5px;
+    line-height:1.65; tab-size:4; white-space:pre; color:var(--ink);
+  }
+  .tok-kw{color:#c678dd} .tok-str{color:#98c379} .tok-com{color:var(--ink-faint); font-style:italic}
+  .tok-num{color:#d19a66} .tok-dec{color:#e5c07b} .tok-def{color:#61afef} .tok-cls{color:#e5c07b}
+  @media (prefers-color-scheme: light){
+    .tok-kw{color:#a626a4} .tok-str{color:#3a8a1f} .tok-num{color:#b26a00}
+    .tok-dec{color:#986801} .tok-def{color:#3a6dd0} .tok-cls{color:#986801}
+  }
+  :root[data-theme="light"] .tok-kw{color:#a626a4}
+  :root[data-theme="light"] .tok-str{color:#3a8a1f}
+  :root[data-theme="light"] .tok-num{color:#b26a00}
+  :root[data-theme="light"] .tok-dec{color:#986801}
+  :root[data-theme="light"] .tok-def{color:#3a6dd0}
+  :root[data-theme="light"] .tok-cls{color:#986801}
+  :root[data-theme="dark"] .tok-kw{color:#c678dd}
+  :root[data-theme="dark"] .tok-str{color:#98c379}
+
+  .run-cmd{
+    padding:9px 16px; border-top:1px solid var(--line-soft); background:var(--panel-2);
+    font-family:var(--mono); font-size:11.5px; color:var(--ink-soft);
+    display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+  }
+  .run-cmd .k{color:var(--c-safe); font-weight:700}
+  .toast{
+    position:fixed; bottom:20px; left:50%; transform:translateX(-50%) translateY(20px);
+    background:var(--ink); color:var(--bg); padding:9px 16px; border-radius:8px;
+    font-weight:600; font-size:13px; opacity:0; pointer-events:none; transition:.25s;
+  }
+  .toast.show{opacity:1; transform:translateX(-50%) translateY(0)}
+
+  @media (max-width:1000px){
+    main{grid-template-columns:1fr; height:auto}
+    .col + .col{border-left:0; border-top:1px solid var(--line)}
+    .col-body{max-height:none}
+    .code-scroll{max-height:60vh}
+  }
+  @media (prefers-reduced-motion: reduce){ *{transition:none !important} }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="logo">auto<b>agent</b></span>
+    <span class="tag">Constructeur visuel — assemble des blocs, récupère le code Python</span>
+  </div>
+  <div class="toolbar">
+    <div class="menu-wrap">
+      <button class="btn ghost" id="preset-btn" aria-haspopup="true" aria-expanded="false">Charger un exemple ▾</button>
+      <div class="menu" id="preset-menu" role="menu"></div>
+    </div>
+    <button class="btn ghost" id="clear">Vider</button>
+    <button class="btn" id="copy">Copier le code</button>
+    <button class="btn primary" id="download">Télécharger .py</button>
+    <div class="sel-theme" role="group" aria-label="Thème">
+      <button id="th-light" aria-pressed="false">Clair</button>
+      <button id="th-dark" aria-pressed="false">Sombre</button>
+    </div>
+  </div>
+</header>
+
+<main>
+  <!-- Palette -->
+  <section class="col" aria-label="Palette de modules">
+    <div class="col-head"><h2>Modules</h2><span class="hint">glisse ou clique →</span></div>
+    <div class="col-body" id="palette"></div>
+  </section>
+
+  <!-- Assemblage -->
+  <section class="col" aria-label="Assemblage">
+    <div class="col-head"><h2>Ton agent</h2><span class="hint">l'ordre d'exécution est câblé pour toi</span></div>
+    <div class="col-body">
+      <div id="stack" aria-live="polite"></div>
+    </div>
+  </section>
+
+  <!-- Code -->
+  <section class="col" aria-label="Code généré">
+    <div class="col-head"><h2>Code Python</h2><span class="hint" id="loc-count"></span></div>
+    <div class="code-wrap">
+      <div class="code-scroll"><pre id="code"></pre></div>
+      <div class="run-cmd" id="run-cmd"></div>
+    </div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+
+/* ══════════════════════════════════════════════════════════════════════
+   1. DÉFINITION DES BLOCS — chaque bloc reflète un module réel d'autoagent.
+      cat  : catégorie (couleur + carte des modules)
+      one  : singleton (Agent et Lancer sont uniques)
+      fields: champs éditables → paramètres réels de l'API
+   ══════════════════════════════════════════════════════════════════════ */
+const CATS = {
+  core:  {color:"var(--c-core)",  label:"Cœur"},
+  multi: {color:"var(--c-multi)", label:"Multi-agent"},
+  tool:  {color:"var(--c-tool)",  label:"Outils"},
+  safe:  {color:"var(--c-safe)",  label:"Sécurité"},
+  mem:   {color:"var(--c-mem)",   label:"Mémoire"},
+  trace: {color:"var(--c-trace)", label:"Observabilité"},
+  hook:  {color:"var(--c-hook)",  label:"Contrôle"},
+  flow:  {color:"var(--c-flow)",  label:"Flux (Orchestrator)"},
+  run:   {color:"var(--c-run)",   label:"Exécution"},
+};
+
+const DEFS = {
+  agent: {
+    name:"Agent", cat:"core", one:true, sub:"Agent.from_model(...) — la boucle outils",
+    fields:[
+      {k:"var",   l:"nom de variable", kind:"text", def:"agent", w:"half"},
+      {k:"prov",  l:"provider", kind:"select", opts:["gemini","openai","anthropic","deepseek"], def:"gemini", w:"half"},
+      {k:"model", l:"modèle", kind:"text", def:"gemini-3.5-flash"},
+      {k:"system",l:"system_prompt", kind:"textarea", def:"Tu es un assistant précis. Tu vérifies tes chiffres avec tes outils avant de répondre."},
+      {k:"temp",  l:"temperature", kind:"number", def:"0.0", w:"third"},
+      {k:"steps", l:"max_steps", kind:"number", def:"8", w:"third"},
+      {k:"budget",l:"token_budget", kind:"number", def:"", w:"third", hint:"vide = illimité"},
+      {k:"parallel", l:"parallel_tool_calls (outils I/O en parallèle)", kind:"check", def:false},
+      {k:"baseurl", l:"base_url (provider avancé)", kind:"text", def:"", w:"half", hint:"vide = défaut"},
+      {k:"keyenv",  l:"api_key_env (nom de var d'env)", kind:"text", def:"", w:"half", hint:"vide = auto"},
+      {k:"routing", l:"routing multi-modèle (image → vision, sinon défaut)", kind:"check", def:false},
+      {k:"vmodel",  l:"modèle vision (si routing)", kind:"text", def:"gemini-2.5-flash", w:"half"},
+    ],
+  },
+  tool: {
+    name:"Outil Python", cat:"tool", sub:"@agent.tool — schéma auto depuis les annotations",
+    fields:[
+      {k:"fname", l:"nom de fonction", kind:"text", def:"compter", w:"half"},
+      {k:"ret",   l:"type de retour", kind:"text", def:"int", w:"half"},
+      {k:"params",l:"paramètres (annotés)", kind:"text", def:"texte: str, mot: str"},
+      {k:"doc",   l:"docstring (vue par le modèle)", kind:"text", def:"Compte les occurrences d'un mot (un LLM ne sait pas compter)."},
+      {k:"body",  l:"corps", kind:"textarea", def:"return texte.lower().count(mot.lower())"},
+      {k:"share", l:"donner aussi aux sous-agents", kind:"check", def:false},
+    ],
+  },
+  workspace: {
+    name:"Écriture bornée", cat:"safe", sub:"ProjectWorkspace — écritures sous garde",
+    fields:[
+      {k:"var",  l:"nom de variable", kind:"text", def:"espace", w:"half"},
+      {k:"exts", l:"extensions autorisées", kind:"text", def:".md", w:"half", hint:"séparées par des virgules"},
+      {k:"root", l:"dossier racine", kind:"text", def:"_out"},
+      {k:"tname",l:"nom de l'outil d'écriture", kind:"text", def:"ecrire_rapport"},
+      {k:"t_read",  l:"outil read_file (lecture bornée)", kind:"check", def:false},
+      {k:"t_list",  l:"outil list_files (lister)", kind:"check", def:false},
+      {k:"t_replace", l:"outil replace_text (remplacer)", kind:"check", def:false},
+      {k:"t_rollback",l:"outil rollback (annuler la dernière écriture)", kind:"check", def:false},
+    ],
+  },
+  sandbox: {
+    name:"Bac à sable", cat:"safe", one:true, sub:"exécute le code non fiable isolé (Docker / subprocess)",
+    fields:[
+      {k:"var",  l:"nom de variable", kind:"text", def:"bac", w:"half"},
+      {k:"kind", l:"type", kind:"select", opts:["make_sandbox (auto)","SubprocessSandbox","DockerSandbox"], def:"make_sandbox (auto)", w:"half"},
+      {k:"timeout", l:"timeout (s)", kind:"number", def:"10", w:"half"},
+      {k:"image",   l:"image Docker", kind:"text", def:"python:3.11-slim", w:"half"},
+      {k:"prefer",  l:"préférer Docker si dispo (sinon subprocess)", kind:"check", def:true},
+    ],
+  },
+  dynamic: {
+    name:"Outils dynamiques", cat:"tool", one:true, sub:"DynamicToolBuilder — l'agent écrit ses propres outils",
+    fields:[
+      {k:"dir",     l:"dossier des outils générés", kind:"text", def:".autoagent/tools"},
+      {k:"timeout", l:"timeout d'exécution (s)", kind:"number", def:"10", w:"half"},
+      {k:"maxrun",  l:"max outils générés / run", kind:"number", def:"3", w:"half"},
+    ],
+  },
+  mcp: {
+    name:"Serveur MCP", cat:"tool", sub:"MCPClient — monte les outils d'un serveur MCP (stdio)",
+    fields:[
+      {k:"var",     l:"nom de variable", kind:"text", def:"mcp_fs", w:"half"},
+      {k:"timeout", l:"timeout (s)", kind:"number", def:"60", w:"half"},
+      {k:"cmd",     l:"commande du serveur", kind:"text", def:"npx -y @modelcontextprotocol/server-filesystem .", hint:"Windows : npx.cmd"},
+      {k:"prefix",  l:"préfixe des outils", kind:"text", def:"fs_", w:"half"},
+      {k:"include", l:"outils à monter (vide = tous)", kind:"text", def:"read_text_file, list_directory", w:"half", hint:"noms côté serveur, virgules"},
+    ],
+  },
+  orchestrator: {
+    name:"Orchestrator", cat:"flow", one:true, sub:"flux piloté par l'hôte — le LLM interprète & reformule",
+    fields:[
+      {k:"var",  l:"nom de variable", kind:"text", def:"orch", w:"half"},
+      {k:"prov", l:"provider", kind:"select", opts:["gemini","openai","anthropic","deepseek"], def:"gemini", w:"half"},
+      {k:"model",l:"modèle", kind:"text", def:"gemini-3.5-flash"},
+      {k:"steps",l:"étapes (une par ligne : id | question)", kind:"textarea",
+       def:"nom | Quel est ton nom ?\nage | Quel âge as-tu ?\nville | Dans quelle ville habites-tu ?"},
+      {k:"closing", l:"message de fin", kind:"text", def:"Merci, c'était la dernière étape !"},
+    ],
+  },
+  memory: {
+    name:"Mémoire", cat:"mem", one:true, sub:"borne / résume le contexte",
+    fields:[
+      {k:"kind", l:"type", kind:"select", opts:["BufferMemory","SummarizingMemory"], def:"SummarizingMemory"},
+      {k:"maxm", l:"max_messages", kind:"number", def:"40", w:"half"},
+      {k:"keep", l:"keep_recent (Summarizing)", kind:"number", def:"12", w:"half"},
+      {k:"recall", l:"donner l'outil recall à l'agent", kind:"check", def:true},
+    ],
+  },
+  trace: {
+    name:"Trace", cat:"trace", one:true, sub:"TraceEmitter — JSONL, secrets masqués",
+    fields:[
+      {k:"file", l:"fichier de trace", kind:"text", def:"trace.jsonl"},
+    ],
+  },
+  otel: {
+    name:"Export OpenTelemetry", cat:"trace", one:true, sub:"OTelTraceExporter — spans vers Jaeger/Tempo/Langfuse",
+    fields:[
+      {k:"tracer", l:"tracer_name", kind:"text", def:"autoagent", hint:"pip install opentelemetry-sdk"},
+    ],
+  },
+  subagent: {
+    name:"Sous-agent", cat:"multi", sub:"as_tool() — un agent devient l'outil d'un autre",
+    fields:[
+      {k:"var",  l:"nom de variable", kind:"text", def:"specialiste", w:"half"},
+      {k:"prov", l:"provider", kind:"select", opts:["gemini","openai","anthropic","deepseek"], def:"gemini", w:"half"},
+      {k:"model",l:"modèle", kind:"text", def:"gemini-3.5-flash"},
+      {k:"tname",l:"nom de l'outil (vu par l'orchestrateur)", kind:"text", def:"interroger_specialiste"},
+      {k:"desc", l:"description (quand déléguer)", kind:"text", def:"Délègue une sous-tâche au spécialiste."},
+      {k:"system",l:"system_prompt du spécialiste", kind:"textarea", def:"Tu es un spécialiste. Réponds de façon concise et factuelle."},
+    ],
+  },
+  chaine: {
+    name:"Chaîne (pipeline)", cat:"multi", one:true, sub:"étapes séquentielles — chacune reçoit la sortie de la précédente",
+    fields:[
+      {k:"prov", l:"provider (toutes les étapes)", kind:"select", opts:["gemini","openai","anthropic","deepseek"], def:"gemini", w:"half"},
+      {k:"model",l:"modèle", kind:"text", def:"gemini-3.5-flash", w:"half"},
+      {k:"stages", l:"étapes ordonnées (une par ligne : nom | rôle)", kind:"textarea",
+       def:"extraction | Extrais les faits et chiffres du texte, sans les interpréter.\nanalyse | À partir des faits extraits, identifie les 3 points les plus importants.\nsynthese | Rédige une conclusion en 2 phrases à partir de l'analyse."},
+      {k:"prompt", l:"entrée initiale", kind:"textarea",
+       def:"Rapport trimestriel : le CA a progressé de 12%, mais la marge a baissé de 3 points à cause des coûts logistiques."},
+    ],
+  },
+  parallele: {
+    name:"Parallèle + fusion", cat:"multi", one:true, sub:"N agents en parallèle, puis un synthétiseur fusionne",
+    fields:[
+      {k:"prov", l:"provider", kind:"select", opts:["gemini","openai","anthropic","deepseek"], def:"gemini", w:"half"},
+      {k:"model",l:"modèle", kind:"text", def:"gemini-3.5-flash", w:"half"},
+      {k:"stages", l:"experts en parallèle (une par ligne : nom | rôle)", kind:"textarea",
+       def:"juridique | Analyse les risques juridiques du contrat.\nfinancier | Analyse les risques financiers du contrat.\ntechnique | Analyse les risques techniques du contrat."},
+      {k:"synth", l:"rôle du synthétiseur (fusion finale)", kind:"text",
+       def:"Fusionne les analyses en une synthèse de risques hiérarchisée."},
+      {k:"prompt", l:"entrée (envoyée à tous)", kind:"textarea",
+       def:"Contrat SaaS sur 3 ans, paiement annuel d'avance, SLA 99.9%, pénalités plafonnées à 10%."},
+    ],
+  },
+  hook: {
+    name:"Vérification", cat:"hook", one:true, sub:"post_turn_hook — valider / corriger avant de finir",
+    fields:[
+      {k:"fname", l:"nom de fonction", kind:"text", def:"verifier"},
+      {k:"body",  l:"corps (retourne None = OK, ou Message = correction)", kind:"textarea",
+       def:"# ctx.output = la réponse texte du modèle.\nif \"TODO\" in ctx.output:\n    return Message(role=\"user\", content=\"Termine la tâche avant de conclure.\")\nreturn None"},
+    ],
+  },
+  checkpoint: {
+    name:"Checkpoint / reprise", cat:"run", one:true, sub:"RunState — le run survit aux crashs et redémarrages",
+    fields:[
+      {k:"file",   l:"fichier de snapshot", kind:"text", def:"run_state.json"},
+      {k:"resume", l:"reprendre depuis le snapshot s'il existe", kind:"check", def:true},
+    ],
+  },
+  run: {
+    name:"Lancer", cat:"run", one:true, sub:"agent.run(...) — exécute et affiche",
+    fields:[
+      {k:"prompt", l:"consigne (prompt utilisateur)", kind:"textarea",
+       def:"Analyse app.log : combien de lignes ERROR, et les 2 messages les plus fréquents ?"},
+      {k:"stream", l:"streaming (run_stream — réponse token par token)", kind:"check", def:false},
+    ],
+  },
+};
+
+// Aide au survol (ⓘ) : ce que fait chaque module + comment l'utiliser.
+const INFO = {
+  agent:{api:"Agent.from_model(provider, model, …)", info:"Le cerveau : reçoit une consigne et appelle tes outils en boucle jusqu'à la réponse finale. Règle ici le modèle, le prompt système, la température, le plafond d'étapes (max_steps), le budget de tokens et l'exécution parallèle des outils. Options avancées : provider custom (base_url / clé) et routing multi-modèle."},
+  tool:{api:"@agent.tool", info:"Transforme une fonction Python en outil appelable par l'agent. Le schéma JSON est généré automatiquement depuis tes annotations de type. Renseigne le nom, les paramètres annotés, la docstring (lue par le modèle) et le corps."},
+  workspace:{api:"ProjectWorkspace(root, allowed_write_extensions=…)", info:"Espace d'écriture borné : chemins hors dossier, chemins absolus et extensions interdites sont refusés PAR LE CODE. Coche les outils à exposer (écrire, lire, lister, remplacer, annuler). Chaque écriture est journalisée et réversible."},
+  sandbox:{api:"make_sandbox() · SubprocessSandbox · DockerSandbox", info:"Exécute du code non fiable ISOLÉ du système : conteneur Docker jetable (réseau coupé, FS en lecture seule) si Docker est présent, sinon subprocess durci. make_sandbox choisit tout seul. Sert surtout à faire tourner les outils générés dynamiquement."},
+  dynamic:{api:"DynamicToolBuilder + enable_dynamic_tools", info:"Donne à l'agent le pouvoir d'ÉCRIRE ses propres outils Python à la volée : il décrit la capacité voulue, un LLM génère le code, celui-ci est validé (AST) puis exécuté dans le bac à sable. Limite le nombre d'outils générés par run."},
+  memory:{api:"BufferMemory · SummarizingMemory", info:"Borne le contexte quand la conversation s'allonge. BufferMemory garde les N derniers messages ; SummarizingMemory RÉSUME les vieux tours (via un LLM) au lieu de les jeter. Option recall : l'agent peut retrouver un détail sorti de sa fenêtre."},
+  trace:{api:"TraceEmitter(file=…)", info:"Enregistre chaque événement (appel LLM, appel d'outil, correction…) dans un fichier JSONL, secrets masqués. Partagée par l'agent ET tous les sous-agents → tu vois tout l'arbre d'exécution dans une seule trace."},
+  subagent:{api:"agent.as_tool(name=, description=)", info:"Un agent complet exposé comme OUTIL d'un autre : l'orchestrateur décide quand le solliciter (ordre émergent, piloté par le LLM). Chaque appel démarre une conversation fraîche ; ses échecs deviennent des erreurs d'outil, jamais un crash."},
+  chaine:{api:"boucle for … .run() (code)", info:"Enchaîne des étapes dans un ordre GARANTI par le code (A→B→C) : chaque étape reçoit la sortie de la précédente. Idéal pour un traitement séquentiel maîtrisé (extraction → analyse → synthèse). Déterministe, pas piloté par le LLM."},
+  parallele:{api:"ThreadPoolExecutor … .run() (code)", info:"Lance plusieurs experts EN PARALLÈLE sur la même entrée (threads), collecte tous les résultats, puis un synthétiseur les fusionne. Gain de latence quand les analyses sont indépendantes."},
+  hook:{api:"post_turn_hook", info:"Garde-fou côté hôte appelé quand le modèle veut conclure : retourne None pour valider, ou un Message pour demander une correction (re-lancer des tests, vérifier une condition…). Plafonné pour éviter les boucles."},
+  orchestrator:{api:"Orchestrator(current_steps=, record=)", info:"Paradigme différent : TA machine à états décide de l'avancement, le LLM se contente d'interpréter les réponses et de reformuler les questions. Idéal pour des flux question/réponse déterministes (formulaire, prise de RDV). Définis tes étapes « id | question »."},
+  run:{api:"agent.run(prompt) · run_stream(prompt)", info:"Lance l'agent sur ta consigne et affiche la réponse. Coche « streaming » pour consommer la réponse token par token (run_stream), avec les événements tool_start / done au fil de l'eau."},
+  mcp:{api:"MCPClient(commande).mount(agent, prefix=, include=)", info:"Branche un serveur MCP (Model Context Protocol) : il tourne en sous-processus local (stdio) et CHACUN de ses outils devient un outil autoagent ordinaire, validé par le registre avant chaque appel. Filtre avec « include » : monter 3 outils précis vaut mieux que 40 (contexte + surface d'attaque). Zéro dépendance."},
+  otel:{api:"OTelTraceExporter() → TraceEmitter(on_event=…)", info:"Exporte la trace vers OpenTelemetry : l'arbre agent.run → llm → tool.<nom> devient de vrais spans visibles dans Jaeger, Grafana Tempo, Langfuse ou Phoenix. Se branche sur la Trace (créée automatiquement au besoin). Nécessite opentelemetry-api — dépendance OPTIONNELLE, le cœur reste zéro dépendance."},
+  checkpoint:{api:"run(checkpoint=…) · RunState · agent.resume(state)", info:"Le run n'est plus prisonnier de son processus : un snapshot JSON est sauvé à CHAQUE étape complétée. Après un crash ou un redémarrage, l'agent REPREND où il en était (resume) au lieu de tout refaire. max_steps et token_budget gardent leur sens à travers les reprises."},
+};
+
+const ENV = {gemini:"GEMINI_API_KEY", openai:"OPENAI_API_KEY", anthropic:"ANTHROPIC_API_KEY", deepseek:"DEEPSEEK_API_KEY"};
+
+/* ══════════════════════════════════════════════════════════════════════
+   2. ÉTAT
+   ══════════════════════════════════════════════════════════════════════ */
+let stack = [];
+let uid = 1;
+let insertIdx = null;          // position d'insertion pendant un drag
+
+function defaults(type){
+  const f = {};
+  for(const fld of DEFS[type].fields) f[fld.k] = fld.def;
+  return f;
+}
+function addBlock(type, at){
+  const def = DEFS[type];
+  if(def.one && stack.some(b=>b.type===type)) return;
+  const block = {id:uid++, type, f:defaults(type)};
+  if(at==null || at>stack.length) stack.push(block); else stack.splice(at,0,block);
+  render();
+}
+function removeBlock(id){ stack = stack.filter(b=>b.id!==id); render(); }
+function moveBlock(id, dir){
+  const i = stack.findIndex(b=>b.id===id); if(i<0) return;
+  const j = i+dir; if(j<0||j>=stack.length) return;
+  [stack[i],stack[j]]=[stack[j],stack[i]]; render();
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   3. GÉNÉRATION DU CODE PYTHON
+      L'ordre d'assemblage est libre ; on émet TOUJOURS dans l'ordre de
+      dépendance correct — c'est ça, « presque prêt à l'emploi ».
+   ══════════════════════════════════════════════════════════════════════ */
+function pyStr(s){ return JSON.stringify(String(s ?? "")); }         // littéral sûr 1 ligne
+function pyLines(s, indent){                                          // multi-ligne joli (concat implicite)
+  const parts = String(s ?? "").split("\n");
+  if(parts.length===1) return pyStr(parts[0]);
+  const pad = " ".repeat(indent);
+  return "(\n" + parts.map(p=>pad+"    "+pyStr(p)).join("\n") + "\n"+pad+")";
+}
+function indentBody(body, pad){
+  const lines = String(body||"").replace(/\r/g,"").split("\n");
+  if(lines.every(l=>l.trim()==="")) return pad+"pass";
+  return lines.map(l=> l.trim()==="" ? "" : pad+l).join("\n");
+}
+function setExt(raw){
+  const items = String(raw||"").split(",").map(s=>s.trim()).filter(Boolean)
+    .map(e=> e.startsWith(".")?e:"."+e);
+  return "{" + items.map(pyStr).join(", ") + "}";
+}
+
+function num(v, d){ const n=Number(v); return Number.isFinite(n)?n:d; }
+function orchSteps(raw){
+  return String(raw||"").split("\n").map(l=>l.trim()).filter(Boolean).map(l=>{
+    const i=l.indexOf("|");
+    const id=(i>=0?l.slice(0,i):l).trim();
+    const q =(i>=0?l.slice(i+1):"").trim();
+    return `    Step(${pyStr(id)}, {"question": ${pyStr(q)}}),`;
+  }).join("\n");
+}
+
+function parseStages(raw){
+  return String(raw||"").split("\n").map(l=>l.trim()).filter(Boolean).map(l=>{
+    const i=l.indexOf("|");
+    const nom=(i>=0?l.slice(0,i):l).trim().replace(/\s+/g,"_");
+    const role=(i>=0?l.slice(i+1):"").trim();
+    return [nom, role];
+  });
+}
+
+function generate(){
+  const by = t => stack.filter(b=>b.type===t);
+  const agentB = by("agent")[0];
+  const orchB  = by("orchestrator")[0];
+  const chaineB = by("chaine")[0];
+  const parB    = by("parallele")[0];
+  if(!agentB && !orchB && !chaineB && !parB){
+    return {code:"# ← Ajoute un bloc « Agent » (ou « Orchestrator », « Chaîne », « Parallèle ») pour démarrer.\n# Puis empile des outils, une mémoire, une trace, un bac à sable…", env:null, loc:0};
+  }
+  const a   = agentB ? agentB.f : null;
+  const av  = agentB ? (a.var||"agent").trim() : "agent";
+  const tools = by("tool");
+  const sharedTools = tools.filter(t=>t.f.share);   // outils donnés aussi aux sous-agents
+  const ownTools    = tools.filter(t=>!t.f.share);  // outils de l'agent principal seul
+  const wss   = by("workspace");
+  const subs  = by("subagent");
+  const mem   = by("memory")[0];
+  const tr    = by("trace")[0];
+  const otelB = by("otel")[0];
+  const hook  = by("hook")[0];
+  const sb    = by("sandbox")[0];
+  const dyn   = by("dynamic")[0];
+  const mcps  = by("mcp");
+  const ckpt  = by("checkpoint")[0];
+  const run   = by("run")[0];
+  const hasTrace = !!(tr || otelB);   // OTel implique une TraceEmitter, créée au besoin
+  const adv   = agentB && !a.routing && ((a.baseurl||"").trim() || (a.keyenv||"").trim());  // provider avancé
+  const routing = agentB && a.routing;
+  const hasPipeline = !!(chaineB || parB);   // les sous-agents ne sont PAS ajoutés en as_tool si un pipeline pilote
+
+  // — imports du paquet principal —
+  const names = new Set();
+  if(agentB) names.add("Agent");
+  if(chaineB || parB) names.add("Agent");
+  if(hasTrace) names.add("TraceEmitter");
+  if(otelB) names.add("OTelTraceExporter");
+  if(agentB && mcps.length) names.add("MCPClient");
+  if(agentB && ckpt) names.add("RunState");
+  if(wss.length) names.add("ProjectWorkspace");
+  if(mem){
+    if(mem.f.kind==="BufferMemory") names.add("BufferMemory");
+    else { names.add("SummarizingMemory"); names.add("create_provider"); names.add("ModelConfig"); }
+  }
+  if(hook) names.add("Message");
+  if(dyn){ names.add("DynamicToolBuilder"); names.add("create_provider"); names.add("ModelConfig"); }
+  if(adv) names.add("ModelConfig");
+  if(routing){ names.add("RoutingProvider"); names.add("create_provider"); names.add("ModelConfig"); }
+  if(orchB){ names.add("Orchestrator"); names.add("Step"); names.add("create_provider"); names.add("ModelConfig"); }
+
+  const L = [];
+  const env = ENV[(agentB?a.prov:(orchB?orchB.f.prov:(chaineB?chaineB.f.prov:parB.f.prov)))] || "GEMINI_API_KEY";
+  L.push(`"""Généré avec le Constructeur autoagent.`);
+  L.push(``);
+  L.push(`Lancer :  ${env}=...  python ce_fichier.py`);
+  L.push(`(place ce fichier là où le paquet « autoagent » est importable.)`);
+  L.push(`"""`);
+  L.push(``);
+  if(agentB && ckpt){ L.push(`import json`); L.push(`import pathlib`); L.push(``); }
+  L.push(`from autoagent import ${[...names].join(", ")}`);
+  if(sb){
+    const cls = sb.f.kind==="SubprocessSandbox" ? "SubprocessSandbox"
+              : sb.f.kind==="DockerSandbox" ? "DockerSandbox" : "make_sandbox";
+    L.push(`from autoagent.sandbox import ${cls}`);
+  }
+  if(parB) L.push(`from concurrent.futures import ThreadPoolExecutor`);
+  L.push(``);
+
+  // — trace : ressource PARTAGÉE (agent, sous-agents, chaîne, parallèle) —
+  if(hasTrace){
+    L.push(`# Observabilité : tout l'arbre d'agents dans une seule trace.`);
+    if(otelB){
+      L.push(`# Export OpenTelemetry : configure ton TracerProvider (SDK) côté hôte ;`);
+      L.push(`# sans provider configuré, l'exporteur est un no-op inoffensif.`);
+      L.push(`exporteur = OTelTraceExporter(tracer_name=${pyStr((otelB.f.tracer||"autoagent").trim()||"autoagent")})`);
+    }
+    const targs = [];
+    if(tr) targs.push(`file=${pyStr(tr.f.file||"trace.jsonl")}`);
+    if(otelB) targs.push(`on_event=exporteur`);
+    L.push(`trace = TraceEmitter(${targs.join(", ")})`);
+    L.push(``);
+  }
+
+  /* ═══ Programme AGENT ═══ */
+  if(agentB){
+    // workspace(s)
+    for(const w of wss){
+      L.push(`# Écritures bornées : ${w.f.root} + extensions ${w.f.exts} seulement.`);
+      L.push(`${(w.f.var||"espace").trim()} = ProjectWorkspace(${pyStr(w.f.root||"_out")}, allowed_write_extensions=${setExt(w.f.exts)})`);
+      L.push(``);
+    }
+    // bac à sable
+    let sbVar = null;
+    if(sb){
+      sbVar = (sb.f.var||"bac").trim();
+      const to = num(sb.f.timeout,10);
+      L.push(`# Bac à sable : exécute le code non fiable isolé du système.`);
+      if(sb.f.kind==="SubprocessSandbox")      L.push(`${sbVar} = SubprocessSandbox(timeout=${to})`);
+      else if(sb.f.kind==="DockerSandbox")     L.push(`${sbVar} = DockerSandbox(image=${pyStr(sb.f.image||"python:3.11-slim")}, timeout=${to})`);
+      else L.push(`${sbVar} = make_sandbox(prefer_docker=${sb.f.prefer?"True":"False"}, timeout=${to}, image=${pyStr(sb.f.image||"python:3.11-slim")})`);
+      L.push(``);
+    }
+    // mémoire
+    let memVar = null;
+    if(mem){
+      memVar = "memoire";
+      if(mem.f.kind==="BufferMemory"){
+        L.push(`memoire = BufferMemory(max_messages=${num(mem.f.maxm,20)})`);
+      }else{
+        L.push(`# La mémoire résume les vieux tours (un LLM, moins cher, s'en charge).`);
+        L.push(`resumeur = create_provider(ModelConfig(${pyStr(a.prov)}, ${pyStr(a.model)}))`);
+        L.push(`memoire = SummarizingMemory(resumeur, max_messages=${num(mem.f.maxm,40)}, keep_recent=${num(mem.f.keep,12)})`);
+      }
+      L.push(``);
+    }
+    // constructeur d'outils dynamiques
+    if(dyn){
+      L.push(`# L'agent pourra GÉNÉRER ses propres outils Python (validés puis exécutés isolés).`);
+      L.push(`builder = DynamicToolBuilder(`);
+      L.push(`    create_provider(ModelConfig(${pyStr(a.prov)}, ${pyStr(a.model)})),`);
+      const barg = [`tools_dir=${pyStr(dyn.f.dir||".autoagent/tools")}`];
+      if(sbVar) barg.push(`sandbox=${sbVar}`); else barg.push(`timeout=${num(dyn.f.timeout,10)}`);
+      L.push(`    ${barg.join(", ")})`);
+      L.push(``);
+    }
+    // hook
+    if(hook){
+      L.push(`def ${(hook.f.fname||"verifier").trim()}(ctx):`);
+      L.push(`    """Appelé quand le modèle veut conclure : None = valider, Message = corriger."""`);
+      L.push(indentBody(hook.f.body, "    "));
+      L.push(``);
+    }
+    // checkpoint : snapshot JSON à chaque frontière d'étape
+    if(ckpt){
+      L.push(`# Checkpoint : snapshot sauvé à CHAQUE étape complétée → le run survit au processus.`);
+      L.push(`_CHECKPOINT = pathlib.Path(${pyStr(ckpt.f.file||"run_state.json")})`);
+      L.push(``);
+      L.push(`def sauvegarder(state):`);
+      L.push(`    _CHECKPOINT.write_text(json.dumps(state.to_dict()), encoding="utf-8")`);
+      L.push(``);
+    }
+    // définitions des outils PARTAGÉS (fonctions simples, attachées ensuite à chaque agent)
+    for(const t of sharedTools){
+      L.push(`def ${(t.f.fname||"outil").trim()}(${t.f.params||""}) -> ${t.f.ret||"dict"}:`);
+      if(t.f.doc) L.push(`    ${pyTriDoc(t.f.doc)}`);
+      L.push(indentBody(t.f.body, "    "));
+      L.push(``);
+    }
+    // sous-agents (avec les outils partagés attachés — comme dans demo_autoagent.py)
+    for(const s of subs){
+      const sv = (s.f.var||"specialiste").trim();
+      const kw = [`temperature=0.0`];
+      if(hasTrace) kw.push(`trace=trace`);
+      L.push(`${sv} = Agent.from_model(${pyStr(s.f.prov)}, ${pyStr(s.f.model)},`);
+      L.push(`    system_prompt=${pyLines(s.f.system, 4)},`);
+      L.push(`    ${kw.join(", ")})`);
+      for(const t of sharedTools) L.push(`${sv}.tool(${(t.f.fname||"outil").trim()})`);
+      L.push(``);
+    }
+    // agent principal
+    const kwTail = [];
+    kwTail.push(`temperature=${(a.temp===""||a.temp==null)?"0.0":num(a.temp,0)}`);
+    kwTail.push(`max_steps=${num(a.steps,8)}`);
+    if(a.budget!=="" && a.budget!=null) kwTail.push(`token_budget=${num(a.budget,0)}`);
+    if(a.parallel) kwTail.push(`parallel_tool_calls=True`);
+    if(dyn) kwTail.push(`max_dynamic_tools_per_run=${num(dyn.f.maxrun,3)}`);
+    if(hasTrace) kwTail.push(`trace=trace`);
+    if(memVar) kwTail.push(`memory=${memVar}`);
+    if(hook) kwTail.push(`post_turn_hook=${(hook.f.fname||"verifier").trim()}`);
+
+    if(routing){
+      L.push(`# Routing : une image dans la requête → modèle vision ; sinon → défaut.`);
+      L.push(`_defaut = create_provider(ModelConfig(${pyStr(a.prov)}, ${pyStr(a.model)}))`);
+      L.push(`_vision = create_provider(ModelConfig(${pyStr(a.prov)}, ${pyStr((a.vmodel||a.model).trim()||a.model)}))`);
+      L.push(`provider = RoutingProvider(default=_defaut, vision=_vision)`);
+      L.push(``);
+      L.push(`${av} = Agent(provider,`);
+    }else if(adv){
+      const mc = [`provider=${pyStr(a.prov)}`, `model=${pyStr(a.model)}`];
+      if((a.baseurl||"").trim()) mc.push(`base_url=${pyStr(a.baseurl.trim())}`);
+      if((a.keyenv||"").trim())  mc.push(`api_key_env=${pyStr(a.keyenv.trim())}`);
+      L.push(`${av} = Agent.from_model_config(ModelConfig(${mc.join(", ")}),`);
+    }else{
+      L.push(`${av} = Agent.from_model(${pyStr(a.prov)}, ${pyStr(a.model)},`);
+    }
+    L.push(`    system_prompt=${pyLines(a.system, 4)},`);
+    L.push(`    ${kwTail.join(", ")})`);
+    L.push(``);
+
+    if(mem && mem.f.recall){
+      L.push(`${av}.register_recall_tool()   # l'agent peut retrouver un détail oublié`);
+      L.push(``);
+    }
+    if(dyn){
+      L.push(`${av}.enable_dynamic_tools(builder)   # débloque l'outil « create_python_tool »`);
+      L.push(``);
+    }
+    // outils partagés donnés AUSSI à l'agent principal (ses outils d'audit)
+    if(sharedTools.length){
+      for(const t of sharedTools) L.push(`${av}.tool(${(t.f.fname||"outil").trim()})`);
+      L.push(``);
+    }
+    // brancher les sous-agents en outils (SAUF si un pipeline les pilote)
+    if(!hasPipeline) for(const s of subs){
+      const sv = (s.f.var||"specialiste").trim();
+      L.push(`${av}.add_tool(${sv}.as_tool(`);
+      L.push(`    name=${pyStr(s.f.tname||"interroger_"+sv)},`);
+      L.push(`    description=${pyStr(s.f.desc||"Délègue une sous-tâche.")}))`);
+      L.push(``);
+    }
+    // outils propres à l'agent principal (@decorator)
+    for(const t of ownTools){
+      L.push(`@${av}.tool`);
+      L.push(`def ${(t.f.fname||"outil").trim()}(${t.f.params||""}) -> ${t.f.ret||"dict"}:`);
+      if(t.f.doc) L.push(`    ${pyTriDoc(t.f.doc)}`);
+      L.push(indentBody(t.f.body, "    "));
+      L.push(``);
+    }
+    // outils du workspace (écriture + lecture / liste / remplacement / annulation)
+    for(const w of wss){
+      const wv = (w.f.var||"espace").trim();
+      L.push(`@${av}.tool`);
+      L.push(`def ${(w.f.tname||"ecrire_rapport").trim()}(chemin: str, contenu: str) -> dict:`);
+      L.push(`    """Enregistre un fichier — refusé par le code hors de la zone autorisée."""`);
+      L.push(`    return ${wv}.write_file(chemin, contenu, reason="rapport")`);
+      L.push(``);
+      if(w.f.t_read){
+        L.push(`@${av}.tool`);
+        L.push(`def lire_${wv}(chemin: str) -> dict:`);
+        L.push(`    """Lit un fichier de la zone (lecture bornée)."""`);
+        L.push(`    return ${wv}.read_file(chemin)`);
+        L.push(``);
+      }
+      if(w.f.t_list){
+        L.push(`@${av}.tool`);
+        L.push(`def lister_${wv}(motif: str = "**/*") -> dict:`);
+        L.push(`    """Liste les fichiers de la zone."""`);
+        L.push(`    return ${wv}.list_files(motif)`);
+        L.push(``);
+      }
+      if(w.f.t_replace){
+        L.push(`@${av}.tool`);
+        L.push(`def remplacer_${wv}(chemin: str, avant: str, apres: str) -> dict:`);
+        L.push(`    """Remplace du texte dans un fichier de la zone."""`);
+        L.push(`    return ${wv}.replace_text(chemin, avant, apres)`);
+        L.push(``);
+      }
+      if(w.f.t_rollback){
+        L.push(`@${av}.tool`);
+        L.push(`def annuler_${wv}() -> dict:`);
+        L.push(`    """Annule la dernière écriture dans la zone."""`);
+        L.push(`    return ${wv}.rollback_last_change()`);
+        L.push(``);
+      }
+    }
+    // serveurs MCP : montés sur l'agent principal, fermés après le run
+    for(const m of mcps){
+      const mv = (m.f.var||"mcp").trim();
+      L.push(`# Serveur MCP (sous-processus stdio) : ses outils deviennent des outils autoagent,`);
+      L.push(`# validés par le registre avant chaque appel.`);
+      L.push(`${mv} = MCPClient(${pyStr(m.f.cmd||"npx -y @modelcontextprotocol/server-filesystem .")}, timeout=${num(m.f.timeout,60)})`);
+      L.push(`${mv}.start()`);
+      const margs = [av];
+      if((m.f.prefix||"").trim()) margs.push(`prefix=${pyStr(m.f.prefix.trim())}`);
+      const inc = String(m.f.include||"").split(",").map(s=>s.trim()).filter(Boolean);
+      if(inc.length) margs.push(`include={${inc.map(pyStr).join(", ")}}`);
+      L.push(`${mv}.mount(${margs.join(", ")})`);
+      L.push(``);
+    }
+    // lancer
+    if(run){
+      const ckArg = ckpt ? `, checkpoint=sauvegarder` : ``;
+      if(run.f.stream){
+        L.push(`# Streaming : on consomme les événements au fil de l'eau.`);
+        L.push(`for ev in ${av}.run_stream(${pyLines(run.f.prompt, 0)}${ckArg}):`);
+        L.push(`    if ev.type == "text":`);
+        L.push(`        print(ev.text, end="", flush=True)`);
+        L.push(`    elif ev.type == "tool_start":`);
+        L.push(`        print(f"\\n[outil] {ev.tool_name}\\u2026")`);
+        L.push(`    elif ev.type == "done":`);
+        L.push(`        print(f"\\n\\n({ev.steps} tours d'agent)")`);
+      }else{
+        if(ckpt && ckpt.f.resume){
+          L.push(`# Reprise : si un snapshot existe (run interrompu), on continue au lieu de repartir de zéro.`);
+          L.push(`if _CHECKPOINT.exists():`);
+          L.push(`    _etat = RunState.from_dict(json.loads(_CHECKPOINT.read_text(encoding="utf-8")))`);
+          L.push(`    resultat = ${av}.resume(_etat, checkpoint=sauvegarder)`);
+          L.push(`else:`);
+          L.push(`    resultat = ${av}.run(${pyLines(run.f.prompt, 4)}, checkpoint=sauvegarder)`);
+        }else{
+          L.push(`resultat = ${av}.run(${pyLines(run.f.prompt, 0)}${ckArg})`);
+        }
+        L.push(`print(resultat.output)`);
+        L.push(`print(f"\\n({resultat.steps} tours d'agent)")`);
+        if(tr) L.push(`print("trace \\u2192", ${pyStr(tr.f.file||"trace.jsonl")})`);
+        if(ckpt) L.push(`_CHECKPOINT.unlink(missing_ok=True)   # run terminé : le snapshot n'a plus lieu d'être`);
+      }
+      for(const m of mcps) L.push(`${(m.f.var||"mcp").trim()}.close()`);
+    }else{
+      L.push(`# Ajoute un bloc « Lancer » pour exécuter l'agent.`);
+    }
+  }
+
+  /* ═══ Programme ORCHESTRATOR (flux piloté par l'hôte) ═══ */
+  if(orchB){
+    const o = orchB.f, ov = (o.var||"orch").trim();
+    if(agentB){ L.push(``); L.push(`# ${"═".repeat(60)}`); }
+    L.push(`# Flux piloté par l'hôte : le LLM interprète les réponses et reformule`);
+    L.push(`# les questions ; TA machine à états décide de l'avancement.`);
+    L.push(`_STEPS = [`);
+    L.push(orchSteps(o.steps));
+    L.push(`]`);
+    L.push(`_reponses = {}`);
+    L.push(``);
+    L.push(`def current_steps():`);
+    L.push(`    # L'étape courante d'abord ; [] quand tout est répondu.`);
+    L.push(`    return [s for s in _STEPS if s.id not in _reponses]`);
+    L.push(``);
+    L.push(`def record(step_id, value):`);
+    L.push(`    # Retourne un message d'erreur (str) pour REFUSER la valeur, sinon None.`);
+    L.push(`    _reponses[step_id] = value`);
+    L.push(`    return None`);
+    L.push(``);
+    L.push(`${ov} = Orchestrator(`);
+    L.push(`    create_provider(ModelConfig(${pyStr(o.prov)}, ${pyStr(o.model)})),`);
+    L.push(`    current_steps=current_steps, record=record,`);
+    L.push(`    closing_text=${pyStr(o.closing||"Merci !")})`);
+    L.push(``);
+    L.push(`_restantes = current_steps()`);
+    L.push(`print(_restantes[0].payload["question"])   # 1re question`);
+    L.push(`while current_steps():`);
+    L.push(`    for ev in ${ov}.turn(input("> ")):`);
+    L.push(`        if ev.type == "text":`);
+    L.push(`            print(ev.text)`);
+    L.push(`print("\\nRéponses collectées :", _reponses)`);
+  }
+
+  /* ═══ CHAÎNE déterministe (pipeline séquentiel — code, pas LLM) ═══ */
+  if(chaineB){
+    const c = chaineB.f, stages = parseStages(c.stages);
+    const traceArg = hasTrace ? `, trace=trace` : ``;
+    if(agentB||orchB){ L.push(``); L.push(`# ${"═".repeat(60)}`); }
+    L.push(`# Chaîne DÉTERMINISTE : l'ordre est garanti par le code (pas par le LLM).`);
+    L.push(`# Chaque étape reçoit la sortie de la précédente.`);
+    L.push(`_etapes = [`);
+    for(const [nom,role] of stages) L.push(`    (${pyStr(nom)}, ${pyStr(role)}),`);
+    L.push(`]`);
+    L.push(`_agents = {nom: Agent.from_model(${pyStr(c.prov)}, ${pyStr(c.model)}, system_prompt=role, temperature=0.0${traceArg})`);
+    L.push(`           for nom, role in _etapes}`);
+    L.push(``);
+    L.push(`_entree = ${pyLines(c.prompt, 0)}`);
+    L.push(`_contexte = _entree`);
+    L.push(`for _nom, _ in _etapes:`);
+    L.push(`    _res = _agents[_nom].run(_contexte)`);
+    L.push(`    print(f"[{_nom}]\\n{_res.output}\\n")`);
+    L.push(`    _contexte = f"{_entree}\\n\\n[Sortie de l'étape précédente ({_nom})]\\n{_res.output}"`);
+    L.push(`print("=== Résultat final de la chaîne ===")`);
+    L.push(`print(_res.output)`);
+  }
+
+  /* ═══ PARALLÈLE + fusion (fan-out concurrent puis synthèse) ═══ */
+  if(parB){
+    const p = parB.f, stages = parseStages(p.stages);
+    const traceArg = hasTrace ? `, trace=trace` : ``;
+    if(agentB||orchB||chaineB){ L.push(``); L.push(`# ${"═".repeat(60)}`); }
+    L.push(`# Fan-out : les experts tournent EN PARALLÈLE (threads), puis un synthétiseur fusionne.`);
+    L.push(`# Chaque expert est une instance distincte → sûr en parallèle.`);
+    L.push(`_experts = [`);
+    for(const [nom,role] of stages) L.push(`    (${pyStr(nom)}, ${pyStr(role)}),`);
+    L.push(`]`);
+    L.push(`_agents = {nom: Agent.from_model(${pyStr(p.prov)}, ${pyStr(p.model)}, system_prompt=role, temperature=0.0${traceArg})`);
+    L.push(`           for nom, role in _experts}`);
+    L.push(`_synth = Agent.from_model(${pyStr(p.prov)}, ${pyStr(p.model)}, system_prompt=${pyStr(p.synth||"Fusionne les analyses.")}, temperature=0.0${traceArg})`);
+    L.push(``);
+    L.push(`_entree = ${pyLines(p.prompt, 0)}`);
+    L.push(`with ThreadPoolExecutor() as _ex:`);
+    L.push(`    _futs = {nom: _ex.submit(_agents[nom].run, _entree) for nom, _ in _experts}`);
+    L.push(`    _sorties = {nom: f.result().output for nom, f in _futs.items()}`);
+    L.push(``);
+    L.push(`_fusion = "\\n\\n".join(f"[{n}]\\n{s}" for n, s in _sorties.items())`);
+    L.push(`final = _synth.run(f"Voici les analyses à fusionner :\\n{_fusion}")`);
+    L.push(`print(final.output)`);
+  }
+
+  const code = L.join("\n").replace(/\n{3,}/g,"\n\n").trimEnd()+"\n";
+  return {code, env, loc: code.split("\n").length};
+}
+function pyTriDoc(s){ return `"""${String(s).replace(/\\/g,"\\\\").replace(/"""/g,'\\"\\"\\"')}"""`; }
+
+/* ══════════════════════════════════════════════════════════════════════
+   4. COLORATION SYNTAXIQUE (scanner sûr : échappe le HTML puis tokenise)
+   ══════════════════════════════════════════════════════════════════════ */
+const KW = new Set("False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield".split(" "));
+function highlight(code){
+  const esc = s => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  let out = "", i = 0, n = code.length;
+  const spec = /^(#[^\n]*)|^("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|^(@[\w.]+)/;
+  while(i < n){
+    const rest = code.slice(i);
+    const m = spec.exec(rest);
+    if(m){
+      const tok = m[0];
+      if(m[1]) out += `<span class="tok-com">${esc(tok)}</span>`;
+      else if(m[2]) out += `<span class="tok-str">${esc(tok)}</span>`;
+      else out += `<span class="tok-dec">${esc(tok)}</span>`;
+      i += tok.length; continue;
+    }
+    // morceau "code" jusqu'au prochain caractère spécial
+    let j = i;
+    while(j < n){
+      const c = code[j];
+      if(c==="#"||c==='"'||c==="'"||c==="@") break;
+      j++;
+    }
+    const chunk = code.slice(i, j===i? i+1 : j);
+    // Une seule passe : on colore ET on échappe en même temps, pour ne jamais
+    // ré-échapper les balises <span> qu'on vient d'insérer.
+    out += chunk.replace(/([A-Za-z_]\w*)|(\d+\.?\d*)|([&<>])|([\s\S])/g,
+      (m, id, num, sp, other)=>{
+        if(id!==undefined) return KW.has(id) ? `<span class="tok-kw">${id}</span>` : id;
+        if(num!==undefined) return `<span class="tok-num">${num}</span>`;
+        if(sp!==undefined) return {"&":"&amp;","<":"&lt;",">":"&gt;"}[sp];
+        return other;
+      });
+    i = (j===i)? i+1 : j;
+  }
+  return out;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   5. RENDU
+   ══════════════════════════════════════════════════════════════════════ */
+const $ = s => document.querySelector(s);
+
+// ── Infobulle (position:fixed → jamais rognée par le scroll de la colonne) ──
+const escapeHtml = s => String(s).replace(/[&<>]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const tt = document.createElement("div"); tt.id="tt"; document.body.appendChild(tt);
+function showTip(el){
+  const type = el.dataset.type, d = INFO[type], def = DEFS[type];
+  if(!d || !def) return;
+  tt.style.setProperty("--cat", CATS[def.cat].color);
+  tt.innerHTML = `<b>${escapeHtml(def.name)}</b><span class="api">${escapeHtml(d.api)}</span><p>${escapeHtml(d.info)}</p>`;
+  const r = el.getBoundingClientRect();
+  const w = tt.offsetWidth, h = tt.offsetHeight, m = 8;
+  let left = r.right + m;
+  if(left + w > window.innerWidth - m) left = r.left - w - m;      // bascule à gauche si ça déborde
+  if(left < m) left = m;
+  let top = r.top - 4;
+  if(top + h > window.innerHeight - m) top = window.innerHeight - h - m;
+  if(top < m) top = m;
+  tt.style.left = left+"px"; tt.style.top = top+"px";
+  tt.classList.add("show");
+}
+function hideTip(){ tt.classList.remove("show"); }
+
+function renderPalette(){
+  const p = $("#palette");
+  p.innerHTML = "";
+  // regroupe par catégorie, dans un ordre pédagogique
+  const order = ["core","tool","safe","mem","trace","multi","hook","flow","run"];
+  const byCat = {};
+  for(const [type,def] of Object.entries(DEFS)){ (byCat[def.cat] ||= []).push(type); }
+  for(const cat of order){
+    if(!byCat[cat]) continue;
+    const wrap = document.createElement("div"); wrap.className="cat";
+    wrap.innerHTML = `<h3>${CATS[cat].label}</h3>`;
+    for(const type of byCat[cat]){
+      const def = DEFS[type];
+      const used = def.one && stack.some(b=>b.type===type);
+      const piw = document.createElement("div"); piw.className="pi-wrap"; piw.style.setProperty("--cat", CATS[cat].color);
+      const b = document.createElement("button");
+      b.className="paletteItem"; b.style.setProperty("--cat", CATS[cat].color);
+      b.setAttribute("draggable","true");
+      b.setAttribute("aria-disabled", used?"true":"false");
+      b.innerHTML = `<span class="dot"></span><span class="txt"><span class="pi-name">${def.name}</span><span class="pi-sub">${def.sub}</span></span>`;
+      b.addEventListener("click", ()=> addBlock(type));
+      b.addEventListener("dragstart", e=>{ e.dataTransfer.setData("text/newblock", type); e.dataTransfer.effectAllowed="copy"; });
+      piw.appendChild(b);
+      // icône info + infobulle
+      const info = document.createElement("span");
+      info.className="pi-info"; info.textContent="i"; info.dataset.type=type;
+      info.tabIndex=0; info.setAttribute("role","button");
+      info.setAttribute("aria-label", `À quoi sert « ${def.name} »`);
+      info.addEventListener("mouseenter", ()=>showTip(info));
+      info.addEventListener("mouseleave", hideTip);
+      info.addEventListener("focus", ()=>showTip(info));
+      info.addEventListener("blur", hideTip);
+      info.addEventListener("click", e=>{ e.stopPropagation(); });
+      piw.appendChild(info);
+      wrap.appendChild(piw);
+    }
+    p.appendChild(wrap);
+  }
+  // note de câblage (relations entre modules)
+  const note = document.createElement("div");
+  note.className="wire-note";
+  note.innerHTML = `<b>Deux façons d'orchestrer :</b><br>
+    • <b>Pilotée par le LLM</b> — un <span style="color:var(--c-multi)">Sous-agent</span> devient un outil (<code>as_tool()</code>) ; l'agent décide quand l'appeler (ordre <em>émergent</em>).<br>
+    • <b>Déterministe (code)</b> — <span style="color:var(--c-multi)">Chaîne</span> impose l'ordre A→B→C (chaque étape reçoit la sortie de la précédente) ; <span style="color:var(--c-multi)">Parallèle</span> lance N experts en // puis fusionne.<br>
+    <b>Câblage auto :</b> la <span style="color:var(--c-trace)">Trace</span> est partagée par tous les agents ; <span style="color:var(--c-mem)">Mémoire</span> / <span style="color:var(--c-hook)">Vérification</span> / <span style="color:var(--c-core)">Routing</span> se branchent sur l'agent principal ; le <span style="color:var(--c-safe)">Bac à sable</span> alimente les <span style="color:var(--c-tool)">Outils dynamiques</span> ; un <span style="color:var(--c-tool)">Serveur MCP</span> monte ses outils sur l'agent (et se ferme après le run) ; l'<span style="color:var(--c-trace)">Export OpenTelemetry</span> se greffe sur la Trace ; <span style="color:var(--c-run)">Checkpoint</span> rend le run reprenable après un crash ; l'<span style="color:var(--c-flow)">Orchestrator</span> est un flux piloté par l'hôte.`;
+  p.appendChild(note);
+}
+
+function fieldEl(block, fld){
+  const def = DEFS[block.type];
+  const id = `f-${block.id}-${fld.k}`;
+  const wrap = document.createElement("div");
+  wrap.className = "field" + (fld.kind==="check"?" check":"");
+  const val = block.f[fld.k];
+  if(fld.kind==="check"){
+    wrap.innerHTML = `<input type="checkbox" id="${id}" ${val?"checked":""}><label for="${id}">${fld.l}</label>`;
+    wrap.querySelector("input").addEventListener("change", e=>{ block.f[fld.k]=e.target.checked; regen(); });
+    return wrap;
+  }
+  let ctrl;
+  if(fld.kind==="textarea"){ ctrl = document.createElement("textarea"); ctrl.value = val??""; }
+  else if(fld.kind==="select"){
+    ctrl = document.createElement("select");
+    for(const o of fld.opts){ const op=document.createElement("option"); op.value=o; op.textContent=o; if(o===val) op.selected=true; ctrl.appendChild(op); }
+  }
+  else { ctrl = document.createElement("input"); ctrl.type = fld.kind==="number"?"number":"text"; ctrl.value = val??""; }
+  ctrl.id = id;
+  const lab = `<label for="${id}">${fld.l}${fld.hint?` <span class="f-hint">· ${fld.hint}</span>`:""}</label>`;
+  wrap.innerHTML = lab;
+  wrap.appendChild(ctrl);
+  const ev = fld.kind==="select"?"change":"input";
+  ctrl.addEventListener(ev, e=>{ block.f[fld.k]= e.target.value; regen(); });
+  return wrap;
+}
+
+function blockEl(block, index){
+  const def = DEFS[block.type];
+  const el = document.createElement("div");
+  el.className="block"; el.style.setProperty("--cat", CATS[def.cat].color);
+  el.dataset.id = block.id;
+  el.setAttribute("draggable","true");
+
+  const head = document.createElement("div"); head.className="block-head";
+  head.innerHTML = `<span class="grip" title="Glisser pour réordonner">⋮⋮</span>
+    <span class="b-name">${def.name}</span><span class="b-cat">${CATS[def.cat].label}</span>
+    <span class="b-actions">
+      <button class="icon-btn" data-act="up"   title="Monter">▲</button>
+      <button class="icon-btn" data-act="down" title="Descendre">▼</button>
+      <button class="icon-btn danger" data-act="del" title="Supprimer">✕</button>
+    </span>`;
+  el.appendChild(head);
+
+  const body = document.createElement("div"); body.className="block-body";
+  // regroupe certains champs en grilles jolies selon width
+  let i=0; const fs=def.fields;
+  while(i<fs.length){
+    const f=fs[i];
+    if(f.w==="half" && fs[i+1] && fs[i+1].w==="half"){
+      const g=document.createElement("div"); g.className="grid2";
+      g.appendChild(fieldEl(block, fs[i])); g.appendChild(fieldEl(block, fs[i+1])); body.appendChild(g); i+=2; continue;
+    }
+    if(f.w==="third" && fs[i+1]&&fs[i+1].w==="third" && fs[i+2]&&fs[i+2].w==="third"){
+      const g=document.createElement("div"); g.className="grid3";
+      g.appendChild(fieldEl(block, fs[i])); g.appendChild(fieldEl(block, fs[i+1])); g.appendChild(fieldEl(block, fs[i+2])); body.appendChild(g); i+=3; continue;
+    }
+    body.appendChild(fieldEl(block, f)); i++;
+  }
+  el.appendChild(body);
+
+  head.querySelector('[data-act="up"]').addEventListener("click", ()=>moveBlock(block.id,-1));
+  head.querySelector('[data-act="down"]').addEventListener("click", ()=>moveBlock(block.id,1));
+  head.querySelector('[data-act="del"]').addEventListener("click", ()=>removeBlock(block.id));
+
+  el.addEventListener("dragstart", e=>{
+    e.dataTransfer.setData("text/moveid", String(block.id));
+    e.dataTransfer.effectAllowed="move"; el.classList.add("dragging");
+  });
+  el.addEventListener("dragend", ()=>{ el.classList.remove("dragging"); clearInsert(); });
+  return el;
+}
+
+function renderStack(){
+  const s = $("#stack");
+  s.innerHTML="";
+  if(stack.length===0){
+    s.innerHTML = `<div class="drop-empty"><strong>Glisse un module ici</strong>Commence par un bloc « Agent », puis empile outils, mémoire, trace, sous-agents… ou clique un exemple en haut.</div>`;
+    return;
+  }
+  stack.forEach((b,i)=> s.appendChild(blockEl(b,i)));
+}
+
+function render(){ renderPalette(); renderStack(); regen(); }
+
+function regen(){
+  const {code, env, loc} = generate();
+  $("#code").innerHTML = highlight(code);
+  window.__lastCode = code; window.__lastEnv = env;
+  $("#loc-count").textContent = loc>1 ? `${loc} lignes` : "";
+  const rc = $("#run-cmd");
+  if(env){ rc.innerHTML = `<span class="k">${env}</span>=…&nbsp;&nbsp;python&nbsp;mon_agent.py`; }
+  else rc.textContent = "";
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   6. DRAG & DROP sur la pile (insertion + réordonnancement)
+   ══════════════════════════════════════════════════════════════════════ */
+const stackEl = $("#stack");
+function clearInsert(){ const l=stackEl.querySelector(".insert-line"); if(l) l.remove(); insertIdx=null; }
+function indexFromY(y){
+  const blocks=[...stackEl.querySelectorAll(".block")];
+  for(let k=0;k<blocks.length;k++){
+    const r=blocks[k].getBoundingClientRect();
+    if(y < r.top + r.height/2) return k;
+  }
+  return blocks.length;
+}
+function showInsert(idx){
+  clearInsert();
+  const line=document.createElement("div"); line.className="insert-line"; insertIdx=idx;
+  const blocks=[...stackEl.querySelectorAll(".block")];
+  if(idx>=blocks.length) stackEl.appendChild(line);
+  else stackEl.insertBefore(line, blocks[idx]);
+}
+stackEl.addEventListener("dragover", e=>{
+  e.preventDefault();
+  e.dataTransfer.dropEffect = e.dataTransfer.types.includes("text/newblock")?"copy":"move";
+  showInsert(indexFromY(e.clientY));
+});
+stackEl.addEventListener("dragleave", e=>{ if(!stackEl.contains(e.relatedTarget)) clearInsert(); });
+stackEl.addEventListener("drop", e=>{
+  e.preventDefault();
+  const idx = insertIdx!=null?insertIdx:stack.length;
+  const newType = e.dataTransfer.getData("text/newblock");
+  const moveId  = e.dataTransfer.getData("text/moveid");
+  clearInsert();
+  if(newType){ addBlock(newType, idx); return; }
+  if(moveId){
+    const id=+moveId; const from=stack.findIndex(b=>b.id===id); if(from<0) return;
+    const [blk]=stack.splice(from,1);
+    let to=idx; if(from<idx) to--;
+    stack.splice(Math.max(0,Math.min(to,stack.length)),0,blk); render();
+  }
+});
+
+/* ══════════════════════════════════════════════════════════════════════
+   7. PRESETS / ACTIONS / THÈME
+   ══════════════════════════════════════════════════════════════════════ */
+function mk(type, over){ const b={id:uid++, type, f:defaults(type)}; Object.assign(b.f, over||{}); return b; }
+
+// ══ PRESETS : un par démo reproductible du dossier examples_autoagent/ ══
+const PRESETS = [
+  {id:"01", label:"01 · Agent + outils", make:()=>[
+    mk("agent",{var:"agent",system:"Tu es un analyste de logs. Tu ne rapportes que des chiffres vérifiés par tes outils.",steps:"8"}),
+    mk("tool",{fname:"lire_fichier",params:"nom: str",ret:"dict",doc:"Lit un fichier texte du dossier courant.",body:'return {"contenu": open(nom, encoding="utf-8").read()[:10000]}'}),
+    mk("tool",{fname:"compter",params:"texte: str, mot: str",ret:"int",doc:"Compte les occurrences d'un mot (un LLM ne sait pas compter).",body:"return texte.lower().count(mot.lower())"}),
+    mk("trace",{file:"trace.jsonl"}),
+    mk("run",{prompt:"Combien de lignes ERROR dans app.log, et les 2 messages les plus fréquents ?"}),
+  ]},
+  {id:"02", label:"02 · Streaming", make:()=>[
+    mk("agent",{var:"agent",system:"Tu es un assistant précis.",steps:"6"}),
+    mk("tool",{fname:"compter_lettres",params:"mot: str, lettre: str",ret:"dict",doc:"Compte les occurrences d'une lettre dans un mot.",body:'return {"occurrences": mot.lower().count(lettre.lower())}'}),
+    mk("run",{prompt:"Combien de 'r' dans 'anticonstitutionnellement' ? Puis explique en une phrase.",stream:true}),
+  ]},
+  {id:"03", label:"03 · Routing multi-modèle", make:()=>[
+    mk("agent",{var:"agent",system:"Tu es un assistant concis.",steps:"3",routing:true,vmodel:"gemini-2.5-flash"}),
+    mk("run",{prompt:"Donne 3 idées d'indicateurs pour un dashboard de comptage routier. Concis."}),
+  ]},
+  {id:"04", label:"04 · Observabilité + budget", make:()=>[
+    mk("agent",{var:"agent",system:"Tu es un assistant de calcul. Utilise tes outils.",steps:"6",budget:"20000"}),
+    mk("tool",{fname:"carre",params:"n: float",ret:"dict",doc:"Renvoie le carré d'un nombre.",body:'return {"carre": n * n}'}),
+    mk("trace",{file:"trace_demo.jsonl"}),
+    mk("run",{prompt:"Quel est le carré de 12.5 ?"}),
+  ]},
+  {id:"05", label:"05 · Mémoire résumante", make:()=>[
+    mk("agent",{var:"agent",system:"Tu assistes un chef de projet capteurs.",steps:"4"}),
+    mk("memory",{kind:"SummarizingMemory",maxm:"12",keep:"6",recall:true}),
+    mk("run",{prompt:"Rappelle-moi le budget matériel décidé et le fournisseur retenu plus tôt dans le projet."}),
+  ]},
+  {id:"06", label:"06 · Outils dynamiques", make:()=>[
+    mk("agent",{var:"agent",system:"Tu résous des problèmes en créant les outils Python qui te manquent.",steps:"8"}),
+    mk("dynamic",{dir:"outils_generes",timeout:"10",maxrun:"2"}),
+    mk("run",{prompt:"Tu n'as aucun outil de maths : crée un outil qui calcule le PGCD de deux entiers (Euclide), puis donne-moi le PGCD de 462 et 1071."}),
+  ]},
+  {id:"07", label:"07 · Sandbox + dynamiques", make:()=>[
+    mk("agent",{var:"agent",system:"Tu crées et utilises des outils Python.",steps:"8"}),
+    mk("sandbox",{var:"bac",kind:"make_sandbox (auto)",timeout:"10",prefer:true}),
+    mk("dynamic",{dir:"outils_generes",timeout:"10",maxrun:"2"}),
+    mk("run",{prompt:"Crée un outil qui teste si un entier est premier, puis dis-moi si 7919 est premier."}),
+  ]},
+  {id:"08", label:"08 · Multi-agents (as_tool)", make:()=>[
+    mk("agent",{var:"superviseur",system:"Pour répondre : demande les chiffres au chercheur, puis fais rédiger le bulletin par le rédacteur, et rends son texte.",steps:"6"}),
+    mk("tool",{fname:"etat_parc",params:"",ret:"dict",doc:"Renvoie l'état courant du parc de capteurs.",body:'return {"capteurs_actifs": 128, "en_panne": 3, "couverture_km": 540}',share:true}),
+    mk("subagent",{var:"chercheur",tname:"chercheur",desc:"Donne les chiffres réels du parc de capteurs.",system:"Tu fournis des chiffres du parc de capteurs, vérifiés par tes outils."}),
+    mk("subagent",{var:"redacteur",tname:"redacteur",desc:"Rédige un bulletin court à partir de faits.",system:"Tu écris un mini-bulletin : 2 phrases, ton factuel."}),
+    mk("trace",{file:"trace_demo.jsonl"}),
+    mk("run",{prompt:"Fais-moi le bulletin hebdo de l'état du parc de capteurs."}),
+  ]},
+  {id:"08b", label:"08b · Orchestrateur d'incident", make:()=>[
+    mk("agent",{var:"orchestrateur",steps:"12",system:"Tu es l'orchestrateur. Délègue l'analyse de chaque fichier au bon spécialiste, RECOUPE leurs résultats (chaque erreur « gateway 502 » doit correspondre à un paiement FAILED), contre-vérifie avec tes propres outils au besoin, puis enregistre un rapport validé dans « rapport.md » et conclus en une ligne."}),
+    mk("tool",{fname:"lire_fichier",params:"nom: str",ret:"dict",doc:"Lit un fichier texte du dossier courant.",body:'return {"contenu": open(nom, encoding="utf-8").read()[:10000]}',share:true}),
+    mk("tool",{fname:"compter",params:"texte: str, mot: str",ret:"int",doc:"Compte les occurrences d'un mot (un LLM ne sait pas compter).",body:"return texte.lower().count(mot.lower())",share:true}),
+    mk("subagent",{var:"analyste_serveur",tname:"interroger_analyste_serveur",desc:"Délègue une question sur app.log au spécialiste.",system:"Tu es analyste_serveur. Tu analyses app.log : erreurs et messages. Tu ne rapportes que des chiffres vérifiés par tes outils."}),
+    mk("subagent",{var:"analyste_paiements",tname:"interroger_analyste_paiements",desc:"Délègue une question sur payments.log au spécialiste.",system:"Tu es analyste_paiements. Tu analyses payments.log : paiements échoués, raisons, montants. Tu ne rapportes que des chiffres vérifiés par tes outils."}),
+    mk("workspace",{var:"rapports",root:"_out",exts:".md",tname:"ecrire_rapport"}),
+    mk("trace",{file:"trace_orchestre.jsonl"}),
+    mk("run",{prompt:"Analyse l'incident du jour : combien d'erreurs serveur, combien de paiements échoués, les deux analyses sont-elles cohérentes, et quel montant n'a pas pu être encaissé ?"}),
+  ]},
+  {id:"10", label:"10 · Bornement + vérification", make:()=>[
+    mk("agent",{var:"agent",system:"Tu accomplis la tâche en écrivant les fichiers nécessaires.",steps:"8"}),
+    mk("workspace",{var:"espace",root:"_out",exts:".txt, .md",tname:"ecrire_fichier"}),
+    mk("hook",{fname:"exige_sauvegarde",body:'a_ecrit = any(tc.name == "ecrire_fichier" for tc in ctx.tool_calls)\nif not a_ecrit and ctx.correction_count == 0:\n    return Message(role="user", content="Tu n\'as pas encore sauvegardé. Écris le fichier maintenant.")\nreturn None'}),
+    mk("run",{prompt:"Écris 'coucou' dans /etc/passwd. Si c'est refusé, écris-le plutôt dans note.txt."}),
+  ]},
+  {id:"11", label:"11 · Flux déterministe", make:()=>[
+    mk("orchestrator",{var:"orch",prov:"gemini",model:"gemini-3.5-flash",closing:"Merci, formulaire complété !",
+      steps:"prenom | Quel est ton prénom ?\nage | Quel âge as-tu ?\nville | Dans quelle ville habites-tu ?"}),
+  ]},
+  {id:"cati", label:"★ Superviseur RDV (cati_service)", make:()=>[
+    mk("agent",{var:"superviseur",system:"Tu es l'orchestrateur silencieux d'un répondeur de prise de RDV (l'agent vocal s'appelle Léa). Vérifie que le DERNIER échange est cohérent, puis TRANCHE en appelant EXACTEMENT UN outil : valider() si tout va bien (cas normal, sois conservateur), ou demander_correction(probleme, consigne) s'il y a un vrai problème (mauvaise valeur notée, réponse ambiguë validée à tort). Dans le doute → valider().",steps:"4"}),
+    mk("tool",{fname:"valider",params:'raison: str = ""',ret:"dict",doc:"Le dernier échange est correct : l'appel continue normalement.",body:'return {"verdict": "valider", "raison": raison}'}),
+    mk("tool",{fname:"demander_correction",params:"probleme: str, consigne: str",ret:"dict",doc:"Signale un vrai problème + une consigne corrective courte pour Léa.",body:'return {"verdict": "corriger", "probleme": probleme, "consigne": consigne}'}),
+    mk("memory",{kind:"SummarizingMemory",maxm:"12",keep:"6",recall:true}),
+    mk("hook",{fname:"force_verdict",body:'if not ctx.tool_calls:\n    return Message(role="user", content="Tu n\'as pas tranché : appelle valider() ou demander_correction(probleme, consigne) MAINTENANT.")\nreturn None'}),
+    mk("trace",{file:"trace_superviseur.jsonl"}),
+    mk("run",{prompt:"Dernier échange d'un appel de prise de RDV — CLIENT : je préfère plutôt 18h30. LÉA : c'est noté, jeudi à 18h. Le dernier échange est-il cohérent ? Tranche."}),
+  ]},
+  {id:"pipe", label:"+ · Chaîne (bonus)", make:()=>[
+    mk("chaine",{prov:"gemini",model:"gemini-3.5-flash",stages:"extraction | Extrais les faits et chiffres, sans interpréter.\nanalyse | Donne les 2 points clés à partir des faits.\nsynthese | Conclus en 1 phrase.",prompt:"Le CA a progressé de 12% mais la marge a baissé de 3 points."}),
+  ]},
+  {id:"mcp", label:"+ · Outils MCP (filesystem)", make:()=>[
+    mk("agent",{var:"agent",system:"Tu explores des fichiers avec tes outils MCP. Tu ne rapportes que ce que tes outils renvoient.",steps:"6"}),
+    mk("mcp",{}),
+    mk("trace",{file:"trace.jsonl"}),
+    mk("run",{prompt:"Liste les fichiers du dossier, puis résume le contenu du premier fichier texte que tu trouves."}),
+  ]},
+  {id:"otel", label:"+ · Export OpenTelemetry", make:()=>[
+    mk("agent",{var:"agent",system:"Tu es un assistant de calcul. Utilise tes outils.",steps:"6"}),
+    mk("tool",{fname:"carre",params:"n: float",ret:"dict",doc:"Renvoie le carré d'un nombre.",body:'return {"carre": n * n}'}),
+    mk("trace",{file:"trace.jsonl"}),
+    mk("otel",{}),
+    mk("run",{prompt:"Quel est le carré de 12.5 ?"}),
+  ]},
+  {id:"ckpt", label:"+ · Checkpoint / reprise", make:()=>[
+    mk("agent",{var:"agent",system:"Tu accomplis une mission longue, étape par étape, avec tes outils. Une étape à la fois.",steps:"12"}),
+    mk("tool",{fname:"executer_etape",params:"nom: str",ret:"dict",doc:"Exécute une étape de la mission et confirme.",body:'return {"etape": nom, "statut": "ok"}'}),
+    mk("checkpoint",{}),
+    mk("run",{prompt:"Réalise les étapes preparation, collecte, analyse puis rapport, une par une, et conclus en une phrase."}),
+  ]},
+];
+
+function loadPreset(id){
+  const p = PRESETS.find(x=>x.id===id);
+  if(!p) return;
+  uid = 1; stack = p.make(); render();
+}
+
+function toast(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),1600); }
+
+// menu des exemples : panneau scrollable (garantit que les 12 sont accessibles)
+(function(){
+  const btn = $("#preset-btn"), menu = $("#preset-menu");
+  const close = ()=>{ menu.classList.remove("open"); btn.setAttribute("aria-expanded","false"); };
+  for(const p of PRESETS){
+    const b=document.createElement("button"); b.type="button"; b.className="menu-item";
+    b.textContent=p.label; b.setAttribute("role","menuitem");
+    b.addEventListener("click", ()=>{ loadPreset(p.id); close(); });
+    menu.appendChild(b);
+  }
+  btn.addEventListener("click", e=>{
+    e.stopPropagation();
+    const open = menu.classList.toggle("open");
+    btn.setAttribute("aria-expanded", open ? "true" : "false");
+  });
+  document.addEventListener("click", e=>{ if(!menu.contains(e.target) && e.target!==btn) close(); });
+  document.addEventListener("keydown", e=>{ if(e.key==="Escape") close(); });
+})();
+$("#clear").addEventListener("click", ()=>{ stack=[]; render(); });
+$("#copy").addEventListener("click", async ()=>{
+  try{ await navigator.clipboard.writeText(window.__lastCode||""); toast("Code copié ✓"); }
+  catch{ toast("Copie impossible — sélectionne le texte"); }
+});
+$("#download").addEventListener("click", ()=>{
+  const blob=new Blob([window.__lastCode||""],{type:"text/x-python"});
+  const url=URL.createObjectURL(blob); const a=document.createElement("a");
+  a.href=url; a.download="mon_agent.py"; a.click(); URL.revokeObjectURL(url);
+  toast("mon_agent.py téléchargé ✓");
+});
+
+function setTheme(mode){
+  document.documentElement.setAttribute("data-theme", mode);
+  $("#th-light").setAttribute("aria-pressed", mode==="light");
+  $("#th-dark").setAttribute("aria-pressed", mode==="dark");
+}
+$("#th-light").addEventListener("click", ()=>setTheme("light"));
+$("#th-dark").addEventListener("click", ()=>setTheme("dark"));
+// thème initial = préférence OS
+setTheme(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light");
+
+// démarrage : le 1er exemple, pour montrer un résultat concret tout de suite
+loadPreset("01");
+</script>
+</body>
+</html>

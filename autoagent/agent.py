@@ -10,6 +10,7 @@ from typing import Any, Callable
 from .dynamic import DynamicToolBuilder, ToolBuildRequest
 from .errors import (
     AgentCancelled,
+    ApprovalRequired,
     AutoAgentError,
     MaxStepsExceeded,
     TokenBudgetExceeded,
@@ -19,7 +20,7 @@ from .logging import get_logger
 from .memory import Memory
 from .providers import create_provider
 from .providers.base import LLMProvider
-from .registry import ToolRegistry
+from .registry import ToolRegistry, ToolResult
 from .schema import (
     LLMRequest,
     LLMResponse,
@@ -32,7 +33,16 @@ from .schema import (
 )
 from .trace import TraceEmitter, truncate_preview
 
-__all__ = ["Agent", "AgentResult", "AgentTurnContext", "PostTurnHook"]
+__all__ = [
+    "Agent",
+    "AgentResult",
+    "AgentTurnContext",
+    "CheckpointHook",
+    "PostTurnHook",
+    "RunState",
+    "ToolPolicy",
+    "ToolPolicyContext",
+]
 
 _log = get_logger("agent")
 
@@ -50,6 +60,100 @@ class AgentResult:
     # Total tokens du run (somme des usages rapportés par le provider).
     # None quand aucun appel n'a rapporté d'usage. Added in 0.10.0.
     usage: TokenUsage | None = None
+
+
+@dataclass
+class RunState:
+    """A resumable snapshot of an agent run, taken at a step boundary (0.11.0).
+
+    Produced by the ``checkpoint`` callback of ``run``/``run_messages``
+    (and their streaming twins) after every completed step, and attached
+    as ``.state`` to ``MaxStepsExceeded`` / ``TokenBudgetExceeded`` /
+    ``AgentCancelled``. Feed it to ``Agent.resume`` to continue the run
+    where it stopped — after a crash, a process restart, or with a
+    raised ``max_steps`` / ``token_budget``.
+
+    JSON round-trip via ``to_dict`` / ``from_dict`` (messages use the
+    lossless ``Message.to_dict`` from 0.7.0)::
+
+        path.write_text(json.dumps(state.to_dict()))
+        ...
+        agent.resume(RunState.from_dict(json.loads(path.read_text())))
+
+    Attributes:
+        messages: Full conversation at the snapshot point (consistent:
+            every tool result of the last step is included).
+        step: Completed steps so far — resume continues at ``step + 1``
+            and still honours the agent's ``max_steps``.
+        corrections: post_turn_hook corrections already injected.
+        turn_start: Index where the current user turn begins (used by
+            the post_turn_hook accounting; do not edit).
+        input_tokens / output_tokens: Token spend so far, so a resumed
+            run keeps honouring ``token_budget``.
+        have_usage: Whether any provider call reported usage.
+    """
+
+    messages: list[Message]
+    step: int = 0
+    corrections: int = 0
+    turn_start: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    have_usage: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "step": self.step,
+            "corrections": self.corrections,
+            "turn_start": self.turn_start,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "have_usage": self.have_usage,
+            "messages": [m.to_dict() for m in self.messages],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RunState":
+        return cls(
+            messages=[Message.from_dict(m) for m in data.get("messages") or []],
+            step=data.get("step", 0),
+            corrections=data.get("corrections", 0),
+            turn_start=data.get("turn_start", 0),
+            input_tokens=data.get("input_tokens", 0),
+            output_tokens=data.get("output_tokens", 0),
+            have_usage=data.get("have_usage", False),
+        )
+
+
+CheckpointHook = Callable[["RunState"], None]
+
+
+@dataclass
+class ToolPolicyContext:
+    """What a ``tool_policy`` hook sees for ONE pending tool call (0.11.0).
+
+    Attributes:
+        call: The pending ``ToolCall`` (name, arguments, id). The ``id``
+            is stable across pause/resume — key your approval store on it.
+        spec: The registered ``ToolSpec`` (``spec.permissions`` is where
+            declarative permissions live), or ``None`` for unknown tools.
+        step: Current loop step (1-based).
+        messages: The conversation so far (treat as READ-ONLY).
+        context: The host ``context`` dict passed to ``run`` — the natural
+            place for a user id, quotas, or an approval store handle.
+    """
+
+    call: ToolCall
+    spec: ToolSpec | None
+    step: int
+    messages: list[Message]
+    context: dict[str, Any]
+
+
+# None = allow. A str = deny with that reason (the model sees it as a tool
+# error and re-plans). Raise ApprovalRequired to PAUSE the run resumably.
+ToolPolicy = Callable[[ToolPolicyContext], "str | None"]
 
 
 @dataclass
@@ -157,6 +261,15 @@ class Agent:
             before each run. `Agent.run_messages` calls `compact()`
             ONCE before the loop. Errors raised by `compact()` are
             isolated and logged. Added in 0.6.0.
+        tool_policy: Optional hook consulted for EVERY pending tool call
+            BEFORE anything of that turn executes (0.11.0). Receives a
+            ``ToolPolicyContext``; return ``None`` to allow, a ``str``
+            to deny with that reason (surfaced to the model as a tool
+            error), or raise ``ApprovalRequired`` to PAUSE the run with
+            a resumable ``RunState`` attached (``exc.state``) — the
+            approval-gate case. A policy that itself crashes DENIES the
+            call (fail-closed: this is a security boundary, unlike
+            trace/checkpoint callbacks which fail-open).
     """
 
     def __init__(
@@ -175,6 +288,7 @@ class Agent:
         memory: Memory | None = None,
         parallel_tool_calls: bool = False,
         token_budget: int | None = None,
+        tool_policy: ToolPolicy | None = None,
     ) -> None:
         self.provider = provider
         self.registry = registry or ToolRegistry()
@@ -189,6 +303,7 @@ class Agent:
         self.memory = memory
         self.parallel_tool_calls = parallel_tool_calls
         self.token_budget = token_budget
+        self.tool_policy = tool_policy
         self.dynamic_builder: DynamicToolBuilder | None = None
         self._dynamic_tools_built_this_run = 0
 
@@ -441,12 +556,15 @@ class Agent:
         *,
         context: dict[str, Any] | None = None,
         cancel_token: threading.Event | None = None,
+        checkpoint: CheckpointHook | None = None,
     ) -> AgentResult:
         messages = [
             Message(role="system", content=self.render_system_prompt()),
             Message(role="user", content=prompt),
         ]
-        return self.run_messages(messages, context=context, cancel_token=cancel_token)
+        return self.run_messages(
+            messages, context=context, cancel_token=cancel_token, checkpoint=checkpoint
+        )
 
     def run_messages(
         self,
@@ -454,6 +572,7 @@ class Agent:
         *,
         context: dict[str, Any] | None = None,
         cancel_token: threading.Event | None = None,
+        checkpoint: CheckpointHook | None = None,
     ) -> AgentResult:
         # Thin wrapper over the single loop implementation (_run_loop).
         # Intermediate events (tool_start/tool_end/correction) are ignored;
@@ -461,7 +580,11 @@ class Agent:
         # MaxStepsExceeded, provider/tool errors) propagate unchanged, so
         # the non-streaming contract is identical to pre-0.10 behaviour.
         for event in self._run_loop(
-            messages, context=context, cancel_token=cancel_token, streaming=False
+            messages,
+            context=context,
+            cancel_token=cancel_token,
+            streaming=False,
+            checkpoint=checkpoint,
         ):
             if event.type == "done":
                 return AgentResult(
@@ -472,12 +595,102 @@ class Agent:
                 )
         raise AutoAgentError("agent loop ended without a result")  # pragma: no cover
 
+    def resume(
+        self,
+        state: RunState,
+        *,
+        context: dict[str, Any] | None = None,
+        cancel_token: threading.Event | None = None,
+        checkpoint: CheckpointHook | None = None,
+    ) -> AgentResult:
+        """Continue an interrupted run from a ``RunState`` snapshot (0.11.0).
+
+        The loop restarts at ``state.step + 1`` with the snapshot's
+        conversation and counters (corrections, token spend), so
+        ``max_steps`` and ``token_budget`` keep their run-wide meaning.
+        To resume past the limit that stopped the run, raise the
+        agent's ``max_steps`` / ``token_budget`` first (or resume on an
+        agent built with bigger ones — provider and tools may differ).
+
+        Memory compaction is SKIPPED on resume: the snapshot is mid-run
+        and its ``turn_start`` index must stay valid. The usual pattern::
+
+            try:
+                result = agent.run(prompt, checkpoint=save_state)
+            except TokenBudgetExceeded as exc:
+                agent.token_budget *= 2
+                result = agent.resume(exc.state)
+        """
+        for event in self._run_loop(
+            state.messages,
+            context=context,
+            cancel_token=cancel_token,
+            streaming=False,
+            checkpoint=checkpoint,
+            resume_from=state,
+        ):
+            if event.type == "done":
+                return AgentResult(
+                    output=event.output,
+                    messages=event.messages,
+                    steps=event.steps,
+                    usage=event.usage,
+                )
+        raise AutoAgentError("agent loop ended without a result")  # pragma: no cover
+
+    def resume_stream(
+        self,
+        state: RunState,
+        *,
+        context: dict[str, Any] | None = None,
+        cancel_token: threading.Event | None = None,
+        checkpoint: CheckpointHook | None = None,
+    ) -> Iterator[StreamEvent]:
+        """Streaming counterpart of ``resume`` — see ``run_messages_stream``
+        for the error-event contract."""
+        try:
+            yield from self._run_loop(
+                state.messages,
+                context=context,
+                cancel_token=cancel_token,
+                streaming=True,
+                checkpoint=checkpoint,
+                resume_from=state,
+            )
+        except AgentCancelled as exc:
+            yield StreamEvent(type="error", error="cancelled", steps=getattr(exc, "step", 0))
+        except ApprovalRequired as exc:
+            state = getattr(exc, "state", None)
+            yield StreamEvent(
+                type="error",
+                error=f"approval_required: {exc}",
+                messages=getattr(state, "messages", []),
+                steps=getattr(state, "step", 0),
+                state=state,
+            )
+        except MaxStepsExceeded as exc:
+            yield StreamEvent(
+                type="error",
+                error=f"max_steps={self.max_steps} exceeded",
+                messages=getattr(exc, "messages", []),
+                steps=self.max_steps,
+            )
+        except TokenBudgetExceeded as exc:
+            yield StreamEvent(
+                type="error",
+                error=f"token_budget={self.token_budget} exceeded (spent={getattr(exc, 'spent', '?')})",
+                messages=getattr(exc, "messages", []),
+            )
+        except Exception as exc:
+            yield StreamEvent(type="error", error=f"{type(exc).__name__}: {exc}")
+
     def run_stream(
         self,
         prompt: str,
         *,
         context: dict[str, Any] | None = None,
         cancel_token: threading.Event | None = None,
+        checkpoint: CheckpointHook | None = None,
     ) -> Iterator[StreamEvent]:
         """Streaming counterpart of ``run``.
 
@@ -498,7 +711,7 @@ class Agent:
             Message(role="user", content=prompt),
         ]
         yield from self.run_messages_stream(
-            messages, context=context, cancel_token=cancel_token
+            messages, context=context, cancel_token=cancel_token, checkpoint=checkpoint
         )
 
     def run_messages_stream(
@@ -507,16 +720,30 @@ class Agent:
         *,
         context: dict[str, Any] | None = None,
         cancel_token: threading.Event | None = None,
+        checkpoint: CheckpointHook | None = None,
     ) -> Iterator[StreamEvent]:
         """Streaming counterpart of ``run_messages`` — see ``run_stream``."""
         # Same single loop as run_messages, but failures become terminal
         # ``error`` events: streaming consumers read events, they don't catch.
         try:
             yield from self._run_loop(
-                messages, context=context, cancel_token=cancel_token, streaming=True
+                messages,
+                context=context,
+                cancel_token=cancel_token,
+                streaming=True,
+                checkpoint=checkpoint,
             )
         except AgentCancelled as exc:
             yield StreamEvent(type="error", error="cancelled", steps=getattr(exc, "step", 0))
+        except ApprovalRequired as exc:
+            state = getattr(exc, "state", None)
+            yield StreamEvent(
+                type="error",
+                error=f"approval_required: {exc}",
+                messages=getattr(state, "messages", []),
+                steps=getattr(state, "step", 0),
+                state=state,
+            )
         except MaxStepsExceeded as exc:
             yield StreamEvent(
                 type="error",
@@ -540,6 +767,8 @@ class Agent:
         context: dict[str, Any] | None,
         cancel_token: threading.Event | None,
         streaming: bool,
+        checkpoint: CheckpointHook | None = None,
+        resume_from: RunState | None = None,
     ) -> Iterator[StreamEvent]:
         """THE agent loop — single implementation behind both public entry
         points (0.10.0; previously ``run_messages`` and
@@ -555,22 +784,150 @@ class Agent:
         modulo the ``streaming`` flag in run_start/llm_request payloads.
         """
         working_messages = list(messages)
-        if self.memory is not None:
+        if self.memory is not None and resume_from is None:
             # Compact ONCE before the loop. Doing it per-iteration would
             # invalidate turn_start mid-run and complicate the
             # post_turn_hook accounting. Hosts that need finer control
             # can call memory.compact() themselves before passing the
-            # messages in.
+            # messages in. SKIPPED on resume: a snapshot is mid-run and
+            # compaction would shift the persisted turn_start index.
             try:
                 working_messages = list(self.memory.compact(working_messages))
             except Exception:
                 _log.exception("memory.compact raised; using messages unchanged")
         self._dynamic_tools_built_this_run = 0
-        corrections = 0
-        turn_start = len(working_messages)
-        spent_in = 0
-        spent_out = 0
-        have_usage = False
+        corrections = resume_from.corrections if resume_from else 0
+        turn_start = resume_from.turn_start if resume_from else len(working_messages)
+        spent_in = resume_from.input_tokens if resume_from else 0
+        spent_out = resume_from.output_tokens if resume_from else 0
+        have_usage = resume_from.have_usage if resume_from else False
+        start_step = (resume_from.step if resume_from else 0) + 1
+
+        def _snapshot(completed_step: int) -> RunState:
+            return RunState(
+                messages=list(working_messages),
+                step=completed_step,
+                corrections=corrections,
+                turn_start=turn_start,
+                input_tokens=spent_in,
+                output_tokens=spent_out,
+                have_usage=have_usage,
+            )
+
+        def _checkpoint(completed_step: int) -> None:
+            if checkpoint is None:
+                return
+            try:
+                checkpoint(_snapshot(completed_step))
+            except Exception:
+                # Same resilience contract as trace callbacks: persistence
+                # trouble must not kill the run it is trying to protect.
+                _log.exception("checkpoint callback raised; run continues")
+
+        def _policy_overrides(
+            calls: list[ToolCall], step: int, req_span: str | None
+        ) -> dict[str, ToolResult]:
+            """Consult tool_policy for the WHOLE turn before any side effect.
+
+            Returns {call_id: denial ToolResult} for denied calls. Raises
+            ApprovalRequired (with a resumable snapshot attached) BEFORE
+            anything of the turn has executed — a pause must never land
+            after a side effect.
+            """
+            overrides: dict[str, ToolResult] = {}
+            if self.tool_policy is None:
+                return overrides
+            for call in calls:
+                spec = next((s for s in self.registry.specs() if s.name == call.name), None)
+                policy_ctx = ToolPolicyContext(
+                    call=call, spec=spec, step=step,
+                    messages=working_messages, context=context or {},
+                )
+                try:
+                    verdict = self.tool_policy(policy_ctx)
+                except ApprovalRequired as pause:
+                    pause.state = _snapshot(step)  # LLM call done, zero tools executed
+                    pause.calls = list(calls)
+                    self._emit(
+                        "approval_required",
+                        {
+                            "step": step,
+                            "call_id": call.id,
+                            "names": [c.name for c in calls],
+                            "reason": truncate_preview(str(pause)),
+                        },
+                        parent_id=req_span,
+                    )
+                    raise
+                except Exception as exc:
+                    # Fail-CLOSED: a buggy policy denies. This hook is a
+                    # security boundary — the opposite contract of trace/
+                    # checkpoint callbacks, which fail-open.
+                    _log.exception("tool_policy raised; denying %r (fail-closed)", call.name)
+                    verdict = f"policy error: {type(exc).__name__}: {exc}"
+                if verdict is None:
+                    continue
+                if not isinstance(verdict, str):
+                    verdict = "policy returned an unsupported verdict type"
+                overrides[call.id] = ToolResult(ok=False, error=f"ToolPolicyDenied: {verdict}")
+                self._emit(
+                    "tool_policy_deny",
+                    {"name": call.name, "call_id": call.id, "step": step,
+                     "reason": truncate_preview(verdict)},
+                    parent_id=req_span,
+                )
+            return overrides
+
+        def _run_turn_tools(
+            calls: list[ToolCall], step: int, req_span: str | None
+        ) -> Iterator[StreamEvent]:
+            """Execute one turn's tool calls (policy-checked), append results."""
+            overrides = _policy_overrides(calls, step, req_span)
+
+            def _timed(call: ToolCall) -> tuple[Any, int]:
+                denied = overrides.get(call.id)
+                if denied is not None:
+                    return denied, 0
+                started_at = time.monotonic()
+                result = self.registry.execute(call, context=context)
+                return result, int((time.monotonic() - started_at) * 1000)
+
+            if self.parallel_tool_calls and len(calls) > 1:
+                # Concurrent execution (opt-in). Starts are announced in
+                # call order, every call runs in a thread pool, then ends
+                # and transcript messages follow the SAME call order —
+                # the conversation stays deterministic whatever the
+                # completion order.
+                spans: list[str | None] = []
+                for call in calls:
+                    spans.append(self._emit_tool_start(call, req_span))
+                    yield StreamEvent(type="tool_start", tool_name=call.name)
+                with ThreadPoolExecutor(
+                    max_workers=min(len(calls), 8),
+                    thread_name_prefix="autoagent-tool",
+                ) as pool:
+                    outcomes = list(pool.map(_timed, calls))
+                for call, tool_span, (tool_result, duration_ms) in zip(calls, spans, outcomes):
+                    self._emit_tool_end(call, tool_span, tool_result, duration_ms)
+                    yield StreamEvent(
+                        type="tool_end",
+                        tool_name=call.name,
+                        tool_status="ok" if tool_result.ok else "error",
+                    )
+                    working_messages.append(_tool_message(call, tool_result))
+            else:
+                for call in calls:
+                    tool_span = self._emit_tool_start(call, req_span)
+                    yield StreamEvent(type="tool_start", tool_name=call.name)
+                    tool_result, duration_ms = _timed(call)
+                    self._emit_tool_end(call, tool_span, tool_result, duration_ms)
+                    yield StreamEvent(
+                        type="tool_end",
+                        tool_name=call.name,
+                        tool_status="ok" if tool_result.ok else "error",
+                    )
+                    working_messages.append(_tool_message(call, tool_result))
+
         model = getattr(getattr(self.provider, "config", None), "model", None)
         run_start_payload: dict[str, Any] = {
             "max_steps": self.max_steps,
@@ -580,9 +937,26 @@ class Agent:
         }
         if streaming:
             run_start_payload["streaming"] = True
+        if resume_from is not None:
+            run_start_payload["resumed_from_step"] = resume_from.step
         run_span = self._emit("run_start", run_start_payload)
         try:
-            for step in range(1, self.max_steps + 1):
+            if (
+                resume_from is not None
+                and working_messages
+                and working_messages[-1].role == "assistant"
+                and working_messages[-1].tool_calls
+            ):
+                # The snapshot was taken by an approval gate: the last step's
+                # LLM call is in the transcript but NONE of its tools ran.
+                # Finish that step first — each pending call goes through the
+                # policy AGAIN (still unapproved → pauses again, idempotent).
+                yield from _run_turn_tools(
+                    list(working_messages[-1].tool_calls), resume_from.step, run_span
+                )
+                _checkpoint(resume_from.step)
+
+            for step in range(start_step, self.max_steps + 1):
                 # Cooperative cancellation: the host may set `cancel_token` to
                 # abort the run between iterations. We check BEFORE the next
                 # provider call so we don't waste a request when the user has
@@ -591,6 +965,7 @@ class Agent:
                     self._emit("cancelled", {"step": step}, parent_id=run_span)
                     cancelled = AgentCancelled(f"Agent cancelled by caller at step {step}")
                     cancelled.step = step  # consumed by run_messages_stream
+                    cancelled.state = _snapshot(step - 1)  # resumable via Agent.resume
                     raise cancelled
 
                 # Token budget: checked BEFORE the next provider call — the
@@ -613,6 +988,7 @@ class Agent:
                     )
                     exhausted.messages = working_messages  # consumed by run_messages_stream
                     exhausted.spent = spent
+                    exhausted.state = _snapshot(step - 1)  # resumable via Agent.resume
                     raise exhausted
 
                 request_payload: dict[str, Any] = {
@@ -683,6 +1059,7 @@ class Agent:
                         corrections += 1
                         turn_start = len(working_messages)
                         yield StreamEvent(type="correction", text=correction.content)
+                        _checkpoint(step)
                         continue
                     self._emit(
                         "run_end",
@@ -706,51 +1083,11 @@ class Agent:
                     )
                     return
 
-                if self.parallel_tool_calls and len(response.tool_calls) > 1:
-                    # Concurrent execution (opt-in). Starts are announced in
-                    # call order, every call runs in a thread pool, then ends
-                    # and transcript messages follow the SAME call order —
-                    # the conversation stays deterministic whatever the
-                    # completion order.
-                    spans: list[str | None] = []
-                    for call in response.tool_calls:
-                        spans.append(self._emit_tool_start(call, req_span))
-                        yield StreamEvent(type="tool_start", tool_name=call.name)
+                yield from _run_turn_tools(list(response.tool_calls), step, req_span)
 
-                    def _timed(call: ToolCall) -> tuple[Any, int]:
-                        started_at = time.monotonic()
-                        result = self.registry.execute(call, context=context)
-                        return result, int((time.monotonic() - started_at) * 1000)
-
-                    with ThreadPoolExecutor(
-                        max_workers=min(len(response.tool_calls), 8),
-                        thread_name_prefix="autoagent-tool",
-                    ) as pool:
-                        outcomes = list(pool.map(_timed, response.tool_calls))
-                    for call, tool_span, (tool_result, duration_ms) in zip(
-                        response.tool_calls, spans, outcomes
-                    ):
-                        self._emit_tool_end(call, tool_span, tool_result, duration_ms)
-                        yield StreamEvent(
-                            type="tool_end",
-                            tool_name=call.name,
-                            tool_status="ok" if tool_result.ok else "error",
-                        )
-                        working_messages.append(_tool_message(call, tool_result))
-                else:
-                    for call in response.tool_calls:
-                        tool_span = self._emit_tool_start(call, req_span)
-                        yield StreamEvent(type="tool_start", tool_name=call.name)
-                        started_at = time.monotonic()
-                        tool_result = self.registry.execute(call, context=context)
-                        duration_ms = int((time.monotonic() - started_at) * 1000)
-                        self._emit_tool_end(call, tool_span, tool_result, duration_ms)
-                        yield StreamEvent(
-                            type="tool_end",
-                            tool_name=call.name,
-                            tool_status="ok" if tool_result.ok else "error",
-                        )
-                        working_messages.append(_tool_message(call, tool_result))
+                # Step boundary: every tool result of this step is in the
+                # transcript — the run is resumable from exactly here.
+                _checkpoint(step)
 
             self._emit("max_steps_exceeded", {"max_steps": self.max_steps}, parent_id=run_span)
             self._emit(
@@ -760,9 +1097,13 @@ class Agent:
             )
             exceeded = MaxStepsExceeded(f"Agent exceeded max_steps={self.max_steps}")
             exceeded.messages = working_messages  # consumed by run_messages_stream
+            exceeded.state = _snapshot(self.max_steps)  # resumable after raising max_steps
             raise exceeded
         except AgentCancelled:
             self._emit("run_end", {"status": "cancelled"}, parent_id=run_span)
+            raise
+        except ApprovalRequired:
+            self._emit("run_end", {"status": "approval_required"}, parent_id=run_span)
             raise
         except (MaxStepsExceeded, TokenBudgetExceeded):
             raise  # run_end already emitted at the raise site

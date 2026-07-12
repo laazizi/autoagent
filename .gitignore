@@ -1,0 +1,15 @@
+# Contexte personnel — ne jamais publier
+.context/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.hypothesis/
+*.egg-info/
+build/
+dist/
+
+# Secrets
+.env

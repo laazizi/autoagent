@@ -35,6 +35,10 @@
 14. [Pièges fréquents et FAQ](#14-pièges-fréquents-et-faq)
 15. [`Orchestrator` — flux déterministe piloté par le host](#15-orchestrator--flux-déterministe-piloté-par-le-host) *(0.9.0)*
 16. [Nouveautés 0.8.0 → 0.10.0](#16-nouveautés-080--0100) — streaming, `SummarizingMemory`, `as_tool`, `token_budget`, `RoutingProvider`…
+17. [`MCPClient` — outils MCP branchés comme des tools locaux](#17-mcpclient--outils-mcp-branchés-comme-des-tools-locaux) *(0.11.0)*
+18. [`OTelTraceExporter` — traces vers OpenTelemetry](#18-oteltraceexporter--traces-vers-opentelemetry) *(0.11.0)*
+19. [`RunState` — checkpoint / resume (agents longue durée)](#19-runstate--checkpoint--resume-agents-longue-durée) *(0.11.0)*
+20. [`tool_policy` — politique d'exécution des outils & approval gate](#20-tool_policy--politique-dexécution-des-outils--approval-gate) *(0.11.0)*
 
 ---
 
@@ -87,7 +91,9 @@
 | `autoagent/providers/routing.py` | `RoutingProvider` — dispatch par requête (texte→cheap, image→vision), §16.7 | — |
 | `autoagent/logging.py` | Logger + `SecretRedactingFilter` | — |
 | **`autoagent/trace.py`** | **`TraceEmitter`, `TraceEvent`, `truncate_preview`** | **0.5.0** |
-| **`autoagent/memory.py`** | **`Memory` Protocol, `BufferMemory`** | **0.6.0** |
+| **`autoagent/memory.py`** | **`Memory` Protocol, `BufferMemory`, `SummarizingMemory` (0.10.0)** | **0.6.0** |
+| **`autoagent/mcp.py`** | **`MCPClient` — outils d'un serveur MCP montés comme tools locaux (stdio, zéro dép.), §17** | **0.11.0** |
+| **`autoagent/otel.py`** | **`OTelTraceExporter` — trace → spans OpenTelemetry (dépendance optionnelle), §18** | **0.11.0** |
 
 ---
 
@@ -305,6 +311,7 @@ class Agent:
         *,
         context: dict[str, Any] | None = None,
         cancel_token: threading.Event | None = None,
+        checkpoint: CheckpointHook | None = None,   # 0.11.0 — snapshot RunState par étape (§19)
     ) -> AgentResult: ...
 
     def run_messages(
@@ -313,9 +320,15 @@ class Agent:
         *,
         context: dict[str, Any] | None = None,
         cancel_token: threading.Event | None = None,
+        checkpoint: CheckpointHook | None = None,   # 0.11.0
     ) -> AgentResult:
         """Continue une conversation. Si self.memory est défini, appelle
         memory.compact(messages) une seule fois avant la boucle."""
+
+    def resume(self, state: RunState, *, context=None, cancel_token=None,
+               checkpoint=None) -> AgentResult:
+        """0.11.0 — reprend un run interrompu à state.step + 1 (§19).
+        resume_stream(state, ...) = jumeau streaming."""
 ```
 
 **Exemple complet — tout branché** :
@@ -1875,12 +1888,15 @@ autoagent/
 ├── pipeline.py              # PipelineManager (pipeline.json)
 ├── evolution.py             # EvolutionRuntime, EVOLUTION_CAPABILITIES
 ├── dynamic.py               # DynamicToolBuilder, ToolBuildRequest
-├── sandbox.py               # SubprocessSandbox
-├── http.py                  # post_json (urllib wrapper)
-├── errors.py                # MaxStepsExceeded, AgentCancelled, ProviderError, ...
+├── sandbox.py               # SubprocessSandbox, DockerSandbox, make_sandbox, pont host-function
+├── http.py                  # post_json / post_sse (urllib wrapper + retry/backoff)
+├── errors.py                # MaxStepsExceeded, AgentCancelled, ProviderError, TokenBudgetExceeded,
+│                            # MCPError (0.11.0), ...
 ├── logging.py               # get_logger + SecretRedactingFilter + redact()
 ├── trace.py                 # 0.5.0 — TraceEmitter, TraceEvent, OnEvent, truncate_preview
-├── memory.py                # 0.6.0 — Memory (Protocol), BufferMemory
+├── memory.py                # 0.6.0 — Memory (Protocol), BufferMemory ; 0.10.0 — SummarizingMemory
+├── mcp.py                   # 0.11.0 — MCPClient (serveur MCP stdio → tools locaux, §17)
+├── otel.py                  # 0.11.0 — OTelTraceExporter (trace → spans OTel, §18)
 └── providers/
     ├── __init__.py
     ├── base.py              # Protocol LLMProvider
@@ -1928,11 +1944,25 @@ from autoagent import (
     # 0.6.0 — memory
     Memory, BufferMemory,
 
+    # 0.8.0 → 0.10.0 — streaming, mémoire résumante, multi-agent, budget, routing
+    StreamChunk, StreamEvent,
+    SummarizingMemory,
+    TokenUsage,
+    RoutingProvider,
+    Orchestrator, Step, TurnEvent, InterpretOutcome, PhraseSignals,   # 0.9.0
+
+    # 0.11.0 — MCP, OpenTelemetry, checkpoint/resume, politique d'outils
+    MCPClient,
+    OTelTraceExporter,
+    RunState, CheckpointHook,
+    ToolPolicy, ToolPolicyContext, ApprovalRequired,
+
     # Providers (instances directes si besoin)
     AnthropicProvider, DeepSeekProvider, GeminiProvider, OpenAIProvider, LLMProvider,
 
     # Erreurs
     AutoAgentError, MaxStepsExceeded, ProviderError, ToolError, ToolValidationError,
+    TokenBudgetExceeded, MCPError,
 )
 from autoagent.trace import truncate_preview        # helper public pour previews redactés
 ```
@@ -2100,16 +2130,17 @@ for ev in orch.turn("je m'appelle Ana et j'ai 30 ans"):
 
 ## 16. Nouveautés 0.8.0 → 0.10.0
 
-> Documenté depuis le code (2026-07-06). Sept ajouts majeurs : le **streaming**,
+> Documenté depuis le code (2026-07-06). Huit ajouts majeurs : le **streaming**,
 > la **mémoire résumante**, le **multi-agent minimal** (`as_tool`), le **budget de
-> tokens**, le **prompt système dynamique**, les **tool calls parallèles** et le
-> **routage multi-provider**.
+> tokens**, le **prompt système dynamique**, les **tool calls parallèles**, la
+> **sortie structurée native** (`response_format`) et le **routage multi-provider**.
 
 ### 16.1 Streaming : `run_stream` / `run_messages_stream` *(0.8.0)*
 
 ```python
-def run_stream(self, prompt, *, context=None, cancel_token=None) -> Iterator[StreamEvent]: ...
-def run_messages_stream(self, messages, *, context=None, cancel_token=None) -> Iterator[StreamEvent]: ...
+def run_stream(self, prompt, *, context=None, cancel_token=None, checkpoint=None) -> Iterator[StreamEvent]: ...
+def run_messages_stream(self, messages, *, context=None, cancel_token=None, checkpoint=None) -> Iterator[StreamEvent]: ...
+# (checkpoint= ajouté en 0.11.0 — voir §19)
 ```
 
 Contrepartie streaming de `run`/`run_messages` — **itérateurs synchrones** (pas d'async) :
@@ -2270,14 +2301,212 @@ agent = Agent(provider)     # l'Agent ne voit RIEN : contrat LLMProvider standar
   streaming NATIF du provider choisi). `self.config` proxifie `default.config` — les hôtes
   qui lisent `agent.provider.config.model` continuent de marcher.
 
-### 16.8 Récap des versions
+### 16.8 Sortie structurée native : `LLMRequest.response_format` *(0.10.0)*
+
+Le JSON strict est demandé au PROVIDER (capacité native quand elle existe),
+plus besoin de parser la prose du modèle :
+
+```python
+from autoagent import LLMRequest, Message
+
+resp = provider.complete(LLMRequest(
+    messages=[Message(role="user", content="3 villes de France, clés: nom, region. JSON.")],
+    response_format={"type": "json_object"},
+))
+data = json.loads(resp.content)      # fiable — le mode JSON est garanti par l'API
+```
+
+Mapping par provider :
+
+| provider | mécanisme |
+|---|---|
+| OpenAI / DeepSeek / Groq | `response_format` transmis VERBATIM (accepte aussi `{"type": "json_schema", "json_schema": {...}}` strict) |
+| Gemini | `generationConfig.responseMimeType = application/json` (PAS `responseSchema` : dialecte OpenAPI divergent) |
+| Anthropic | pas de mode natif → consigne système stricte « JSON only, no fences » (best effort — garder un parseur tolérant) |
+
+`DynamicToolBuilder` l'utilise depuis la 0.10 : le builder demande le JSON mode
+à la source, ce qui a tué la classe de bugs « fences ```json autour du JSON »
+(le parseur tolérant reste en filet). NB : pour un VERDICT (décision typée),
+le pattern « verdict = appel d'outil » (§14 / README) reste supérieur au JSON
+parsé — le modèle ne peut pas répondre mal formé.
+
+### 16.9 Récap des versions
 
 | Version | Ajouts |
 |---|---|
 | 0.8.0 | `run_stream` / `run_messages_stream`, `StreamEvent`, `stream()` sur les providers (SSE) + fallback |
 | 0.9.0 | `Orchestrator` (§15) |
 | 0.10.0 | `_run_loop` unifié, `SummarizingMemory`, `as_tool()`, `token_budget` + `TokenUsage`, `system_prompt` callable, `parallel_tool_calls`, usage sur `done`/`AgentResult` |
+| 0.11.0 | `MCPClient` (§17) + `MCPError`, `OTelTraceExporter` (§18), `RunState` + `checkpoint=` + `Agent.resume` (§19), `tool_policy` + `ApprovalRequired` (§20) |
 | — | `RoutingProvider` (providers/routing.py) |
+
+## 17. `MCPClient` — outils MCP branchés comme des tools locaux
+
+> `autoagent/mcp.py`, zéro dépendance. Transport **stdio uniquement** (le
+> serveur MCP est un sous-processus local, JSON-RPC 2.0 ligne par ligne).
+> Pas de HTTP/SSE pour l'instant.
+
+```python
+from autoagent import Agent, MCPClient
+
+agent = Agent.from_model("gemini", "gemini-3.5-flash", system_prompt="...")
+
+with MCPClient(["npx", "-y", "@modelcontextprotocol/server-filesystem", "."]) as mcp:
+    mcp.mount(agent, prefix="fs_")          # chaque tool serveur → tool autoagent
+    print(agent.run("Liste les fichiers du projet.").output)
+```
+
+**API** :
+
+| membre | rôle |
+|---|---|
+| `MCPClient(command, *, env=, cwd=, timeout=60.0, client_name=)` | `command` = argv liste (recommandé) ou str ; `env` FUSIONNÉ sur `os.environ` (clé API du serveur) |
+| `start()` / `close()` / context manager | lance le process + handshake `initialize` ; `close()` idempotent |
+| `list_tools()` | définitions brutes du serveur (pagination `nextCursor` suivie) |
+| `call_tool(name, arguments, timeout=)` | 1 appel ; `structuredContent` renvoyé tel quel, sinon `{"text": ...}` |
+| `tools(include=, exclude=, prefix=)` | handlers portant `__autoagent_tool_spec__` (schéma = `inputSchema` du serveur) |
+| `mount(agent, include=, exclude=, prefix=)` | `add_tool` de chaque handler ; accepte aussi un `ToolRegistry` nu |
+| `server_info` / `server_capabilities` / `alive` | état après handshake |
+
+**Sémantique** :
+* Les arguments sont validés par le `ToolRegistry` (JSON-Schema du serveur)
+  AVANT d'atteindre le serveur — même chemin qu'un `@agent.tool` local.
+* Résultat `isError` → `ToolError` → *tool error* pour le LLM (jamais un crash).
+* Échec transport/protocole (process mort, timeout, erreur JSON-RPC) → `MCPError`
+  (le bout de stderr du serveur est joint au message).
+* Thread-safe : corrélation par id → compatible `parallel_tool_calls=True`.
+* Pings serveur → répondus ; notifications → ignorées ; requêtes serveur
+  (sampling/roots) → refusées proprement (`-32601`).
+* Windows : donner le vrai exécutable (`npx.cmd`, pas `npx`) ; pipes forcés UTF-8.
+* `include`/`exclude` filtrent sur les noms CÔTÉ SERVEUR (avant `prefix`) —
+  monter 3 outils précis vaut mieux que 40 (contexte + surface d'attaque).
+
+## 18. `OTelTraceExporter` — traces vers OpenTelemetry
+
+> `autoagent/otel.py`. Dépendance `opentelemetry-api` **optionnelle** (import
+> paresseux à la construction — le cœur reste zéro-dépendance ; sans le paquet,
+> `AutoAgentError` explicite).
+
+Callback `on_event` pour `TraceEmitter` qui reconstruit l'arbre de spans de
+l'agent en vrais spans OTel (visibles dans Jaeger / Tempo / Langfuse / Phoenix) :
+
+```python
+from autoagent import Agent, TraceEmitter, OTelTraceExporter
+
+# le HOST configure OTel comme d'habitude (TracerProvider + OTLP exporter)…
+with OTelTraceExporter() as exporter:                 # tracer global par défaut
+    trace = TraceEmitter(file="trace.jsonl", on_event=exporter)  # JSONL + OTel
+    agent = Agent.from_model("gemini", "gemini-3.5-flash", trace=trace)
+    agent.run("...")
+```
+
+**Mapping** (calqué sur l'émission réelle de `agent.py`) :
+
+| événement | effet OTel |
+|---|---|
+| `run_start` / `llm_request` / `tool_call_start` | OUVRE un span (`agent.run`, `llm`, `tool.<nom>`), parenté via `parent_id` |
+| `run_end` / `llm_response` / `tool_call_end` | FERME le span visé par son `parent_id` ; statut ERROR si `status` ∈ {error, cancelled, max_steps} |
+| tout le reste (`cancelled`, hooks, événements custom du host) | span *event* ponctuel sur le span ouvert le plus proche |
+| payload | attributs `autoagent.*` (previews déjà redactées des secrets) |
+
+**Garanties** : un backend OTel cassé ne casse JAMAIS la boucle agent (mêmes
+règles que les callbacks de `TraceEmitter`) ; `close()` ferme les spans laissés
+ouverts par un run interrompu ; garde anti-fuite à 10 000 spans ouverts ;
+partager UN `TraceEmitter` avec les sous-agents `as_tool` = un seul arbre.
+
+## 19. `RunState` — checkpoint / resume (agents longue durée)
+
+> Un run n'est plus prisonnier de son processus : snapshot JSON à chaque
+> frontière d'étape, reprise après crash/redémarrage, ou au-delà d'un
+> `max_steps` / `token_budget` relevé.
+
+```python
+from autoagent import Agent, RunState
+import json, pathlib
+
+CHECKPOINT = pathlib.Path("run_state.json")
+
+def save(state: RunState):                       # appelé après CHAQUE étape complétée
+    CHECKPOINT.write_text(json.dumps(state.to_dict()), encoding="utf-8")
+
+result = agent.run("Longue mission…", checkpoint=save)
+
+# … crash / redémarrage du process …
+state = RunState.from_dict(json.loads(CHECKPOINT.read_text(encoding="utf-8")))
+result = agent.resume(state)                     # reprend à state.step + 1
+```
+
+**API** :
+
+| membre | rôle |
+|---|---|
+| `run` / `run_messages` / `run_stream` / `run_messages_stream` (`checkpoint=`) | callback `RunState -> None` appelé à chaque frontière d'étape (résultats d'outils inclus) et après chaque correction du hook |
+| `RunState.to_dict()` / `from_dict()` | aller-retour JSON sans perte (s'appuie sur `Message.to_dict` 0.7.0 — tool_calls, attachments, reasoning inclus) |
+| `Agent.resume(state, context=, cancel_token=, checkpoint=)` | continue la boucle à `state.step + 1`, compteurs restaurés |
+| `Agent.resume_stream(state, ...)` | jumeau streaming (même contrat d'events que `run_messages_stream`) |
+| `exc.state` sur `MaxStepsExceeded` / `TokenBudgetExceeded` / `AgentCancelled` | snapshot prêt à reprendre — relever la limite puis `agent.resume(exc.state)` |
+
+**Sémantique** :
+* Le comptage CONTINUE : `max_steps` et `token_budget` gardent leur sens
+  « pour le run entier » à travers les reprises (relever la limite pour aller plus loin).
+* Un callback `checkpoint` qui lève est loggué et IGNORÉ (même contrat que la
+  trace : la persistance ne tue pas le run qu'elle protège).
+* `memory.compact` est SAUTÉ à la reprise (un snapshot est en plein run ;
+  compacter décalerait `turn_start`). La compaction reprend au run suivant.
+* Le step final (réponse texte) ne produit pas de checkpoint : le résultat
+  EST la persistance (`result.messages`, comme avant).
+* Pause volontaire = `cancel_token` + le `.state` de l'`AgentCancelled` —
+  c'est la moitié « pause/reprise » d'un approval gate.
+
+## 20. `tool_policy` — politique d'exécution des outils & approval gate
+
+> UNE primitive pour les quatre besoins entreprise : autoriser / refuser /
+> demander validation humaine / auditer-quotas. Consultée pour CHAQUE appel
+> d'outil, AVANT tout effet de bord du tour.
+
+```python
+from autoagent import Agent, ApprovalRequired, ToolPolicyContext
+
+APPROUVES: set[str] = set()          # store d'approbations (fichier/DB en prod)
+
+def politique(ctx: ToolPolicyContext):
+    perms = ctx.spec.permissions if ctx.spec else []
+    if "filesystem.write" not in perms:
+        return None                                    # ALLOW (cas normal)
+    if ctx.context.get("user") != "admin":
+        return "écriture réservée aux admins"          # DENY motivé → le modèle re-planifie
+    if ctx.call.id not in APPROUVES:
+        raise ApprovalRequired(f"{ctx.call.name}({ctx.call.arguments})")   # ASK → pause
+
+agent = Agent(provider, tool_policy=politique)
+
+try:
+    resultat = agent.run("Nettoie les vieux logs.", context={"user": "admin"})
+except ApprovalRequired as exc:
+    sauvegarder(exc.state.to_dict())                   # snapshot JSON reprenable
+    prevenir_operateur(exc.calls)                      # les appels en attente (rien n'a tourné)
+# … l'humain valide (APPROUVES.add(call.id)) — même process ou un autre :
+resultat = agent.resume(RunState.from_dict(charger()))
+```
+
+**Le contrat, en 6 règles :**
+
+| règle | détail |
+|---|---|
+| Verdicts | `None` = allow ; `str` = deny motivé (le modèle voit `ToolPolicyDenied: <raison>` en erreur d'outil et re-planifie) ; lever `ApprovalRequired` = pause reprenable |
+| Pré-passe sur TOUT le tour | la politique est évaluée pour tous les appels du tour AVANT d'en exécuter un seul — une pause ne tombe JAMAIS après un effet de bord (y compris en `parallel_tool_calls`) |
+| Fail-CLOSED | une politique qui plante REFUSE l'appel (c'est une frontière de sécurité — contrat inverse des callbacks trace/checkpoint, qui fail-open) |
+| Reprise idempotente | au `resume()`, les appels en attente repassent par la politique : non approuvé → re-pause ; rejeté (`str`) → le modèle voit le refus ; approuvé → exécution UNE seule fois |
+| `ctx` | `call` (l'`id` est stable à travers pause/reprise — clé du store d'approbations), `spec` (dont `permissions`), `step`, `messages` (lecture seule), `context` (user, quotas…) |
+| Observabilité | événements de trace `tool_policy_deny` et `approval_required` ; `run_end` porte `status="approval_required"` |
+
+**Streaming** : l'`ApprovalRequired` devient un événement terminal
+`error` (`"approval_required: …"`) qui porte le snapshot dans `ev.state` →
+`agent.resume_stream(ev.state)` après validation.
+
+**Quota / audit** = le même hook, en code hôte : compter dans `ctx.context`,
+logger, retourner un `str` quand le quota est dépassé. Pas de primitive
+dédiée — c'est du Python.
 
 ---
 

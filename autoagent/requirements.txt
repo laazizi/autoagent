@@ -1,0 +1,18 @@
+# ── autoagent — dépendances d'exécution ─────────────────────────────────────
+# Python 3.10+ requis (le code utilise le typage « X | None »).
+#
+# Une SEULE dépendance tierce : jsonschema (validation des schémas d'outils).
+# Tout le reste est dans la bibliothèque standard :
+#   - HTTP vers les LLM  → urllib (pas de requests/httpx)
+#   - base de données    → sqlite3
+#   - sandbox            → subprocess (Docker optionnel, via la CLI)
+jsonschema>=4.18
+
+# ── Providers LLM ────────────────────────────────────────────────────────────
+# AUCUN SDK à installer : autoagent appelle les API en HTTP direct.
+# Fournis AU MOINS une clé (variable d'environnement ou fichier .env) :
+#   GEMINI_API_KEY   |   OPENAI_API_KEY   |   ANTHROPIC_API_KEY   |   DEEPSEEK_API_KEY
+
+# ── Développement (optionnel) ────────────────────────────────────────────────
+# Décommente pour lancer les tests de la lib :
+# pytest>=8

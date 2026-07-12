@@ -1,0 +1,8 @@
+2026-07-08 09:01:50 PAYMENT ok      order=1001 amount=49.90
+2026-07-08 09:02:40 PAYMENT ok      order=1002 amount=120.00
+2026-07-08 09:03:41 PAYMENT FAILED  order=1003 amount=75.50  reason=gateway_502
+2026-07-08 09:04:20 PAYMENT ok      order=1004 amount=15.00
+2026-07-08 09:05:02 PAYMENT ok      order=1005 amount=230.10
+2026-07-08 09:06:38 PAYMENT FAILED  order=1006 amount=42.00  reason=gateway_502
+2026-07-08 09:07:15 PAYMENT ok      order=1007 amount=89.99
+2026-07-08 09:08:44 PAYMENT ok      order=1008 amount=12.50

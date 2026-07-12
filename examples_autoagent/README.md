@@ -1,7 +1,7 @@
-# examples_autoagent — le potentiel d'autoagent en 11 démos
+# examples_autoagent — le potentiel d'autoagent en 15 démos
 
-Onze scripts courts (~50 lignes chacun), **exécutables tels quels**, montrant
-chacun UNE facette de la lib. Rangés du plus simple au plus avancé.
+Quinze scripts courts, **exécutables tels quels**, montrant chacun UNE facette
+de la lib (la n°13 les combine). Rangés du plus simple au plus avancé.
 
 ## Installation
 
@@ -30,11 +30,16 @@ présente. Pour forcer : `--provider gemini --model gemini-2.5-flash`.
 | 10 | `10_bornement_verification.py` | `ProjectWorkspace` (écriture confinée) + `post_turn_hook` (exiger une action) | oui |
 | 11 | `11_flux_deterministe.py` | `Orchestrator` : le host possède la machine à états, le LLM interprète/reformule seulement | oui |
 | 12 | `12_pseudonymisation_pii.py` | **RGPD** : le host masque les PII (nom/email/tél) en jetons ; le LLM ne voit JAMAIS les vraies données, restaurées côté host | oui |
+| 13 | `13_prise_rdv_supervisee.py` | **La démo complète** (inspirée de cati_service) : les 3 cerveaux — `Orchestrator` (flux + validation), `Agent` superviseur (valider/corriger via outils + hook), mémoire par appelant (Memory + recall) | oui |
+| 14 | `14_base_sql.py` | **Base SQL comme source** : l'agent inspecte le schéma, écrit un SELECT, la lib l'exécute en LECTURE SEULE (écriture refusée par le code) et répond sur des lignes réelles. SQLite (stdlib) | oui |
+| 15 | `15_appel_entrant_fiche.py` | **Standard téléphonique** : cascade de repli pilotée par l'agent — fiche locale → CRM externe → sinon il DISCUTE avec l'appelant pour créer sa fiche. Plusieurs outils, l'agent choisit l'escalade | oui |
 
 ## Par où commencer
 
 - **Zéro clé, tout de suite** : `python examples_autoagent/07_sandbox_securite.py`
 - **La démo « wow »** : `06` (l'agent code son outil) puis `08` (agents qui délèguent).
+- **Le cas complet, façon prod** : `13` (prise de RDV supervisée) — combine flux
+  déterministe + agent superviseur + mémoire par appelant (l'archi de cati_service).
 - **Pour un usage produit** : `04` (coût/observabilité), `05` (mémoire), `10` (bornement), `12` (RGPD/PII).
 
 ## Choisir la bonne primitive

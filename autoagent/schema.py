@@ -392,3 +392,6 @@ class StreamEvent:
     steps: int = 0
     error: str = ""
     usage: "TokenUsage | None" = None  # sur l'événement done (0.10.0)
+    # Sur l'événement ``error`` "approval_required: ..." (0.11.0) : le
+    # snapshot RunState à passer à Agent.resume() une fois l'humain décidé.
+    state: Any = None
