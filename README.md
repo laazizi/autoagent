@@ -89,7 +89,7 @@ someone else's abstraction stack instead of your own code.
 ```bash
 pip install autoagent-core            # installs as `import autoagent`
 # or from source:
-git clone <this-repo>
+git clone https://github.com/laazizi/autoagent.git
 cd autoagent
 pip install jsonschema        # the core's only extra; examples may need more
 export GEMINI_API_KEY=...     # or OPENAI_API_KEY / ANTHROPIC_API_KEY / DEEPSEEK_API_KEY
@@ -98,7 +98,7 @@ python examples/demo_autoagent.py      # the demo below (French prompts/comments
 
 The demo that carries the argument — one scenario, two files:
 
-**[`examples/demo_autoagent.py`](examples/demo_autoagent.py)** (55 lines of code) is a
+**[`examples/demo_autoagent.py`](https://github.com/laazizi/autoagent/blob/main/examples/demo_autoagent.py)** (55 lines of code) is a
 **three-agent hierarchy**: an orchestrator delegates two log files to two specialist
 agents (`as_tool()`), **cross-checks their findings against each other** (each
 gateway-502 server error must match one FAILED payment), audits the raw files with its
@@ -109,7 +109,7 @@ attempting what an agent might: `../demo_autoagent.py` → *Path escapes workspa
 `virus.exe` → *extension blocked*, `C:/Windows/x.md` → *absolute paths not allowed*.
 Boundaries you can demo, because they're code.
 
-**[`examples/demo_pure_python.py`](examples/demo_pure_python.py)** (164 lines of code) is
+**[`examples/demo_pure_python.py`](https://github.com/laazizi/autoagent/blob/main/examples/demo_pure_python.py)** (164 lines of code) is
 the **same system with no library** — same model, same three agents, same validated
 answer. Everything the library did for free, hand-rolled and annotated: the generic agent
 loop, every tool schema, the provider wire format + retries, delegation with its failure
@@ -433,7 +433,7 @@ that's the niche this library is built for.
 ## Project status
 
 Used in production internally (survey/phone-bot supervision at Alyce). API surface is
-small and stable; version-tagged features are documented in [the developer guide](autoagent-dev-doc.md).
+small and stable; version-tagged features are documented in [the developer guide](https://github.com/laazizi/autoagent/blob/main/autoagent-dev-doc.md).
 Contributions welcome — especially provider adapters, `Memory` backends, and sandbox hardening.
 
 ## License

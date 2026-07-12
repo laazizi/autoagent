@@ -21,6 +21,11 @@ dependencies = [
     "jsonschema>=4.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/laazizi/autoagent"
+Repository = "https://github.com/laazizi/autoagent"
+Changelog = "https://github.com/laazizi/autoagent/blob/main/CHANGELOG.md"
+
 [project.optional-dependencies]
 otel = [
     "opentelemetry-api>=1.20",
