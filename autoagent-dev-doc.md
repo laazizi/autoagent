@@ -156,12 +156,18 @@ print(len(result.messages))  # historique complet
 ### 2.4 Lancer les exemples
 
 ```bash
-python examples/basic.py           # tool Python classique
-python examples/dynamic_tools.py   # agent qui crée ses tools
-python examples/software_evolution.py  # agent qui modifie un projet
-python examples/web_app_evolution.py   # agent qui édite une page HTML
-python examples/qt_panel_evolution.py  # agent qui édite un plugin PyQt5
+# La démo « avant/après » (l'argument de la lib) :
+python examples/demo_autoagent.py        # 3 agents + workspace borné, 55 lignes
+python examples/demo_pure_python.py      # LA MÊME chose sans la lib : 164 lignes
+
+# Les 17 démos thématiques (une facette chacune — voir leur README) :
+python examples_autoagent/01_hello_tools.py
+python examples_autoagent/17_memoire_factuelle.py
 ```
+
+Et le **constructeur visuel** (`constructeur_autoagent.html`, hors-ligne) :
+assemble des blocs → code Python généré ; menu « Charger un exemple » =
+18 presets + les démos complètes en lecture.
 
 ---
 
