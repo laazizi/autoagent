@@ -1,4 +1,4 @@
-# examples_autoagent — le potentiel d'autoagent en 15 démos
+# examples_autoagent — le potentiel d'autoagent en 16 démos
 
 Quinze scripts courts, **exécutables tels quels**, montrant chacun UNE facette
 de la lib (la n°13 les combine). Rangés du plus simple au plus avancé.
@@ -33,6 +33,7 @@ présente. Pour forcer : `--provider gemini --model gemini-2.5-flash`.
 | 13 | `13_prise_rdv_supervisee.py` | **La démo complète** (inspirée de cati_service) : les 3 cerveaux — `Orchestrator` (flux + validation), `Agent` superviseur (valider/corriger via outils + hook), mémoire par appelant (Memory + recall) | oui |
 | 14 | `14_base_sql.py` | **Base SQL comme source** : l'agent inspecte le schéma, écrit un SELECT, la lib l'exécute en LECTURE SEULE (écriture refusée par le code) et répond sur des lignes réelles. SQLite (stdlib) | oui |
 | 15 | `15_appel_entrant_fiche.py` | **Standard téléphonique** : cascade de repli pilotée par l'agent — fiche locale → CRM externe → sinon il DISCUTE avec l'appelant pour créer sa fiche. Plusieurs outils, l'agent choisit l'escalade | oui |
+| 16 | `16_questions_clarification.py` | **Clarification** : demande vague → l'agent POSE des questions à l'humain (outil `demander_a_l_humain`) avant d'agir ; `post_turn_hook` en filet (interdit de conclure en devinant) | oui |
 
 ## Par où commencer
 
