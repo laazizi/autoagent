@@ -832,7 +832,7 @@ result = agent.run_messages([
 ])
 ```
 
-L'exemple `examples/web_app_evolution.py` montre le pattern UI complet (bouton 📎, paste, drag-drop, 4 images max, 8 MB chacune, whitelist MIME `image/{jpeg,png,webp,gif}`, thumbnails avant envoi, bulles d'image dans le chat).
+Pattern UI éprouvé en interne (appli non publiée) : bouton 📎, paste, drag-drop, 4 images max, 8 MB chacune, whitelist MIME `image/{jpeg,png,webp,gif}`, thumbnails avant envoi, bulles d'image dans le chat.
 
 ### 4.10 `reasoning_content` (DeepSeek / o-series)
 
@@ -1912,7 +1912,7 @@ agent.run_messages([
 ])
 ```
 
-Le provider (OpenAI / Anthropic / Gemini) sérialise tout seul vers son format wire (§4.9). Voir `examples/web_app_evolution.py` pour le pattern UI complet (paste, drag-drop, thumbnails).
+Le provider (OpenAI / Anthropic / Gemini) sérialise tout seul vers son format wire (§4.9).
 
 ### 14.14 Comment je force l'agent à valider quelque chose avant de répondre ?
 
