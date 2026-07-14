@@ -1303,6 +1303,12 @@ const PRESETS = [
     mk("orchestrator",{var:"orch",prov:"gemini",model:"gemini-3.5-flash",closing:"Merci, formulaire complété !",
       steps:"prenom | Quel est ton prénom ?\nage | Quel âge as-tu ?\nville | Dans quelle ville habites-tu ?"}),
   ]},
+  {id:"16", label:"16 · Clarification (questions à l'humain)", make:()=>[
+    mk("agent",{var:"agent",steps:"8",system:"Tu organises des tâches pour l'utilisateur. RÈGLE : si la demande est vague ou qu'il te manque une information indispensable (quoi, qui, quand…), utilise demander_a_l_humain — UNE question précise à la fois, deux maximum. Ne devine JAMAIS un détail important. Quand tu as ce qu'il faut, produis le résultat final."}),
+    mk("tool",{fname:"demander_a_l_humain",params:"question: str",ret:"dict",doc:"Pose UNE question de clarification à l'utilisateur et renvoie sa réponse. À utiliser dès que la demande est ambiguë, AVANT d'agir.",body:'print(f"\\n❓ {question}")\nreturn {"reponse": input("→ ta réponse : ").strip()}'}),
+    mk("hook",{fname:"exiger_clarification",body:'a_clarifie = any(tc.name == "demander_a_l_humain" for tc in ctx.tool_calls)\nif not a_clarifie and ctx.correction_count == 0:\n    return Message(role="user", content="Ta réponse repose sur des suppositions : pose d\'abord ta question la plus importante avec demander_a_l_humain.")\nreturn None'}),
+    mk("run",{prompt:"Organise la réunion."}),
+  ]},
   {id:"cati", label:"★ Superviseur RDV (cati_service)", make:()=>[
     mk("agent",{var:"superviseur",system:"Tu es l'orchestrateur silencieux d'un répondeur de prise de RDV (l'agent vocal s'appelle Léa). Vérifie que le DERNIER échange est cohérent, puis TRANCHE en appelant EXACTEMENT UN outil : valider() si tout va bien (cas normal, sois conservateur), ou demander_correction(probleme, consigne) s'il y a un vrai problème (mauvaise valeur notée, réponse ambiguë validée à tort). Dans le doute → valider().",steps:"4"}),
     mk("tool",{fname:"valider",params:'raison: str = ""',ret:"dict",doc:"Le dernier échange est correct : l'appel continue normalement.",body:'return {"verdict": "valider", "raison": raison}'}),
