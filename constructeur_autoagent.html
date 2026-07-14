@@ -422,12 +422,14 @@ const DEFS = {
     ],
   },
   memory: {
-    name:"Mémoire", cat:"mem", one:true, sub:"borne / résume le contexte",
+    name:"Mémoire", cat:"mem", one:true, sub:"borne le contexte : tronque, résume ou extrait des FAITS",
     fields:[
-      {k:"kind", l:"type", kind:"select", opts:["BufferMemory","SummarizingMemory"], def:"SummarizingMemory"},
+      {k:"kind", l:"type", kind:"select", opts:["BufferMemory","SummarizingMemory","FactMemory"], def:"SummarizingMemory"},
       {k:"maxm", l:"max_messages", kind:"number", def:"40", w:"half"},
-      {k:"keep", l:"keep_recent (Summarizing)", kind:"number", def:"12", w:"half"},
+      {k:"keep", l:"keep_recent (Summarizing/Fact)", kind:"number", def:"12", w:"half"},
+      {k:"path", l:"fichier de faits (FactMemory)", kind:"text", def:"faits_agent.json", hint:"JSON lisible, 1 par identité"},
       {k:"recall", l:"donner l'outil recall à l'agent", kind:"check", def:true},
+      {k:"remember", l:"donner l'outil remember (FactMemory)", kind:"check", def:true},
     ],
   },
   trace: {
@@ -509,7 +511,7 @@ const INFO = {
   workspace:{api:"ProjectWorkspace(root, allowed_write_extensions=…)", info:"Espace d'écriture borné : chemins hors dossier, chemins absolus et extensions interdites sont refusés PAR LE CODE. Coche les outils à exposer (écrire, lire, lister, remplacer, annuler). Chaque écriture est journalisée et réversible."},
   sandbox:{api:"make_sandbox() · SubprocessSandbox · DockerSandbox", info:"Exécute du code non fiable ISOLÉ du système : conteneur Docker jetable (réseau coupé, FS en lecture seule) si Docker est présent, sinon subprocess durci. make_sandbox choisit tout seul. Sert surtout à faire tourner les outils générés dynamiquement."},
   dynamic:{api:"DynamicToolBuilder + enable_dynamic_tools", info:"Donne à l'agent le pouvoir d'ÉCRIRE ses propres outils Python à la volée : il décrit la capacité voulue, un LLM génère le code, celui-ci est validé (AST) puis exécuté dans le bac à sable. Limite le nombre d'outils générés par run."},
-  memory:{api:"BufferMemory · SummarizingMemory", info:"Borne le contexte quand la conversation s'allonge. BufferMemory garde les N derniers messages ; SummarizingMemory RÉSUME les vieux tours (via un LLM) au lieu de les jeter. Option recall : l'agent peut retrouver un détail sorti de sa fenêtre."},
+  memory:{api:"BufferMemory · SummarizingMemory · FactMemory", info:"Borne le contexte quand la conversation s'allonge. BufferMemory garde les N derniers messages ; SummarizingMemory RÉSUME les vieux tours ; FactMemory extrait des FAITS atomiques tenus à jour (une contradiction remplace le fait périmé, JSON lisible par identité). Options : recall (l'agent lit sa mémoire) et remember (il mémorise volontairement, FactMemory)."},
   trace:{api:"TraceEmitter(file=…)", info:"Enregistre chaque événement (appel LLM, appel d'outil, correction…) dans un fichier JSONL, secrets masqués. Partagée par l'agent ET tous les sous-agents → tu vois tout l'arbre d'exécution dans une seule trace."},
   subagent:{api:"agent.as_tool(name=, description=)", info:"Un agent complet exposé comme OUTIL d'un autre : l'orchestrateur décide quand le solliciter (ordre émergent, piloté par le LLM). Chaque appel démarre une conversation fraîche ; ses échecs deviennent des erreurs d'outil, jamais un crash."},
   chaine:{api:"boucle for … .run() (code)", info:"Enchaîne des étapes dans un ordre GARANTI par le code (A→B→C) : chaque étape reçoit la sortie de la précédente. Idéal pour un traitement séquentiel maîtrisé (extraction → analyse → synthèse). Déterministe, pas piloté par le LLM."},
@@ -633,6 +635,7 @@ function generate(){
   if(wss.length) names.add("ProjectWorkspace");
   if(mem){
     if(mem.f.kind==="BufferMemory") names.add("BufferMemory");
+    else if(mem.f.kind==="FactMemory"){ names.add("FactMemory"); names.add("create_provider"); names.add("ModelConfig"); }
     else { names.add("SummarizingMemory"); names.add("create_provider"); names.add("ModelConfig"); }
   }
   if(hook) names.add("Message");
@@ -699,6 +702,11 @@ function generate(){
       memVar = "memoire";
       if(mem.f.kind==="BufferMemory"){
         L.push(`memoire = BufferMemory(max_messages=${num(mem.f.maxm,20)})`);
+      }else if(mem.f.kind==="FactMemory"){
+        L.push(`# Mémoire FACTUELLE : faits atomiques tenus À JOUR (add/update/delete) —`);
+        L.push(`# une contradiction REMPLACE le fait périmé. JSON lisible par identité.`);
+        L.push(`resumeur = create_provider(ModelConfig(${pyStr(a.prov)}, ${pyStr(a.model)}))`);
+        L.push(`memoire = FactMemory(resumeur, path=${pyStr(mem.f.path||"faits_agent.json")}, max_messages=${num(mem.f.maxm,40)}, keep_recent=${num(mem.f.keep,12)})`);
       }else{
         L.push(`# La mémoire résume les vieux tours (un LLM, moins cher, s'en charge).`);
         L.push(`resumeur = create_provider(ModelConfig(${pyStr(a.prov)}, ${pyStr(a.model)}))`);
@@ -782,6 +790,10 @@ function generate(){
 
     if(mem && mem.f.recall){
       L.push(`${av}.register_recall_tool()   # l'agent peut retrouver un détail oublié`);
+      L.push(``);
+    }
+    if(mem && mem.f.kind==="FactMemory" && mem.f.remember){
+      L.push(`${av}.register_remember_tool()   # l'agent mémorise volontairement (tracé)`);
       L.push(``);
     }
     if(dyn){
@@ -1335,6 +1347,11 @@ const PRESETS = [
     mk("tool",{fname:"demander_a_l_humain",params:"question: str",ret:"dict",doc:"Pose UNE question de clarification à l'utilisateur et renvoie sa réponse. À utiliser dès que la demande est ambiguë, AVANT d'agir.",body:'print(f"\\n❓ {question}")\nreturn {"reponse": input("→ ta réponse : ").strip()}'}),
     mk("hook",{fname:"exiger_clarification",body:'a_clarifie = any(tc.name == "demander_a_l_humain" for tc in ctx.tool_calls)\nif not a_clarifie and ctx.correction_count == 0:\n    return Message(role="user", content="Ta réponse repose sur des suppositions : pose d\'abord ta question la plus importante avec demander_a_l_humain.")\nreturn None'}),
     mk("run",{prompt:"Organise la réunion."}),
+  ]},
+  {id:"17", label:"17 · Mémoire factuelle", make:()=>[
+    mk("agent",{var:"agent",steps:"6",system:"Tu es l'assistant d'enquête. Quand l'appelant te demande de NOTER une information durable, utilise remember puis confirme en une phrase. Pour retrouver une information mémorisée, utilise recall."}),
+    mk("memory",{kind:"FactMemory",path:"faits_appelant.json",maxm:"40",keep:"12",recall:true,remember:true}),
+    mk("run",{prompt:"Notez bien que je serai absent tout le mois d'août, puis dites-moi ce que vous savez déjà de moi."}),
   ]},
   {id:"cati", label:"★ Superviseur RDV (cati_service)", make:()=>[
     mk("agent",{var:"superviseur",system:"Tu es l'orchestrateur silencieux d'un répondeur de prise de RDV (l'agent vocal s'appelle Léa). Vérifie que le DERNIER échange est cohérent, puis TRANCHE en appelant EXACTEMENT UN outil : valider() si tout va bien (cas normal, sois conservateur), ou demander_correction(probleme, consigne) s'il y a un vrai problème (mauvaise valeur notée, réponse ambiguë validée à tort). Dans le doute → valider().",steps:"4"}),

@@ -4,3 +4,5 @@ trace_demo.jsonl
 trace_rdv.jsonl
 memoire_demo/
 __pycache__/
+faits_martin.json
+faits_appelant.json
