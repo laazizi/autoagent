@@ -39,6 +39,7 @@
 18. [`OTelTraceExporter` — traces vers OpenTelemetry](#18-oteltraceexporter--traces-vers-opentelemetry) *(0.11.0)*
 19. [`RunState` — checkpoint / resume (agents longue durée)](#19-runstate--checkpoint--resume-agents-longue-durée) *(0.11.0)*
 20. [`tool_policy` — politique d'exécution des outils & approval gate](#20-tool_policy--politique-dexécution-des-outils--approval-gate) *(0.11.0)*
+21. [`FactMemory` — mémoire factuelle tenue à jour](#21-factmemory--mémoire-factuelle-tenue-à-jour) *(non publié)*
 
 ---
 
@@ -91,7 +92,7 @@
 | `autoagent/providers/routing.py` | `RoutingProvider` — dispatch par requête (texte→cheap, image→vision), §16.7 | — |
 | `autoagent/logging.py` | Logger + `SecretRedactingFilter` | — |
 | **`autoagent/trace.py`** | **`TraceEmitter`, `TraceEvent`, `truncate_preview`** | **0.5.0** |
-| **`autoagent/memory.py`** | **`Memory` Protocol, `BufferMemory`, `SummarizingMemory` (0.10.0)** | **0.6.0** |
+| **`autoagent/memory.py`** | **`Memory` Protocol, `BufferMemory`, `SummarizingMemory` (0.10.0), `FactMemory` (§21)** | **0.6.0** |
 | **`autoagent/mcp.py`** | **`MCPClient` — outils d'un serveur MCP montés comme tools locaux (stdio, zéro dép.), §17** | **0.11.0** |
 | **`autoagent/otel.py`** | **`OTelTraceExporter` — trace → spans OpenTelemetry (dépendance optionnelle), §18** | **0.11.0** |
 
@@ -1909,7 +1910,8 @@ autoagent/
 │                            # MCPError + ApprovalRequired (0.11.0), ...
 ├── logging.py               # get_logger + SecretRedactingFilter + redact()
 ├── trace.py                 # 0.5.0 — TraceEmitter, TraceEvent, OnEvent, truncate_preview
-├── memory.py                # 0.6.0 — Memory (Protocol), BufferMemory ; 0.10.0 — SummarizingMemory
+├── memory.py                # 0.6.0 — Memory (Protocol), BufferMemory ; 0.10.0 — SummarizingMemory ;
+│                            # FactMemory (§21, non publié)
 ├── mcp.py                   # 0.11.0 — MCPClient (serveur MCP stdio → tools locaux, §17)
 ├── otel.py                  # 0.11.0 — OTelTraceExporter (trace → spans OTel, §18)
 └── providers/
@@ -1962,6 +1964,7 @@ from autoagent import (
     # 0.8.0 → 0.10.0 — streaming, mémoire résumante, multi-agent, budget, routing
     StreamChunk, StreamEvent,
     SummarizingMemory,
+    FactMemory,   # non publié (§21)
     TokenUsage,
     RoutingProvider,
     Orchestrator, Step, TurnEvent, InterpretOutcome, PhraseSignals,   # 0.9.0
@@ -2354,6 +2357,7 @@ parsé — le modèle ne peut pas répondre mal formé.
 | 0.9.0 | `Orchestrator` (§15) |
 | 0.10.0 | `_run_loop` unifié, `SummarizingMemory`, `as_tool()`, `token_budget` + `TokenUsage`, `system_prompt` callable, `parallel_tool_calls`, usage sur `done`/`AgentResult` |
 | 0.11.0 | `MCPClient` (§17) + `MCPError`, `OTelTraceExporter` (§18), `RunState` + `checkpoint=` + `Agent.resume` (§19), `tool_policy` + `ApprovalRequired` (§20) |
+| non publié | `FactMemory` + `register_remember_tool` (§21) |
 | — | `RoutingProvider` (providers/routing.py) |
 
 ## 17. `MCPClient` — outils MCP branchés comme des tools locaux
@@ -2523,6 +2527,50 @@ resultat = agent.resume(RunState.from_dict(charger()))
 **Quota / audit** = le même hook, en code hôte : compter dans `ctx.context`,
 logger, retourner un `str` quand le quota est dépassé. Pas de primitive
 dédiée — c'est du Python.
+
+## 21. `FactMemory` — mémoire factuelle tenue à jour
+
+> `autoagent/memory.py`, non publié (post-0.11.0). Inspirée du cœur de Mem0
+> (extraction + consolidation add/update/delete) SANS la dépendance : LLM
+> pas cher + JSON, zéro embedding, zéro service.
+
+Là où `SummarizingMemory` replie les vieux tours en prose (une contradiction
+s'EMPILE), `FactMemory` maintient des **faits atomiques à jour** :
+« préfère le matin » REMPLACE « préfère le soir ».
+
+```python
+from autoagent import Agent, FactMemory
+
+memoire = FactMemory(
+    resumeur,                                 # LLM pas cher (extraction)
+    path=f"faits/{numero_appelant}.json",     # 1 fichier JSON par identité
+    max_messages=40, keep_recent=12,
+)
+agent = Agent(provider, memory=memoire)
+agent.register_recall_tool()      # l'agent LIT sa mémoire (recherche lexicale sur les faits)
+agent.register_remember_tool()    # l'agent ÉCRIT volontairement (« notez que… »), tracé
+```
+
+**API** :
+
+| membre | rôle |
+|---|---|
+| `FactMemory(provider, *, path=, max_messages=40, keep_recent=12, max_context_facts=20, max_facts=500)` | mêmes bornes de compaction que SummarizingMemory ; `path` = persistance JSON lisible (audit main, RGPD = supprimer le fichier) |
+| `compact(messages)` | replie les vieux tours → extraction LLM (JSON mode) → opérations `add`/`update`/`delete` sur la base ; injecte `[Faits mémorisés]` (les `max_context_facts` plus récents) |
+| `recall(query, k)` | recherche lexicale sur les faits (courts et denses — le lexical y marche bien) |
+| `remember(fait, subject=)` | ajout DIRECT sans LLM, dédupliqué à l'identique |
+| `forget(id)` / `facts()` | suppression ciblée / copie de la base pour audit |
+| `Agent.register_remember_tool(name=, description=)` | expose `remember` comme outil ; no-op si la mémoire n'a pas de `.remember` |
+
+**Contrats** : échec d'extraction → compaction SAUTÉE (rien de tronqué en
+silence) ; opérations mal formées ignorées (id inconnu, op inconnue, non-JSON,
+fences ```json tolérées) ; les faits SURVIVENT aux conversations (un historique
+qui raccourcit ne vide pas la base — c'est le but) ; réabsorption du message
+`[Faits mémorisés]` in-band quand l'hôte persiste l'historique compacté.
+
+**Ce que ça ne fait PAS** (assumé) : pas de recherche sémantique (« véhicule »
+≠ « voiture ») ni de raisonnement temporel à la Zep — pour ça, brancher un
+backend lourd via le protocole `Memory` ou un serveur mémoire MCP (§17).
 
 ---
 

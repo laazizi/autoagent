@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`FactMemory` + `Agent.register_remember_tool()`** — fact-based memory
+  kept UP TO DATE instead of a rolling summary. Old turns go through an LLM
+  extraction that maintains a list of short atomic facts via add / update /
+  delete operations — a contradiction REPLACES the stale fact instead of
+  piling up next to it. Context gets the fact list (dense) rather than raw
+  messages; `recall()` does lexical search over facts; `remember()` stores a
+  fact directly (no LLM), exposed to the agent by `register_remember_tool()`
+  (the write-side twin of `register_recall_tool` — deliberate, traced
+  memorization). Optional `path=` gives a human-readable JSON store per
+  identity (per caller, per customer) — auditable, hand-correctable, and
+  GDPR-friendly (forget someone = delete their file). Extraction failures
+  skip compaction (nothing silently truncated); malformed operations are
+  ignored, never fatal.
+
 ## [0.11.0] - 2026-07-13
 
 ### Added

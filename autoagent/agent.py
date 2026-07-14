@@ -463,6 +463,67 @@ class Agent:
             handler=_recall,
         )
 
+    def register_remember_tool(
+        self,
+        *,
+        name: str = "remember",
+        description: str | None = None,
+    ) -> None:
+        """Register a ``remember`` tool wrapping ``self.memory.remember`` (0.12.0).
+
+        The write-side twin of ``register_recall_tool``: the agent can
+        DELIBERATELY store a durable fact (« notez que je pars en août »)
+        instead of hoping it survives compaction. The call shows up in
+        the trace like any tool call. No-op unless the configured memory
+        exposes a ``remember(fact, subject=)`` method (``FactMemory``
+        does; bring-your-own memories can too).
+        """
+        if self.memory is None or not hasattr(self.memory, "remember"):
+            return
+
+        previewed = description or (
+            "Store one short, self-contained fact in durable memory (a decision, "
+            "a preference, a value, a commitment). Use it when the user states "
+            "something worth remembering across conversations."
+        )
+
+        # Même contrat que register_recall_tool : self.memory est relu à
+        # CHAQUE appel, pour honorer un memory remplacé après coup.
+        agent_self = self
+
+        def _remember(fact: str, subject: str = "") -> dict[str, Any]:
+            mem = agent_self.memory
+            if mem is None or not hasattr(mem, "remember"):
+                return {"stored": False, "error": "No fact-capable memory is attached."}
+            try:
+                stored = mem.remember(fact, subject=subject or None)
+            except Exception as exc:
+                return {"stored": False, "error": f"{type(exc).__name__}: {exc}"}
+            return {"stored": True, "fact": stored}
+
+        self.registry.replace(
+            ToolSpec(
+                name=name,
+                description=previewed,
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "fact": {
+                            "type": "string",
+                            "description": "One short, self-contained fact to remember.",
+                        },
+                        "subject": {
+                            "type": "string",
+                            "description": "Optional topic tag (e.g. 'rdv', 'contact').",
+                        },
+                    },
+                    "required": ["fact"],
+                    "additionalProperties": False,
+                },
+            ),
+            handler=_remember,
+        )
+
     def as_tool(
         self,
         *,

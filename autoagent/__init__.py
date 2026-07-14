@@ -40,7 +40,7 @@ from .errors import (
 from .evolution import EVOLUTION_CAPABILITIES, EvolutionRuntime, enable_software_evolution
 from .logging import get_logger
 from .mcp import MCPClient
-from .memory import BufferMemory, Memory, SummarizingMemory
+from .memory import BufferMemory, FactMemory, Memory, SummarizingMemory
 from .otel import OTelTraceExporter
 from .orchestrator import (
     InterpretOutcome,
@@ -91,6 +91,7 @@ __all__ = [
     "DeepSeekProvider",
     "DynamicToolBuilder",
     "EvolutionRuntime",
+    "FactMemory",
     "GeminiProvider",
     "LLMProvider",
     "LLMRequest",
