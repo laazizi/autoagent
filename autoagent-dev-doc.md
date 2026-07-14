@@ -3,7 +3,7 @@
 > Référence technique complète pour intégrer, étendre et tester `autoagent` dans un projet Python.
 > **Public visé** : devs qui vont écrire des tools, brancher l'agent sur leur app, ou éventuellement contribuer à la lib.
 
-**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-07-13 · **Couvre autoagent** : 0.11.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
+**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-07-14 · **Couvre autoagent** : 0.12.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
 
 ---
 
@@ -39,7 +39,7 @@
 18. [`OTelTraceExporter` — traces vers OpenTelemetry](#18-oteltraceexporter--traces-vers-opentelemetry) *(0.11.0)*
 19. [`RunState` — checkpoint / resume (agents longue durée)](#19-runstate--checkpoint--resume-agents-longue-durée) *(0.11.0)*
 20. [`tool_policy` — politique d'exécution des outils & approval gate](#20-tool_policy--politique-dexécution-des-outils--approval-gate) *(0.11.0)*
-21. [`FactMemory` — mémoire factuelle tenue à jour](#21-factmemory--mémoire-factuelle-tenue-à-jour) *(non publié)*
+21. [`FactMemory` — mémoire factuelle tenue à jour](#21-factmemory--mémoire-factuelle-tenue-à-jour) *(0.12.0)*
 
 ---
 
@@ -1911,7 +1911,7 @@ autoagent/
 ├── logging.py               # get_logger + SecretRedactingFilter + redact()
 ├── trace.py                 # 0.5.0 — TraceEmitter, TraceEvent, OnEvent, truncate_preview
 ├── memory.py                # 0.6.0 — Memory (Protocol), BufferMemory ; 0.10.0 — SummarizingMemory ;
-│                            # FactMemory (§21, non publié)
+│                            # 0.12.0 — FactMemory (§21)
 ├── mcp.py                   # 0.11.0 — MCPClient (serveur MCP stdio → tools locaux, §17)
 ├── otel.py                  # 0.11.0 — OTelTraceExporter (trace → spans OTel, §18)
 └── providers/
@@ -1964,7 +1964,7 @@ from autoagent import (
     # 0.8.0 → 0.10.0 — streaming, mémoire résumante, multi-agent, budget, routing
     StreamChunk, StreamEvent,
     SummarizingMemory,
-    FactMemory,   # non publié (§21)
+    FactMemory,   # 0.12.0 (§21)
     TokenUsage,
     RoutingProvider,
     Orchestrator, Step, TurnEvent, InterpretOutcome, PhraseSignals,   # 0.9.0
@@ -2357,7 +2357,7 @@ parsé — le modèle ne peut pas répondre mal formé.
 | 0.9.0 | `Orchestrator` (§15) |
 | 0.10.0 | `_run_loop` unifié, `SummarizingMemory`, `as_tool()`, `token_budget` + `TokenUsage`, `system_prompt` callable, `parallel_tool_calls`, usage sur `done`/`AgentResult` |
 | 0.11.0 | `MCPClient` (§17) + `MCPError`, `OTelTraceExporter` (§18), `RunState` + `checkpoint=` + `Agent.resume` (§19), `tool_policy` + `ApprovalRequired` (§20) |
-| non publié | `FactMemory` + `register_remember_tool` (§21) |
+| 0.12.0 | `FactMemory` + `register_remember_tool` (§21) |
 | — | `RoutingProvider` (providers/routing.py) |
 
 ## 17. `MCPClient` — outils MCP branchés comme des tools locaux
@@ -2530,7 +2530,7 @@ dédiée — c'est du Python.
 
 ## 21. `FactMemory` — mémoire factuelle tenue à jour
 
-> `autoagent/memory.py`, non publié (post-0.11.0). Inspirée du cœur de Mem0
+> `autoagent/memory.py`, 0.12.0. Inspirée du cœur de Mem0
 > (extraction + consolidation add/update/delete) SANS la dépendance : LLM
 > pas cher + JSON, zéro embedding, zéro service.
 

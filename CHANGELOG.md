@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-14
+
 ### Added
 - **`FactMemory` + `Agent.register_remember_tool()`** — fact-based memory
   kept UP TO DATE instead of a rolling summary. Old turns go through an LLM
