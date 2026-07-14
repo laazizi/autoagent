@@ -1537,8 +1537,9 @@ chevauche stdin/stdout — pas le réseau — il fonctionne **même sous `--netw
 noms whitelistés répondent (`fn(**args)`) ; tout autre nom est refusé. Le tool n'obtient jamais
 l'objet réel (DB, secrets) : seulement le résultat retourné par la fonction host.
 
-C'est le mécanisme central de `examples/traffic_incident_agent/` (host functions `http_get`,
-`avatar_station_proche`, `ask_user`, `connecter_service`…) et de `sql_react_dashboard` (`sql_query`).
+C'est le mécanisme qu'on a éprouvé en interne sur des applications complètes
+(host functions `http_get`, `ask_user`, `connecter_service`, `sql_query`… —
+applications restées dans le dépôt de travail interne, hors de ce repo publié).
 
 ### 11.6 Promotion humaine sandbox → natif — `autoagent/approval.py`
 
