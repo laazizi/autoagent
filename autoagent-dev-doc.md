@@ -3,7 +3,7 @@
 > Référence technique complète pour intégrer, étendre et tester `autoagent` dans un projet Python.
 > **Public visé** : devs qui vont écrire des tools, brancher l'agent sur leur app, ou éventuellement contribuer à la lib.
 
-**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-07-06 · **Couvre autoagent** : 0.10.0
+**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-07-13 · **Couvre autoagent** : 0.11.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
 
 ---
 
@@ -108,13 +108,19 @@
   `SubprocessSandbox` (durcissement AST seul, pas d'isolation réseau). Pas besoin de Docker si tu
   n'utilises pas les tools dynamiques.
 
-### 2.2 Cloner et lancer
+### 2.2 Installer
 
 ```bash
-git clone <ce-repo>
+pip install autoagent-core            # s'importe `import autoagent`
+pip install autoagent-core[otel]      # + export OpenTelemetry (§18)
+```
+
+Ou depuis les sources (dev de la lib) :
+
+```bash
+git clone https://github.com/laazizi/autoagent.git
 cd autoagent
-# Pas de pip install pour le cœur. Pour les exemples :
-pip install -r requirements.txt
+pip install jsonschema                # seule dépendance du cœur
 ```
 
 `.env` à la racine :
@@ -243,7 +249,7 @@ class Agent:
         provider: LLMProvider,
         *,
         registry: ToolRegistry | None = None,
-        system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        system_prompt: str | Callable[[], str] = DEFAULT_SYSTEM_PROMPT,  # callable : 0.10.0
         max_steps: int = 8,
         max_dynamic_tools_per_run: int = 3,
         temperature: float | None = None,
@@ -252,6 +258,9 @@ class Agent:
         max_corrections_per_run: int = 1,                  # 0.2.0
         trace: TraceEmitter | None = None,                 # 0.5.0
         memory: Memory | None = None,                      # 0.6.0
+        parallel_tool_calls: bool = False,                 # 0.10.0
+        token_budget: int | None = None,                   # 0.10.0
+        tool_policy: ToolPolicy | None = None,             # 0.11.0
     ): ...
 ```
 
@@ -270,6 +279,12 @@ class Agent:
 | `max_corrections_per_run` | `int` | `1` | Cap dur sur le nombre de corrections que le hook peut injecter. |
 | `trace` | `TraceEmitter \| None` | `None` | Émetteur d'événements typés (run_start, tool_call_*, run_end…). Voir §4.5. |
 | `memory` | `Memory \| None` | `None` | Appelé via `memory.compact(messages)` UNE FOIS avant la boucle. Voir §4.6. |
+| `parallel_tool_calls` | `bool` | `False` | Les tool calls d'un même tour s'exécutent en pool de threads (opt-in : handlers thread-safe). Voir §16.6. |
+| `token_budget` | `int \| None` | `None` | Cap dur sur les tokens du run ; `TokenBudgetExceeded` au-delà. Voir §16.5. |
+| `tool_policy` | `ToolPolicy \| None` | `None` | Politique d'exécution des outils : allow / deny / approbation humaine, fail-closed. Voir §20. |
+
+NB : `system_prompt` accepte aussi un **callable** `() -> str`, réévalué à chaque
+run (état vivant dans le prompt — voir §16.4).
 
 **Méthodes** :
 
@@ -1891,7 +1906,7 @@ autoagent/
 ├── sandbox.py               # SubprocessSandbox, DockerSandbox, make_sandbox, pont host-function
 ├── http.py                  # post_json / post_sse (urllib wrapper + retry/backoff)
 ├── errors.py                # MaxStepsExceeded, AgentCancelled, ProviderError, TokenBudgetExceeded,
-│                            # MCPError (0.11.0), ...
+│                            # MCPError + ApprovalRequired (0.11.0), ...
 ├── logging.py               # get_logger + SecretRedactingFilter + redact()
 ├── trace.py                 # 0.5.0 — TraceEmitter, TraceEvent, OnEvent, truncate_preview
 ├── memory.py                # 0.6.0 — Memory (Protocol), BufferMemory ; 0.10.0 — SummarizingMemory
@@ -2167,6 +2182,7 @@ for ev in agent.run_stream("Analyse ce rapport…"):
 | `output` / `messages` / `steps` | str / list[Message] / int | done |
 | `usage` | `TokenUsage \| None` | done *(0.10.0)* |
 | `error` | str | error |
+| `state` | `RunState \| None` | error `"approval_required: …"` *(0.11.0)* — snapshot à passer à `resume_stream` (§20) |
 
 **Sémantique d'erreur inversée** : `run_messages` LÈVE (`AgentCancelled`,
 `MaxStepsExceeded`…) ; `run_messages_stream` **ne lève jamais** — les échecs deviennent un
