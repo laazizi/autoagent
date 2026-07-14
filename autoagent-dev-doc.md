@@ -1783,20 +1783,24 @@ agent = Agent(provider, memory=BufferMemory(max_messages=30))
 
 `BufferMemory` impose un hard cap sur les non-system messages et ancre la queue sur le premier user message (pas d'orphan tool).
 
-Pour une mémoire **vectorielle avec recall** (le LLM peut explicitement aller chercher un vieux détail) :
+Pour **résumer** au lieu de tronquer → `SummarizingMemory` (§16.2). Pour des
+**faits tenus à jour avec recall/remember** (le LLM va chercher — et note —
+lui-même les détails durables) → `FactMemory` (§21) :
 
 ```python
-# Voir examples/memory_vector.py
-from examples.memory_vector import VectorMemory
+from autoagent import Agent, FactMemory
 
-memory = VectorMemory(provider, keep_recent=6)
+memory = FactMemory(provider, path="faits_client.json")
 agent = Agent(provider, memory=memory)
-agent.register_recall_tool()   # expose un tool recall(query, k)
+agent.register_recall_tool()     # tool recall(query, k)
+agent.register_remember_tool()   # tool remember(fact) — 0.12.0
 ```
+
+Pour du **sémantique** (embeddings) : apporte ta `Memory` (contrat en §4.6.6).
 
 Si tu préfères tout faire à la main :
 
-- **Sliding window** côté hôte (voir `HistoryStore` dans `examples/react_dashboard_agent.py`).
+- **Sliding window** côté hôte (fenêtre glissante sur `result.messages`).
 - Tronque les `tool_call.arguments` et `tool_message.content` après une certaine taille.
 - Important : **garde toujours le system message et ne casse pas une paire `assistant.tool_calls` ↔ `tool.tool_call_id`** (sinon les providers rejettent la requête).
 
