@@ -643,12 +643,14 @@ Règles :
 3. **Drop si aucun user dans le budget** : on retourne **uniquement les system messages** — préférable à une conversation malformée.
 4. `max_messages < 1` lève `ValueError` au constructeur.
 
-#### 4.6.4 Quand l'utiliser
+#### 4.6.4 Quelle mémoire choisir ?
 
-- ✅ Chat persistant avec un cap doux sur le coût des tokens
-- ✅ Démos / scripts où une mémoire est OK pour 95% des cas
-- ❌ Quand il faut **retrouver** un détail oublié → écris une `Memory` vectorielle (voir `examples/memory_vector.py`)
-- ❌ Quand il faut **résumer** plutôt que tronquer → idem
+| Besoin | Classe | Où |
+|---|---|---|
+| Cap doux sur les tokens, tronquer suffit | `BufferMemory` | ci-dessus |
+| **Résumer** plutôt que jeter (contexte borné sans perdre les décisions) | `SummarizingMemory` | §16.2 |
+| **Connaître la personne** : faits tenus à jour (une contradiction remplace), JSON par identité, outils remember/recall | `FactMemory` | §21 |
+| Recherche **sémantique** (« véhicule » retrouve « voiture ») | apporte ta `Memory` vectorielle (2 méthodes) ou un backend externe via MCP | §4.6.6 |
 
 #### 4.6.5 `agent.register_recall_tool()`
 
@@ -668,18 +670,35 @@ Implémentation (`autoagent/agent.py` ~l.224-295) :
 - **Erreurs absorbées** : si `recall()` lève, le tool retourne `{matches: [], error: "..."}` au lieu de propager — le LLM peut réagir gracieusement.
 - **Truncation/redaction** : chaque `match["content"]` passe par `truncate_preview(..., limit=2000)` (mêmes patterns que `trace`).
 
-#### 4.6.6 Mémoire vectorielle — voir `examples/memory_vector.py`
+Jumeau d'ÉCRITURE (0.12.0) : `agent.register_remember_tool()` — l'agent
+mémorise volontairement un fait durable (no-op si la mémoire n'a pas de
+méthode `remember` ; `FactMemory` l'a). Voir §21.
 
-L'exemple fournit `VectorMemory(provider, embed_fn=None, keep_recent=6, summary_temperature=0.2)` (~520 LOC, no chromadb / no faiss — numpy en mémoire) :
+#### 4.6.6 Mémoire vectorielle — apporte la tienne
 
-- `embed_fn` par défaut : OpenAI `text-embedding-3-small` via `urllib` stdlib (cohérent avec le no-deps style d'autoagent). Lève si pas de `OPENAI_API_KEY`.
-- Chunks par turn = (user + assistant qui suit + tool messages associés). Embeddés, indexés.
-- **Lock TOCTOU-safe** : le check + embed + store est sous un même lock.
-- **Résumé** des turns anciens via 1 appel LLM, retourne `[system…, summary, last keep_recent]`.
-- **Redaction au chokepoint rendu** : `_render_chunk` retourne `redact("\n".join(out))` → cascade sur chunks stockés, input du résumé LLM, preview fallback.
-- Recall : cosine similarity (dot product numpy sur vecteurs normalisés).
+La lib n'embarque VOLONTAIREMENT pas de mémoire à embeddings (dépendance +
+service à opérer, contraire au zéro-dépendance). Le protocole suffit — deux
+méthodes à implémenter côté hôte :
 
-À utiliser comme base, pas comme prod-ready : tu vas typiquement le porter sur ton vector store (Chroma, Qdrant, pgvector).
+```python
+class MaMemoireVectorielle:
+    def compact(self, messages):
+        # embedder + indexer les vieux tours (Chroma, Qdrant, pgvector…),
+        # retourner [system…, résumé éventuel, derniers tours verbatim]
+        ...
+    def recall(self, query, k=5):
+        # top-k par similarité cosinus → list[Message]
+        ...
+
+agent = Agent(provider, memory=MaMemoireVectorielle())
+agent.register_recall_tool()      # et c'est branché
+```
+
+Points à soigner (appris en interne) : redacter les contenus AVANT de les
+indexer (`from autoagent.trace import truncate_preview` / `redact`), verrouiller
+le check-embed-store sous un même lock, et garder les derniers tours verbatim.
+Alternative sans code : un backend mémoire externe (Mem0 & co) exposé en
+serveur MCP → `MCPClient.mount(agent)` (§17).
 
 ### 4.7 `post_turn_hook` — boucle de vérification hôte
 
