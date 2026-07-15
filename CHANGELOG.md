@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-15
+
 ### Added
 - **`FactMemory(background=True)` + `flush()`** — "sleep-time" consolidation:
   the extraction LLM call moves OFF the critical path into a worker thread.
