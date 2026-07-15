@@ -40,9 +40,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable
 
 from .logging import get_logger
 from .schema import LLMRequest, Message
@@ -336,6 +338,20 @@ class FactMemory:
         max_facts: taille max de la base (au-delà, les faits les plus
             anciennement mis à jour sont écartés).
         extract_max_tokens: budget de la réponse d'extraction.
+        background: consolidation en ARRIÈRE-PLAN (« sleep-time », 0.13) —
+            l'appel LLM d'extraction sort du chemin critique : ``compact()``
+            lance l'extraction dans un thread et rend la main immédiatement
+            (les vieux tours restent dans le contexte UN tour de plus, puis
+            sont repliés une fois les faits sauvés — jamais de troncature
+            avant sauvegarde). ``flush()`` attend la fin (tests, arrêt).
+        embed_fn: fonction d'embedding OPTIONNELLE ``list[str] ->
+            list[list[float]]`` fournie par l'hôte (API OpenAI/Gemini,
+            modèle local…). Quand elle est fournie, ``recall`` cherche par
+            SENS (cosinus) au lieu du lexical — « véhicule » retrouve
+            « voiture ». Embeddings calculés paresseusement au premier
+            recall (un lot), persistés dans un fichier annexe
+            ``<path>.vectors.json`` (le JSON des faits reste lisible).
+            Échec d'embedding → repli lexical, jamais d'erreur.
     """
 
     _MARKER = "[Faits mémorisés]"
@@ -350,6 +366,8 @@ class FactMemory:
         max_context_facts: int = 20,
         max_facts: int = 500,
         extract_max_tokens: int = 800,
+        background: bool = False,
+        embed_fn: Callable[[list[str]], list[list[float]]] | None = None,
     ) -> None:
         if max_messages < 2 or keep_recent < 1 or keep_recent >= max_messages:
             raise ValueError("exige max_messages >= 2 et 1 <= keep_recent < max_messages")
@@ -362,10 +380,15 @@ class FactMemory:
         self.max_context_facts = max_context_facts
         self.max_facts = max_facts
         self.extract_max_tokens = extract_max_tokens
+        self.background = background
+        self.embed_fn = embed_fn
         self._facts: list[dict[str, Any]] = []
         self._next_id = 1
         self._covered = 0  # nb de messages non-système déjà passés par l'extraction
         self._covered_fp = ""  # empreinte du préfixe couvert (détection de nouvelle conversation)
+        self._lock = threading.Lock()  # garde _facts/_next_id (worker + hôte)
+        self._job: dict[str, Any] | None = None  # extraction en cours (mode background)
+        self._vectors: dict[int, list[float]] = {}  # id de fait -> embedding
         if self.path is not None and self.path.exists():
             self._load()
 
@@ -392,6 +415,20 @@ class FactMemory:
             # jamais extrait (contradictions perdues en silence).
             self._covered = 0
             self._covered_fp = ""
+        # Mode background : une extraction lancée à un tour précédent vient
+        # de finir ? On n'adopte le repli qu'ICI, une fois les faits SAUVÉS —
+        # jamais de troncature avant sauvegarde.
+        if self._job is not None and not self._job["thread"].is_alive():
+            job, self._job = self._job, None
+            if (
+                job.get("error") is None
+                and job["cut"] <= len(others)
+                and _prefix_fingerprint(others[: job["cut"]]) == job["fp"]
+            ):
+                self._covered = job["cut"]
+                self._covered_fp = job["fp"]
+            # échec ou transcript changé → la tranche sera retentée telle
+            # qu'elle est aujourd'hui ; rien n'a été perdu.
         if len(others) <= self.max_messages:
             return self._assemble(system_msgs, others)
         cut = len(others) - self.keep_recent
@@ -399,7 +436,34 @@ class FactMemory:
             cut += 1
         if cut >= len(others):  # aucun user dans la fenêtre récente — dégénéré
             cut = max(self._covered, len(others) - self.keep_recent)
-        to_fold = others[self._covered : cut]
+        to_fold = list(others[self._covered : cut])
+        if to_fold and self.background:
+            if self._job is None:
+                # « Sleep-time » (0.13) : l'appel LLM part dans un thread,
+                # la conversation ne l'attend JAMAIS. Le contexte reste
+                # entier un tour de plus (coût borné et connu) ; le repli
+                # aura lieu au prochain compact(), après sauvegarde.
+                job: dict[str, Any] = {
+                    "cut": cut,
+                    "fp": _prefix_fingerprint(others[:cut]),
+                    "error": None,
+                }
+
+                def _worker() -> None:
+                    try:
+                        self._extract(to_fold)
+                    except Exception as exc:  # noqa: BLE001
+                        job["error"] = exc
+                        _log.exception(
+                            "background fact extraction failed; slice will be retried"
+                        )
+
+                job["thread"] = threading.Thread(
+                    target=_worker, name="autoagent-factmemory", daemon=True
+                )
+                self._job = job
+                job["thread"].start()
+            return self._assemble(system_msgs, others[self._covered :])
         if to_fold:
             try:
                 self._extract(to_fold)
@@ -412,23 +476,73 @@ class FactMemory:
             self._covered_fp = _prefix_fingerprint(others[:cut])
         return self._assemble(system_msgs, others[cut:])
 
+    def flush(self, timeout: float | None = None) -> bool:
+        """Attend la fin d'une consolidation en arrière-plan (arrêt propre,
+        tests). Retourne ``False`` si le délai expire. No-op en mode
+        synchrone."""
+        job = self._job
+        if job is None:
+            return True
+        job["thread"].join(timeout)
+        return not job["thread"].is_alive()
+
     def recall(self, query: str, k: int = 5) -> list[Message]:
+        with self._lock:
+            snapshot = [dict(f) for f in self._facts]
+        if not snapshot:
+            return []
+        if self.embed_fn is not None:
+            try:
+                ranked = self._semantic_rank(query, snapshot, k)
+                if ranked is not None:
+                    return ranked
+            except Exception:
+                _log.exception("embed_fn failed; falling back to lexical recall")
         terms = {t for t in query.lower().split() if len(t) > 2}
         if not terms:
             return []
         scored = []
-        for fact in self._facts:
+        for fact in snapshot:
             haystack = set(
                 (fact["fact"] + " " + (fact.get("subject") or "")).lower().split()
             )
             score = len(terms & haystack)
             if score:
-                scored.append((score, fact["id"]))
-        scored.sort(key=lambda pair: (-pair[0], pair[1]))
-        by_id = {fact["id"]: fact for fact in self._facts}
+                scored.append((score, fact["id"], fact["fact"]))
+        scored.sort(key=lambda item: (-item[0], item[1]))
         return [
-            Message(role="user", content=f"[Fait #{fid}] {by_id[fid]['fact']}")
-            for _, fid in scored[:k]
+            Message(role="user", content=f"[Fait #{fid}] {texte}")
+            for _, fid, texte in scored[:k]
+        ]
+
+    def _semantic_rank(
+        self, query: str, snapshot: list[dict[str, Any]], k: int
+    ) -> list[Message] | None:
+        """Classement par cosinus d'embeddings ; None = repli lexical."""
+        missing = [f for f in snapshot if f["id"] not in self._vectors]
+        if missing:
+            vectors = self.embed_fn([f["fact"] for f in missing])
+            with self._lock:
+                for fact, vector in zip(missing, vectors):
+                    self._vectors[fact["id"]] = list(vector)
+            self._save_vectors()
+        query_vec = self.embed_fn([query])[0]
+        with self._lock:
+            pairs = [
+                (fact, self._vectors.get(fact["id"])) for fact in snapshot
+            ]
+        scored = [
+            (_cosine(query_vec, vector), fact)
+            for fact, vector in pairs
+            if vector is not None
+        ]
+        if not scored:
+            return None
+        scored.sort(key=lambda item: (-item[0], item[1]["id"]))
+        return [
+            Message(role="user", content=f"[Fait #{fact['id']}] {fact['fact']}")
+            for score, fact in scored[:k]
+            if score > 0
         ]
 
     # ── API factuelle ────────────────────────────────────────────────────
@@ -440,27 +554,31 @@ class FactMemory:
         fact = (fact or "").strip()
         if not fact:
             raise ValueError("fact must be a non-empty string")
-        for existing in self._facts:
-            if existing["fact"].strip().lower() == fact.lower():
-                existing["updated"] = self._today()
-                self._save()
-                return dict(existing)
-        stored = self._add(fact, subject)
-        self._save()
-        return dict(stored)
+        with self._lock:
+            for existing in self._facts:
+                if existing["fact"].strip().lower() == fact.lower():
+                    existing["updated"] = self._today()
+                    self._save()
+                    return dict(existing)
+            stored = self._add(fact, subject)
+            self._save()
+            return dict(stored)
 
     def forget(self, fact_id: int) -> bool:
         """Supprime un fait par id. Retourne True s'il existait."""
-        before = len(self._facts)
-        self._facts = [f for f in self._facts if f["id"] != fact_id]
-        removed = len(self._facts) < before
-        if removed:
-            self._save()
-        return removed
+        with self._lock:
+            before = len(self._facts)
+            self._facts = [f for f in self._facts if f["id"] != fact_id]
+            self._vectors.pop(fact_id, None)
+            removed = len(self._facts) < before
+            if removed:
+                self._save()
+            return removed
 
     def facts(self) -> list[dict[str, Any]]:
         """Copie de la base de faits (pour inspection/audit hôte)."""
-        return [dict(f) for f in self._facts]
+        with self._lock:
+            return [dict(f) for f in self._facts]
 
     # ── interne ──────────────────────────────────────────────────────────
 
@@ -485,10 +603,14 @@ class FactMemory:
         return stored
 
     def _extract(self, to_fold: list[Message]) -> None:
+        # Peut tourner dans le worker : instantané des faits sous verrou,
+        # appel LLM HORS verrou, application des opérations sous verrou.
+        with self._lock:
+            existants = [(f["id"], f["fact"]) for f in self._facts]
         lines = ["Faits existants :"]
-        if self._facts:
-            for fact in self._facts:
-                lines.append(f"- [id {fact['id']}] {fact['fact']}")
+        if existants:
+            for fid, texte in existants:
+                lines.append(f"- [id {fid}] {texte}")
         else:
             lines.append("(aucun)")
         lines.append("\nNouveaux échanges :")
@@ -510,10 +632,12 @@ class FactMemory:
                 response_format={"type": "json_object"},
             )
         )
-        self._apply_operations(_parse_operations(response.content or ""))
-        self._save()
+        with self._lock:
+            self._apply_operations(_parse_operations(response.content or ""))
+            self._save()
 
     def _apply_operations(self, operations: list[dict[str, Any]]) -> None:
+        # Appelé sous self._lock.
         by_id = {fact["id"]: fact for fact in self._facts}
         for op in operations:
             kind = op.get("op")
@@ -529,21 +653,25 @@ class FactMemory:
                 if target is not None and fact:
                     target["fact"] = fact
                     target["updated"] = self._today()
+                    self._vectors.pop(target["id"], None)  # texte changé → ré-embedder
                 else:
                     _log.debug("fact update ignoré (id inconnu ou fait vide): %r", op)
             elif kind == "delete":
                 if op.get("id") in by_id:
                     self._facts = [f for f in self._facts if f["id"] != op["id"]]
+                    self._vectors.pop(op["id"], None)
                     by_id.pop(op["id"], None)
             else:
                 _log.debug("opération de fait inconnue ignorée: %r", op)
 
     def _assemble(self, system_msgs: list[Message], tail: list[Message]) -> list[Message]:
-        if not self._facts:
+        with self._lock:
+            facts_now = [dict(f) for f in self._facts]
+        if not facts_now:
             return [*system_msgs, *tail]
         # Les plus récemment mis à jour d'abord, bornés, ré-ordonnés par id
         # pour un rendu stable.
-        chosen = sorted(self._facts, key=lambda f: f["updated"], reverse=True)
+        chosen = sorted(facts_now, key=lambda f: f["updated"], reverse=True)
         chosen = sorted(chosen[: self.max_context_facts], key=lambda f: f["id"])
         lines = [self._MARKER]
         for fact in chosen:
@@ -567,6 +695,22 @@ class FactMemory:
         except OSError:
             _log.exception("fact store write failed (%s); facts kept in memory", self.path)
 
+    def _vectors_path(self) -> Path | None:
+        # Fichier ANNEXE : le JSON des faits reste lisible par un humain,
+        # les embeddings (gros et opaques) vivent à côté.
+        return None if self.path is None else self.path.with_name(self.path.name + ".vectors.json")
+
+    def _save_vectors(self) -> None:
+        vpath = self._vectors_path()
+        if vpath is None:
+            return
+        try:
+            with self._lock:
+                data = {str(fid): vec for fid, vec in self._vectors.items()}
+            vpath.write_text(json.dumps(data), encoding="utf-8")
+        except OSError:
+            _log.exception("vector sidecar write failed (%s); vectors kept in memory", vpath)
+
     def _load(self) -> None:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -577,6 +721,27 @@ class FactMemory:
         except (OSError, ValueError):
             _log.exception("fact store unreadable (%s); starting empty", self.path)
             self._facts, self._next_id = [], 1
+        vpath = self._vectors_path()
+        if vpath is not None and vpath.exists():
+            try:
+                raw = json.loads(vpath.read_text(encoding="utf-8"))
+                ids = {f["id"] for f in self._facts}
+                self._vectors = {
+                    int(fid): vec for fid, vec in raw.items()
+                    if int(fid) in ids and isinstance(vec, list)
+                }
+            except (OSError, ValueError):
+                _log.exception("vector sidecar unreadable (%s); will re-embed", vpath)
+                self._vectors = {}
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    """Similarité cosinus en pur stdlib (les vecteurs sont courts)."""
+    if len(a) != len(b) or not a:
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm = math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b))
+    return dot / norm if norm else 0.0
 
 
 def _prefix_fingerprint(messages: list[Message]) -> str:

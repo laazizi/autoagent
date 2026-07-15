@@ -2591,6 +2591,8 @@ agent.register_remember_tool()    # l'agent ÉCRIT volontairement (« notez que�
 | `remember(fait, subject=)` | ajout DIRECT sans LLM, dédupliqué à l'identique |
 | `forget(id)` / `facts()` | suppression ciblée / copie de la base pour audit |
 | `Agent.register_remember_tool(name=, description=)` | expose `remember` comme outil ; no-op si la mémoire n'a pas de `.remember` |
+| `background=True` + `flush(timeout=)` *(non publié)* | consolidation « **sleep-time** » : l'appel LLM d'extraction part dans un THREAD, `compact()` rend la main en <1 ms ; le repli du transcript n'est adopté qu'APRÈS sauvegarde des faits (échec = rien perdu, la tranche est retentée). `flush()` pour l'arrêt propre/les tests |
+| `embed_fn=` *(non publié)* | recherche par le SENS : fonction d'embedding fournie par l'hôte (`list[str] -> list[list[float]]`) → `recall("véhicule")` retrouve « deux voitures » (cosinus). Embeddings paresseux (1 lot au premier recall), persistés dans `<path>.vectors.json` (le JSON des faits reste lisible), échec → repli lexical |
 
 **Contrats** : échec d'extraction → compaction SAUTÉE (rien de tronqué en
 silence) ; opérations mal formées ignorées (id inconnu, op inconnue, non-JSON,
@@ -2598,9 +2600,10 @@ fences ```json tolérées) ; les faits SURVIVENT aux conversations (un historiqu
 qui raccourcit ne vide pas la base — c'est le but) ; réabsorption du message
 `[Faits mémorisés]` in-band quand l'hôte persiste l'historique compacté.
 
-**Ce que ça ne fait PAS** (assumé) : pas de recherche sémantique (« véhicule »
-≠ « voiture ») ni de raisonnement temporel à la Zep — pour ça, brancher un
-backend lourd via le protocole `Memory` ou un serveur mémoire MCP (§17).
+**Ce que ça ne fait PAS** (assumé) : pas de raisonnement temporel à la Zep
+(« où habitait-il avant ? ») ni de graphe de relations — pour ça, brancher un
+backend lourd (Graphiti/Mem0) via le protocole `Memory` ou un serveur mémoire
+MCP (§17). La recherche sémantique, elle, est couverte par `embed_fn=`.
 
 ---
 

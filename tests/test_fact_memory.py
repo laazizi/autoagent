@@ -164,6 +164,87 @@ class TestPersistence:
         assert memory.facts() == []
 
 
+class TestBackgroundConsolidation:
+    def test_extraction_off_the_hot_path_then_folded_after_save(self) -> None:
+        """« Sleep-time » : compact() ne bloque pas sur le LLM ; le repli
+        n'a lieu qu'APRÈS la sauvegarde des faits (au compact suivant)."""
+        provider = FakeLLMProvider([_ops({"op": "add", "fact": "préfère le soir"})])
+        memory = FactMemory(provider, max_messages=6, keep_recent=2, background=True)
+        msgs = _convo(4)  # 8 messages non-système > 6
+
+        first = memory.compact(msgs)
+        # 1er passage : job lancé, transcript INTACT (aucune troncature)
+        assert len([m for m in first if m.role != "system"]) == 8
+
+        assert memory.flush(timeout=5)          # la consolidation se termine
+        assert memory.facts()[0]["fact"] == "préfère le soir"
+
+        second = memory.compact(msgs)
+        # 2e passage : faits sauvés → repli adopté (keep_recent=2)
+        assert len([m for m in second if m.role != "system"]) == 2
+        assert any((m.content or "").startswith("[Faits mémorisés]") for m in second)
+
+    def test_background_failure_never_loses_anything(self) -> None:
+        class BrokenProvider(FakeLLMProvider):
+            def complete(self, request):
+                raise RuntimeError("réseau")
+
+        memory = FactMemory(BrokenProvider(), max_messages=6, keep_recent=2, background=True)
+        msgs = _convo(4)
+        memory.compact(msgs)
+        assert memory.flush(timeout=5)
+        again = memory.compact(msgs)            # échec → rien adopté, rien perdu
+        assert len([m for m in again if m.role != "system"]) == 8
+        assert memory.facts() == []
+
+
+def _embed_par_theme(texts: list[str]) -> list[list[float]]:
+    """Faux embedding déterministe : axe 0 = « véhicules », axe 1 = le reste."""
+    vehicule = ("voiture", "voitures", "véhicule", "auto", "scooter")
+    return [
+        [1.0, 0.0] if any(w in t.lower() for w in vehicule) else [0.0, 1.0]
+        for t in texts
+    ]
+
+
+class TestSemanticRecall:
+    def test_finds_by_meaning_where_lexical_fails(self) -> None:
+        memory = FactMemory(FakeLLMProvider(), embed_fn=_embed_par_theme)
+        memory.remember("possède deux voitures", subject="foyer")
+        memory.remember("préfère être rappelé le matin")
+
+        matches = memory.recall("véhicule")     # aucun mot commun avec le fait
+        assert matches and "voitures" in matches[0].content
+
+    def test_broken_embed_fn_falls_back_to_lexical(self) -> None:
+        def embed_casse(texts):
+            raise RuntimeError("API embeddings indisponible")
+
+        memory = FactMemory(FakeLLMProvider(), embed_fn=embed_casse)
+        memory.remember("préfère être rappelé le matin")
+        matches = memory.recall("matin")        # le lexical prend le relais
+        assert matches and "matin" in matches[0].content
+
+    def test_vectors_persist_in_sidecar_and_are_not_recomputed(self, tmp_path) -> None:
+        appels: list[int] = []
+
+        def embed_compte(texts):
+            appels.append(len(texts))
+            return _embed_par_theme(texts)
+
+        store = tmp_path / "faits.json"
+        m1 = FactMemory(FakeLLMProvider(), path=store, embed_fn=embed_compte)
+        m1.remember("possède deux voitures")
+        m1.recall("véhicule")                   # embed du fait + de la requête
+        sidecar = tmp_path / "faits.json.vectors.json"
+        assert sidecar.exists()
+
+        appels.clear()
+        m2 = FactMemory(FakeLLMProvider(), path=store, embed_fn=embed_compte)
+        assert m2.recall("véhicule")            # vecteurs rechargés du sidecar
+        assert appels == [1]                    # SEULE la requête a été embarquée
+
+
 class TestRememberTool:
     def test_agent_stores_fact_through_the_tool(self) -> None:
         memory = FactMemory(FakeLLMProvider())

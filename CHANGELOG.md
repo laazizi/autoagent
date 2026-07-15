@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`FactMemory(background=True)` + `flush()`** — "sleep-time" consolidation:
+  the extraction LLM call moves OFF the critical path into a worker thread.
+  `compact()` returns in <1 ms; the transcript is only folded AFTER the facts
+  are safely stored (a failed background extraction loses nothing — the slice
+  is retried). Inspired by Letta's sleep-time compute.
+- **`FactMemory(embed_fn=...)`** — semantic recall: pass a host-provided
+  embedding function (`list[str] -> list[list[float]]`, any provider or local
+  model) and `recall("véhicule")` finds "deux voitures" by cosine similarity.
+  Embeddings are computed lazily (one batch at first recall), persisted in a
+  `<path>.vectors.json` sidecar (the facts JSON stays human-readable), and any
+  embedding failure falls back to lexical search — never an error.
+
 ## [0.12.0] - 2026-07-14
 
 ### Added
