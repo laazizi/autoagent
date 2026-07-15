@@ -1,5 +1,9 @@
 # autoagent
 
+[![tests](https://github.com/laazizi/autoagent/actions/workflows/tests.yml/badge.svg)](https://github.com/laazizi/autoagent/actions/workflows/tests.yml)
+[![PyPI](https://img.shields.io/pypi/v/autoagent-core)](https://pypi.org/project/autoagent-core/)
+[![visual builder](https://img.shields.io/badge/visual_builder-try_it_online-6172f3)](https://laazizi.github.io/autoagent/)
+
 **A minimal, auditable LLM agent core for Python. Not a framework.**
 
 `autoagent` is a small library that gives you the agent loop — LLM ↔ tools, done right —
@@ -23,6 +27,10 @@ print(result.output)   # "42"
 
 That's the whole API for the common case. The JSON schema for `add` is generated from the
 type annotations. The loop, retries, and provider wire formats are handled for you.
+
+Prefer assembling visually? **[Try the visual builder online](https://laazizi.github.io/autoagent/)** —
+drag blocks (agent, tools, memory, MCP, checkpoint…), get runnable Python. Fully offline,
+also ships in the repo as `constructeur_autoagent.html`.
 
 Need live output? Streaming is a plain sync iterator — no async ceremony:
 

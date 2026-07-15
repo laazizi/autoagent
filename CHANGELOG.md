@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`FactMemory` consolidation now scales**: the extraction prompt no longer
+  ships the WHOLE fact base — only the facts relevant to the folded slice
+  (crude-stem lexical overlap, generous top-K via `max_consolidation_facts`,
+  default 30). At 500 facts this cuts ~15k tokens per consolidation and keeps
+  the LLM focused; small bases (≤ K) are unchanged. The dedup in
+  `_apply_operations` still checks the whole base as a backstop.
+
+### Added
+- CI (GitHub Actions): pytest on Linux + Windows × Python 3.10–3.13.
+- The visual builder is published on GitHub Pages:
+  https://laazizi.github.io/autoagent/
+- `AGENTS.md` (master context file for coding agents — Codex, Cursor, Gemini
+  CLI…) with `CLAUDE.md` / `GEMINI.md` / Copilot pointers and a repo-shipped
+  Claude Code skill (`.claude/skills/autoagent-dev`).
+
 ## [0.13.0] - 2026-07-15
 
 ### Added

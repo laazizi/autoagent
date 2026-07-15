@@ -368,11 +368,14 @@ class FactMemory:
         extract_max_tokens: int = 800,
         background: bool = False,
         embed_fn: Callable[[list[str]], list[list[float]]] | None = None,
+        max_consolidation_facts: int = 30,
     ) -> None:
         if max_messages < 2 or keep_recent < 1 or keep_recent >= max_messages:
             raise ValueError("exige max_messages >= 2 et 1 <= keep_recent < max_messages")
-        if max_context_facts < 1 or max_facts < 1:
-            raise ValueError("max_context_facts et max_facts doivent être >= 1")
+        if max_context_facts < 1 or max_facts < 1 or max_consolidation_facts < 1:
+            raise ValueError(
+                "max_context_facts, max_facts et max_consolidation_facts doivent être >= 1"
+            )
         self.provider = provider
         self.path = Path(path) if path is not None else None
         self.max_messages = max_messages
@@ -382,6 +385,7 @@ class FactMemory:
         self.extract_max_tokens = extract_max_tokens
         self.background = background
         self.embed_fn = embed_fn
+        self.max_consolidation_facts = max_consolidation_facts
         self._facts: list[dict[str, Any]] = []
         self._next_id = 1
         self._covered = 0  # nb de messages non-système déjà passés par l'extraction
@@ -607,6 +611,7 @@ class FactMemory:
         # appel LLM HORS verrou, application des opérations sous verrou.
         with self._lock:
             existants = [(f["id"], f["fact"]) for f in self._facts]
+        existants = self._relevant_for(to_fold, existants)
         lines = ["Faits existants :"]
         if existants:
             for fid, texte in existants:
@@ -635,6 +640,41 @@ class FactMemory:
         with self._lock:
             self._apply_operations(_parse_operations(response.content or ""))
             self._save()
+
+    def _relevant_for(
+        self, to_fold: list[Message], existants: list[tuple[int, str]]
+    ) -> list[tuple[int, str]]:
+        """Présélectionne les faits PERTINENTS pour la tranche à consolider.
+
+        Envoyer TOUTE la base au LLM coûte linéairement (500 faits ≈ 15k
+        tokens PAR consolidation) et dégrade sa précision — les systèmes
+        de référence (Mem0) ne consolident que contre les faits similaires.
+        Filtre par recouvrement lexical avec la tranche, VOLONTAIREMENT
+        généreux (``max_consolidation_facts``, défaut 30) : un fait non
+        montré ne peut pas être contredit — et la déduplication de
+        ``_apply_operations`` (qui compare à TOUTE la base) reste le filet
+        contre les doublons.
+        """
+        if len(existants) <= self.max_consolidation_facts:
+            return existants  # petite base : comportement inchangé
+
+        def stems(texte: str) -> set[str]:
+            # Racines grossières (5 premiers caractères) : « rappel » et
+            # « rappelé » doivent matcher — le filtre est un rappel large,
+            # pas une recherche exacte.
+            return {t[:5] for t in texte.lower().split() if len(t) > 3}
+
+        slice_stems: set[str] = set()
+        for message in to_fold:
+            slice_stems |= stems(message.content or "")
+        scored = []
+        for index, (fid, texte) in enumerate(existants):
+            overlap = len(slice_stems & stems(texte))
+            scored.append((-overlap, index, fid, texte))
+        scored.sort()
+        kept = scored[: self.max_consolidation_facts]
+        kept.sort(key=lambda item: item[1])  # ordre d'origine (stabilité du prompt)
+        return [(fid, texte) for _, _, fid, texte in kept]
 
     def _apply_operations(self, operations: list[dict[str, Any]]) -> None:
         # Appelé sous self._lock.

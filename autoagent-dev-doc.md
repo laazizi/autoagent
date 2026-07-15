@@ -2593,6 +2593,7 @@ agent.register_remember_tool()    # l'agent ÉCRIT volontairement (« notez que�
 | `forget(id)` / `facts()` | suppression ciblée / copie de la base pour audit |
 | `Agent.register_remember_tool(name=, description=)` | expose `remember` comme outil ; no-op si la mémoire n'a pas de `.remember` |
 | `background=True` + `flush(timeout=)` *(0.13.0)* | consolidation « **sleep-time** » : l'appel LLM d'extraction part dans un THREAD, `compact()` rend la main en <1 ms ; le repli du transcript n'est adopté qu'APRÈS sauvegarde des faits (échec = rien perdu, la tranche est retentée). `flush()` pour l'arrêt propre/les tests |
+| `max_consolidation_facts=30` *(non publié)* | scalabilité de la consolidation : le prompt d'extraction ne reçoit que les faits PERTINENTS pour la tranche (recouvrement lexical à racines, top-K généreux) au lieu de TOUTE la base — à 500 faits, ~15k tokens économisés par consolidation ; la déduplication reste un filet sur la base entière |
 | `embed_fn=` *(0.13.0)* | recherche par le SENS : fonction d'embedding fournie par l'hôte (`list[str] -> list[list[float]]`) → `recall("véhicule")` retrouve « deux voitures » (cosinus). Embeddings paresseux (1 lot au premier recall), persistés dans `<path>.vectors.json` (le JSON des faits reste lisible), échec → repli lexical |
 
 **Contrats** : échec d'extraction → compaction SAUTÉE (rien de tronqué en

@@ -164,6 +164,38 @@ class TestPersistence:
         assert memory.facts() == []
 
 
+class TestConsolidationScalability:
+    def test_large_base_only_relevant_facts_reach_the_llm(self) -> None:
+        """500 faits en base ≠ 500 faits dans le prompt : seuls les faits
+        PERTINENTS pour la tranche traitée sont montrés au LLM (top-K)."""
+        provider = FakeLLMProvider([_ops()])
+        memory = FactMemory(provider, max_messages=4, keep_recent=2,
+                            max_consolidation_facts=10)
+        for i in range(60):
+            memory.remember(f"trajet domicile travail numero {i} en tramway")
+        memory.remember("préfère être rappelé le soir", subject="rdv")
+
+        msgs = [Message(role="system", content="sys")]
+        for i in range(3):
+            msgs.append(Message(role="user", content="pour le rappel, plutôt le matin"))
+            msgs.append(Message(role="assistant", content="je note le rappel du matin"))
+        memory.compact(msgs)
+
+        prompt = provider.calls[-1].messages[-1].content
+        assert "préfère être rappelé le soir" in prompt      # le fait pertinent est là
+        assert prompt.count("- [id ") <= 10                   # ... pas la base entière
+        assert "numero 42" not in prompt                      # le bruit est filtré
+
+    def test_small_base_unchanged_all_facts_shown(self) -> None:
+        provider = FakeLLMProvider([_ops()])
+        memory = FactMemory(provider, max_messages=4, keep_recent=2)
+        memory.remember("préfère le soir")
+        memory.remember("deux voitures au foyer")
+        memory.compact(_convo(4))
+        prompt = provider.calls[-1].messages[-1].content
+        assert prompt.count("- [id ") == 2                    # petite base : tout est montré
+
+
 class TestBackgroundConsolidation:
     def test_extraction_off_the_hot_path_then_folded_after_save(self) -> None:
         """« Sleep-time » : compact() ne bloque pas sur le LLM ; le repli
