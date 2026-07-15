@@ -249,3 +249,45 @@ class TestSubprocessSandbox:
         tool = load_generated_tool(path)
         with pytest.raises(ToolError, match="crashed inside generated tool"):
             tool()
+
+
+class TestCIHardening:
+    """Correctifs trouvés par le premier run CI (runners Windows)."""
+
+    def test_child_env_never_leaks_host_secrets(self, monkeypatch):
+        from autoagent import sandbox
+
+        monkeypatch.setenv("GEMINI_API_KEY", "super-secret")
+        monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
+        monkeypatch.setattr(sandbox.os, "name", "nt")
+        env = sandbox._child_env()
+        assert "GEMINI_API_KEY" not in env          # isolation préservée
+        assert env.get("SYSTEMROOT") == r"C:\Windows"  # CreateProcess a le nécessaire
+        monkeypatch.setattr(sandbox.os, "name", "posix")
+        assert sandbox._child_env() == {}           # POSIX : env vide, comme avant
+
+    def test_docker_available_requires_a_linux_daemon(self, monkeypatch):
+        """Un démon en mode « conteneurs Windows » répond, mais est inutilisable
+        (images linux, --read-only) : il doit compter comme indisponible."""
+        from autoagent import sandbox
+
+        class _Done:
+            def __init__(self, out):
+                self.returncode = 0
+                self.stdout = out
+
+        saved = sandbox._DOCKER_STATE.pop("available", None)
+        try:
+            monkeypatch.setattr(sandbox.shutil, "which", lambda _: "docker")
+            monkeypatch.setattr(sandbox.subprocess, "run",
+                                lambda *a, **k: _Done(b"windows\n"))
+            assert sandbox.docker_available() is False
+
+            sandbox._DOCKER_STATE.pop("available", None)
+            monkeypatch.setattr(sandbox.subprocess, "run",
+                                lambda *a, **k: _Done(b"linux\n"))
+            assert sandbox.docker_available() is True
+        finally:
+            sandbox._DOCKER_STATE.pop("available", None)
+            if saved is not None:
+                sandbox._DOCKER_STATE["available"] = saved

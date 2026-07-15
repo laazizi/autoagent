@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -296,7 +297,7 @@ class SubprocessSandbox:
                 capture_output=True,
                 timeout=self.timeout,
                 cwd=str(path.parent),
-                env={},
+                env=_child_env(),
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
@@ -380,17 +381,44 @@ except Exception as exc:
 _DOCKER_STATE: dict[str, bool] = {}
 
 
+def _child_env() -> dict[str, str]:
+    """Environnement MINIMAL du sous-processus sandboxé.
+
+    Le but est l'isolation : aucun secret de l'hôte (clés API…) ne doit
+    fuiter dans l'environnement du tool. Sous POSIX, un env vide suffit.
+    Sous Windows, un bloc d'environnement VIDE fait échouer CreateProcess
+    (``OSError: [WinError 87]`` sur les Python ≤ 3.11 — trouvé par la CI)
+    et le Python enfant a besoin de ``SystemRoot`` : on ne passe que des
+    variables système inoffensives, jamais le reste de ``os.environ``.
+    """
+    if os.name != "nt":
+        return {}
+    keep = ("SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT",
+            "TEMP", "TMP", "NUMBER_OF_PROCESSORS")
+    return {var: os.environ[var] for var in keep if var in os.environ}
+
+
 def docker_available() -> bool:
-    """True if a working Docker daemon is reachable (cached once). Lets the
-    host fall back to SubprocessSandbox when Docker is absent."""
+    """True if a working Docker daemon running LINUX containers is
+    reachable (cached once). Lets the host fall back to SubprocessSandbox
+    when Docker is absent — or useless: a daemon in *Windows containers*
+    mode (Docker Desktop switched, GitHub windows runners) answers ``info``
+    happily but can neither pull ``python:*-slim`` (linux image) nor honor
+    ``--read-only`` — found by CI."""
     if "available" not in _DOCKER_STATE:
         exe = shutil.which("docker")
         if not exe:
             _DOCKER_STATE["available"] = False
         else:
             try:
-                done = subprocess.run([exe, "info"], capture_output=True, timeout=20)
-                _DOCKER_STATE["available"] = done.returncode == 0
+                done = subprocess.run(
+                    [exe, "version", "--format", "{{.Server.Os}}"],
+                    capture_output=True, timeout=20,
+                )
+                _DOCKER_STATE["available"] = (
+                    done.returncode == 0
+                    and done.stdout.strip().lower() == b"linux"
+                )
             except Exception:  # noqa: BLE001
                 _DOCKER_STATE["available"] = False
     return _DOCKER_STATE["available"]

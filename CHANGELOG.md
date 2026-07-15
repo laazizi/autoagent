@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the LLM focused; small bases (≤ K) are unchanged. The dedup in
   `_apply_operations` still checks the whole base as a backstop.
 
+### Fixed
+- **Windows hardening (found by the first CI run)**: `SubprocessSandbox` no
+  longer passes an EMPTY environment to the child (`WinError 87` on Python
+  ≤ 3.11 — a minimal system-vars whitelist is passed instead, still zero
+  host secrets), and `docker_available()` now requires a LINUX-containers
+  daemon (a Windows-containers daemon answers `info` but cannot run the
+  sandbox images).
+
 ### Added
 - CI (GitHub Actions): pytest on Linux + Windows × Python 3.10–3.13.
 - The visual builder is published on GitHub Pages:
