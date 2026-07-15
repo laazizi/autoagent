@@ -1,4 +1,4 @@
-# examples_autoagent — le potentiel d'autoagent en 17 démos
+# examples_autoagent — le potentiel d'autoagent en 18 démos
 
 Quinze scripts courts, **exécutables tels quels**, montrant chacun UNE facette
 de la lib (la n°13 les combine). Rangés du plus simple au plus avancé.
@@ -35,6 +35,7 @@ présente. Pour forcer : `--provider gemini --model gemini-2.5-flash`.
 | 15 | `15_appel_entrant_fiche.py` | **Standard téléphonique** : cascade de repli pilotée par l'agent — fiche locale → CRM externe → sinon il DISCUTE avec l'appelant pour créer sa fiche. Plusieurs outils, l'agent choisit l'escalade | oui |
 | 16 | `16_questions_clarification.py` | **Clarification** : demande vague → l'agent POSE des questions à l'humain (outil `demander_a_l_humain`) avant d'agir ; `post_turn_hook` en filet (interdit de conclure en devinant) | oui |
 | 17 | `17_memoire_factuelle.py` | **Mémoire factuelle** (`FactMemory` 0.12.0) : faits atomiques tenus À JOUR (une contradiction REMPLACE, un fait caduc DISPARAÎT), JSON auditable par identité, + outils `remember`/`recall` | oui |
+| 18 | `18_corpus_url.py` | **Gros corpus depuis une URL** (~1M tokens) : l'agent TÉLÉCHARGE, le host INDEXE, l'agent navigue par outils (`chercher`/`lire_passage`) — répond en consommant ~1 % du corpus au lieu de tout injecter | oui |
 
 ## Par où commencer
 
