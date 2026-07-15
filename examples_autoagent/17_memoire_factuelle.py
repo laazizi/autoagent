@@ -1,20 +1,27 @@
 """17 — Mémoire factuelle : des FAITS tenus à jour, pas un résumé qui empile.
 
-`FactMemory` (0.12.0) fait passer les vieux tours par une extraction LLM qui
-maintient des faits atomiques via add / update / delete : une contradiction
-REMPLACE le fait périmé (« préfère le soir » → « préfère le matin »), un fait
-caduc disparaît (« le scooter a été vendu »). Le tout dans un JSON lisible par
-identité (`path=`) : auditable à la main, RGPD = supprimer le fichier.
+`FactMemory` fait passer les vieux tours par une extraction LLM qui maintient
+des faits atomiques via add / update / delete : une contradiction REMPLACE le
+fait périmé (« préfère le soir » → « préfère le matin »), un fait caduc
+disparaît (« le scooter a été vendu »). JSON lisible par identité (`path=`).
 
-La démo rejoue le scénario d'un enquêté rappelé deux fois :
+Et les deux atouts v2 (sleep-time + sens) :
 
-  appel 1  →  préférences + équipement extraits en faits
-  appel 2  →  CONTRADICTION (soir→matin) + fait caduc (scooter vendu)
-  agent    →  remember (« notez que je pars en août ») puis recall
+  * ``background=True`` — l'appel LLM d'extraction part dans un THREAD :
+    ``compact()`` rend la main en <1 ms (chronométré ci-dessous), la
+    conversation n'attend jamais la mémoire, et le transcript n'est replié
+    qu'APRÈS la sauvegarde des faits (échec = rien perdu).
+  * ``embed_fn=`` — recherche par le SENS : « véhicule » retrouve « deux
+    voitures » sans un seul mot commun (embeddings Gemini si la clé est là,
+    sinon repli lexical automatique).
 
     python examples_autoagent/17_memoire_factuelle.py
 """
 
+import json
+import os
+import time
+import urllib.request
 from pathlib import Path
 
 from _common import make_provider
@@ -22,6 +29,23 @@ from _common import make_provider
 from autoagent import Agent, FactMemory, Message
 
 STORE = Path(__file__).parent / "faits_martin.json"   # 1 fichier par identité
+
+
+def embed_gemini(texts: list[str]) -> list[list[float]]:
+    """Embeddings réels via l'API Gemini (batch, urllib pur, zéro dépendance)."""
+    corps = json.dumps({"requests": [
+        {"model": "models/gemini-embedding-001", "content": {"parts": [{"text": t}]}}
+        for t in texts
+    ]}).encode()
+    req = urllib.request.Request(
+        "https://generativelanguage.googleapis.com/v1beta/"
+        "models/gemini-embedding-001:batchEmbedContents",
+        data=corps,
+        headers={"Content-Type": "application/json",
+                 "x-goog-api-key": os.environ["GEMINI_API_KEY"]},
+    )
+    with urllib.request.urlopen(req, timeout=30) as reponse:  # noqa: S310
+        return [e["values"] for e in json.loads(reponse.read())["embeddings"]]
 
 
 def conversation(*tours: tuple[str, str]) -> list[Message]:
@@ -40,10 +64,15 @@ def afficher(memoire: FactMemory, titre: str) -> None:
 def main() -> None:
     STORE.unlink(missing_ok=True)                      # démo reproductible
     provider = make_provider()
-    memoire = FactMemory(provider, path=STORE, max_messages=6, keep_recent=2)
+    semantique = "GEMINI_API_KEY" in os.environ
+    memoire = FactMemory(
+        provider, path=STORE, max_messages=6, keep_recent=2,
+        background=True,                               # sleep-time : jamais bloquant
+        embed_fn=embed_gemini if semantique else None, # recherche par le sens
+    )
 
-    # ── Appel 1 : l'enquêté se présente (compact() extrait les faits) ──
-    memoire.compact(conversation(
+    # ── Appel 1 : l'enquêté se présente — et compact() ne bloque PAS ──
+    appel1 = conversation(
         ("user", "Bonjour, c'est M. Martin. Je préfère être rappelé le soir, après 18h."),
         ("assistant", "C'est noté, nous vous rappellerons le soir après 18h."),
         ("user", "Nous avons deux voitures au foyer, et mon fils a un scooter."),
@@ -52,10 +81,15 @@ def main() -> None:
         ("assistant", "Parfait, c'est noté."),
         ("user", "On peut continuer le questionnaire ?"),
         ("assistant", "Bien sûr."),
-    ))
-    afficher(memoire, "Faits après l'appel 1")
+    )
+    debut = time.perf_counter()
+    memoire.compact(appel1)
+    print(f"⚡ compact() a rendu la main en {(time.perf_counter() - debut) * 1000:.1f} ms "
+          "— l'extraction LLM tourne en coulisses (sleep-time)")
+    memoire.flush(timeout=60)                          # on attend juste pour l'affichage
+    afficher(memoire, "Faits après l'appel 1 (extraits en arrière-plan)")
 
-    # ── Appel 2 : contradiction + fait caduc → update / delete, PAS d'empilement ──
+    # ── Appel 2 : contradiction + fait caduc → update / delete ──
     memoire.compact(conversation(
         ("user", "Rebonjour, c'est M. Martin. Finalement rappelez-moi plutôt LE MATIN."),
         ("assistant", "C'est modifié : le matin désormais."),
@@ -66,7 +100,17 @@ def main() -> None:
         ("user", "Allez-y."),
         ("assistant", "Très bien."),
     ))
+    memoire.flush(timeout=60)
     afficher(memoire, "Faits après l'appel 2 (soir→matin mis à jour, scooter supprimé)")
+
+    # ── Recherche par le SENS : aucun mot commun avec le fait ──
+    if semantique:
+        matches = memoire.recall("véhicule")
+        print("\n🔍 recall('véhicule') — mot absent des faits — trouve par le sens :")
+        for m in matches[:1]:
+            print(f"  {m.content}")
+    else:
+        print("\n(pas de GEMINI_API_KEY : recall lexical — fournis embed_fn pour le sens)")
 
     # ── L'agent écrit et lit sa mémoire lui-même (remember / recall) ──
     agent = Agent(
@@ -79,12 +123,11 @@ def main() -> None:
         ),
         max_steps=6,
     )
-    agent.register_remember_tool()     # écriture volontaire (tracée)
-    agent.register_recall_tool()       # lecture à la demande
+    agent.register_remember_tool()
+    agent.register_recall_tool()
 
     r1 = agent.run("Notez bien que je serai absent tout le mois d'août, je pars en vacances.")
     print(f"\nagent (remember) : {r1.output.strip()}")
-
     r2 = agent.run("Quel est le meilleur moment pour rappeler M. Martin ? Vérifie avec recall.")
     print(f"agent (recall)   : {r2.output.strip()}")
 

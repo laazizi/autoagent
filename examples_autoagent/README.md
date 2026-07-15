@@ -34,7 +34,7 @@ présente. Pour forcer : `--provider gemini --model gemini-2.5-flash`.
 | 14 | `14_base_sql.py` | **Base SQL comme source** : l'agent inspecte le schéma, écrit un SELECT, la lib l'exécute en LECTURE SEULE (écriture refusée par le code) et répond sur des lignes réelles. SQLite (stdlib) | oui |
 | 15 | `15_appel_entrant_fiche.py` | **Standard téléphonique** : cascade de repli pilotée par l'agent — fiche locale → CRM externe → sinon il DISCUTE avec l'appelant pour créer sa fiche. Plusieurs outils, l'agent choisit l'escalade | oui |
 | 16 | `16_questions_clarification.py` | **Clarification** : demande vague → l'agent POSE des questions à l'humain (outil `demander_a_l_humain`) avant d'agir ; `post_turn_hook` en filet (interdit de conclure en devinant) | oui |
-| 17 | `17_memoire_factuelle.py` | **Mémoire factuelle** (`FactMemory` 0.12.0) : faits atomiques tenus À JOUR (une contradiction REMPLACE, un fait caduc DISPARAÎT), JSON auditable par identité, + outils `remember`/`recall` | oui |
+| 17 | `17_memoire_factuelle.py` | **Mémoire factuelle** (`FactMemory`) : faits atomiques tenus À JOUR (une contradiction REMPLACE, un fait caduc DISPARAÎT), JSON auditable par identité, outils `remember`/`recall` — + v2 : consolidation **sleep-time** (`background=True`, compact <1 ms) et recall **par le sens** (`embed_fn`) | oui |
 | 18 | `18_corpus_url.py` | **Gros corpus depuis une URL** (~1M tokens) : l'agent TÉLÉCHARGE, le host INDEXE, l'agent navigue par outils (`chercher`/`lire_passage`) — répond en consommant ~1 % du corpus au lieu de tout injecter | oui |
 
 ## Par où commencer

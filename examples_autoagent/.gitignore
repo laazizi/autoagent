@@ -7,3 +7,4 @@ __pycache__/
 faits_martin.json
 faits_appelant.json
 corpus_cache/
+faits_martin.json.vectors.json
