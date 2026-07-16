@@ -32,6 +32,8 @@ Prefer assembling visually? **[Try the visual builder online](https://laazizi.gi
 drag blocks (agent, tools, memory, MCP, checkpoint…), get runnable Python. Fully offline,
 also ships in the repo as `constructeur_autoagent.html`.
 
+[![The visual builder: drag blocks on the left, edit them in the middle, runnable Python appears on the right](assets/constructeur.png)](https://laazizi.github.io/autoagent/)
+
 Need live output? Streaming is a plain sync iterator — no async ceremony:
 
 ```python
