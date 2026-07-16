@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-07-16
+
 ### Changed
 - **`FactMemory` consolidation now scales**: the extraction prompt no longer
   ships the WHOLE fact base — only the facts relevant to the folded slice
