@@ -1448,8 +1448,14 @@ $("#th-dark").addEventListener("click", ()=>setTheme("dark"));
 // thème initial = préférence OS
 setTheme(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light");
 
-// démarrage : le 1er exemple, pour montrer un résultat concret tout de suite
-loadPreset("01");
+// démarrage : lien profond ?exemple=<id> (preset ou vitrine), sinon le 1er
+// exemple — pour montrer un résultat concret tout de suite.
+(function(){
+  const demande = new URLSearchParams(location.search).get("exemple");
+  if(demande && PRESETS.some(p=>p.id===demande)){ loadPreset(demande); return; }
+  if(demande && SHOWCASES.some(s=>s.id===demande)){ loadShowcase(demande); return; }
+  loadPreset("01");
+})();
 </script>
 </body>
 </html>
