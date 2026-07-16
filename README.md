@@ -428,6 +428,33 @@ If, instead, your agent is a **component inside a real application** — where y
 know exactly what it can touch, log exactly what it did, and debug it by reading code —
 that's the niche this library is built for.
 
+## Security posture: sobriety is a feature
+
+If your agent touches sensitive data (PII, credentials, internal databases), the size of
+your stack *is* part of your attack surface. autoagent's position, in verifiable facts:
+
+- **Supply chain you can actually audit.** `pip install autoagent-core` installs the
+  standard library plus `jsonschema` — that's the entire tree. Mainstream agent
+  frameworks pull in dozens to hundreds of transitive packages; every one of them is a
+  potential compromise, typosquat, or breaking release you now own. Here, one afternoon
+  of reading covers 100 % of the code that runs.
+- **Nothing phones home.** No telemetry, no SaaS backend, no account. Providers are
+  called over raw HTTPS to the endpoints *you* configure — the only network traffic is
+  the traffic you asked for. Observability is a local JSONL file and/or *your* OTel
+  collector.
+- **Secrets are scrubbed at the source.** Every trace preview and recall snippet passes
+  a redaction filter (Bearer tokens, API keys) before it can reach a log, a file, or an
+  external backend.
+- **Untrusted code never runs free.** Agent-written tools go through AST screening, then
+  a Docker sandbox (no network, read-only FS, non-root); promotion to native execution
+  requires a human-approved hash manifest, and one changed byte revokes it.
+- **The human stays in the loop by construction.** `tool_policy` is fail-closed: a
+  crashing policy denies. Sensitive calls pause *before* any side effect and resume only
+  after approval.
+
+None of this makes an agent "secure" by itself — but it means the boundaries are code
+you can unit-test and audit, not behaviors you hope for.
+
 ## Design notes
 
 - **One loop to understand**: send history + tool specs → LLM answers text (done) or tool
