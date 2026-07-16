@@ -330,6 +330,14 @@ agent.register_recall_tool()      # the model gets a `recall(query)` tool
 If the summarizer call ever fails, compaction is skipped for that turn — context grows
 temporarily instead of being silently truncated. Failure modes are boring on purpose.
 
+Measured, not promised: the repo ships a behavioral memory eval
+([`evals/`](evals/)) — 12 multi-session scenarios (facts established in past
+calls, then contradicted or made stale, then queried in a *fresh* session).
+**`FactMemory` + recall: 12/12 · no memory: 0/12 · rolling summary: 0/12**
+(a rolling summary is *conversation* memory by design — it doesn't survive a new
+session; `FactMemory` is *identity* memory). Run it yourself:
+`python evals/eval_memoire.py`.
+
 ### Route images to a vision model, keep text on the cheap one
 
 ```python

@@ -1,0 +1,95 @@
+{
+  "sans_memoire": {
+    "scores": {
+      "retention-simple": false,
+      "contradiction-horaire": false,
+      "fait-caduc": false,
+      "valeur-numerique": false,
+      "multi-faits": false,
+      "contradiction-adresse": false,
+      "engagement-date": false,
+      "distracteurs": false,
+      "double-contradiction": false,
+      "preference-negative": false,
+      "profession-employeur": false,
+      "correction-orthographe": false
+    },
+    "reponses": {
+      "retention-simple": "Je ne sais pas.",
+      "contradiction-horaire": "",
+      "fait-caduc": "Le foyer possède un Volkswagen Tiguan blanc (acheté en 2021) et une moto Yamaha MT-07 grise (achetée en 2022).",
+      "valeur-numerique": "Le montant du loyer mensuel de cette personne est de 750 euros.",
+      "multi-faits": "M. Ferreira se rend au travail en bus.",
+      "contradiction-adresse": "Je ne peux pas vous donner l'adresse actuelle sans savoir de quelle personne il s'agit.",
+      "engagement-date": "**appel de l'outil** : `recall`({\"query\": \"date d'absence de la personne\"})",
+      "distracteurs": "Je ne sais pas.",
+      "double-contradiction": "Quel numéro de téléphone souhaitez-vous rappeler ?",
+      "preference-negative": "J'utilise l'outil recall pour vérifier si nous avons un numéro de téléphone pour cette personne.\n**Outil Recall:** `recall(query=\"numéro de téléphone pour cette personne\")`\nJe ne sais pas à quelle per",
+      "profession-employeur": "Je ne sais pas.",
+      "correction-orthographe": "Je ne sais pas, vous n'avez pas précisé de quelle personne il s'agit."
+    },
+    "accuracy": 0.0
+  },
+  "summarizing": {
+    "scores": {
+      "retention-simple": false,
+      "contradiction-horaire": false,
+      "fait-caduc": false,
+      "valeur-numerique": false,
+      "multi-faits": false,
+      "contradiction-adresse": false,
+      "engagement-date": false,
+      "distracteurs": false,
+      "double-contradiction": false,
+      "preference-negative": false,
+      "profession-employeur": false,
+      "correction-orthographe": false
+    },
+    "reponses": {
+      "retention-simple": "Je ne sais pas.",
+      "contradiction-horaire": "Je ne sais pas.",
+      "fait-caduc": "Je ne sais pas quels véhicules possède ce foyer aujourd'hui.",
+      "valeur-numerique": "Je ne sais pas.",
+      "multi-faits": "Je ne sais pas.",
+      "contradiction-adresse": "Je ne sais pas.",
+      "engagement-date": "Je ne sais pas quand cette personne sera absente.",
+      "distracteurs": "Je ne sais pas.",
+      "double-contradiction": "Je ne sais pas.",
+      "preference-negative": "Je ne sais pas.",
+      "profession-employeur": "Je ne sais pas où travaille cette personne ni à quel rythme.",
+      "correction-orthographe": "Je ne sais pas."
+    },
+    "accuracy": 0.0
+  },
+  "fact_memory": {
+    "scores": {
+      "retention-simple": true,
+      "contradiction-horaire": true,
+      "fait-caduc": true,
+      "valeur-numerique": true,
+      "multi-faits": true,
+      "contradiction-adresse": true,
+      "engagement-date": true,
+      "distracteurs": true,
+      "double-contradiction": true,
+      "preference-negative": true,
+      "profession-employeur": true,
+      "correction-orthographe": true
+    },
+    "reponses": {
+      "retention-simple": "Le code d'accès immeuble est le 4271B.",
+      "contradiction-horaire": "Il faut rappeler cette personne le matin avant 9h.",
+      "fait-caduc": "L'utilisateur a deux voitures.",
+      "valeur-numerique": "Le montant de votre loyer mensuel est de 743 euros.",
+      "multi-faits": "M. Ferreira se rend au travail en métro, ligne A puis B.",
+      "contradiction-adresse": "L'utilisateur habite 3 avenue Berthelot à Lyon.",
+      "engagement-date": "Cette personne sera absente tout le mois d'août.",
+      "distracteurs": "L'utilisateur covoiture le jeudi.",
+      "double-contradiction": "Le numéro de téléphone fixe est le 04 72 11 22 33.",
+      "preference-negative": "Non, il est préférable de contacter cette personne uniquement par appels téléphoniques, pas par SMS.",
+      "profession-employeur": "Vous travaillez comme infirmière de nuit à l'hôpital Édouard-Herriot.",
+      "correction-orthographe": "Le nom de famille de cette personne est Kowalski."
+    },
+    "accuracy": 100.0
+  }
+}
