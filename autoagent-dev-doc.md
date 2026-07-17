@@ -1123,6 +1123,26 @@ class Provider(Protocol):
 
 Une **seule méthode** : `complete`. Pas d'async, pas de streaming, pas de batch.
 
+### 8.1 bis Endpoints OpenAI-compatibles (Kimi, Groq, Ollama, vLLM…)
+
+Tout service qui parle le dialecte `chat/completions` d'OpenAI se branche
+SANS nouveau code — `provider="openai"` + `base_url` :
+
+```python
+agent = Agent.from_model_config(ModelConfig(
+    provider="openai",
+    model="kimi-k2-turbo-preview",           # le nom exact de ta console
+    base_url="https://api.moonshot.ai/v1",   # Kimi / Moonshot AI
+    api_key_env="KIMI_API_KEY",
+))
+# Ollama local : base_url="http://localhost:11434/v1", api_key="ollama"
+# Groq        : base_url="https://api.groq.com/openai/v1" (GROQ_API_KEY est auto)
+```
+
+Le tool-calling, le streaming SSE et `response_format` passent par le même
+dialecte. Les démos détectent `KIMI_API_KEY` automatiquement (`_common.py`,
+modèle écrasable via `KIMI_MODEL`).
+
 ### 8.2 LLMRequest / LLMResponse
 
 ```python

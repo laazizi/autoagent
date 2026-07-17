@@ -352,7 +352,7 @@ const DEFS = {
       {k:"steps", l:"max_steps", kind:"number", def:"8", w:"third"},
       {k:"budget",l:"token_budget", kind:"number", def:"", w:"third", hint:"vide = illimité"},
       {k:"parallel", l:"parallel_tool_calls (outils I/O en parallèle)", kind:"check", def:false},
-      {k:"baseurl", l:"base_url (provider avancé)", kind:"text", def:"", w:"half", hint:"vide = défaut"},
+      {k:"baseurl", l:"base_url (provider avancé)", kind:"text", def:"", w:"half", hint:"ex. api.moonshot.ai/v1 (Kimi), localhost:11434/v1 (Ollama)"},
       {k:"keyenv",  l:"api_key_env (nom de var d'env)", kind:"text", def:"", w:"half", hint:"vide = auto"},
       {k:"routing", l:"routing multi-modèle (image → vision, sinon défaut)", kind:"check", def:false},
       {k:"vmodel",  l:"modèle vision (si routing)", kind:"text", def:"gemini-2.5-flash", w:"half"},

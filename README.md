@@ -62,8 +62,10 @@ someone else's abstraction stack instead of your own code.
    promoted to native only through a **hash-based manifest a human approves**.
 3. **Zero dependencies for the core.** Python ≥ 3.10, `urllib`, `dataclasses`. No SDKs —
    each provider adapter speaks the wire format directly (~100 lines each).
-4. **Multi-provider without ceremony.** OpenAI, Anthropic, DeepSeek, Gemini. A provider is
-   one method: `complete(LLMRequest) -> LLMResponse`. Write your own in 50 lines.
+4. **Multi-provider without ceremony.** OpenAI, Anthropic, DeepSeek, Gemini — plus any
+   OpenAI-compatible endpoint (Kimi/Moonshot, Groq, Ollama, vLLM…) via
+   `ModelConfig(base_url=…)`. A provider is one method:
+   `complete(LLMRequest) -> LLMResponse`. Write your own in 50 lines.
 5. **Synchronous and deterministic — with real streaming.** The loop is sync by design —
    *you* choose your concurrency model (`threading`, `asyncio.to_thread`, a queue). No
    colored functions imposed on your codebase. Streaming is a plain **sync iterator**:

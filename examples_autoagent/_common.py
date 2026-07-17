@@ -30,12 +30,21 @@ DEFAULTS = {
     "deepseek": "deepseek-chat",
     "openai": "gpt-4o-mini",
     "anthropic": "claude-sonnet-4-5",
+    "kimi": "kimi-k2-turbo-preview",   # écrasable : --model ou KIMI_MODEL dans .env
 }
 KEYS = {
     "gemini": "GEMINI_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
+    "kimi": "KIMI_API_KEY",
+}
+
+# Endpoints OpenAI-compatibles : le « provider » wire est openai, seul le
+# base_url change. Même recette pour Groq, Ollama (http://localhost:11434/v1),
+# vLLM, etc. — ajoute une entrée ici et une clé dans .env, c'est tout.
+OPENAI_COMPATIBLES = {
+    "kimi": ("https://api.moonshot.ai/v1", "KIMI_API_KEY", "KIMI_MODEL"),
 }
 
 
@@ -63,6 +72,14 @@ def make_provider(argv: list[str] | None = None, timeout: float = 180.0):
     name = args.provider or next((n for n, k in KEYS.items() if os.getenv(k)), None)
     if name is None:
         sys.exit("Aucune clé LLM dans .env (GEMINI_API_KEY / DEEPSEEK_API_KEY / ...).")
+    if name in OPENAI_COMPATIBLES:
+        base_url, key_env, model_env = OPENAI_COMPATIBLES[name]
+        model = args.model or os.getenv(model_env) or DEFAULTS[name]
+        print(f"[provider: {name} (openai-compatible) / {model}]\n")
+        return create_provider(ModelConfig(
+            provider="openai", model=model, base_url=base_url,
+            api_key_env=key_env, timeout=timeout,
+        ))
     model = args.model or DEFAULTS[name]
     print(f"[provider: {name} / {model}]\n")
     return create_provider(ModelConfig(provider=name, model=model, timeout=timeout))
