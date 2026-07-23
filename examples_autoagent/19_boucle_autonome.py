@@ -127,10 +127,24 @@ def main() -> None:
         return zone.write_file(f"semaine_{semaine}.md", contenu, reason="rapport hebdo")
 
     print(f"═══ Battement de boucle : semaine {semaine} ═══")
-    resultat = agent.run(
-        f"Produis le rapport de la semaine {semaine}. Consulte d'abord recall "
-        "pour d'éventuelles leçons des semaines passées."
-    )
+    try:
+        resultat = agent.run(
+            f"Produis le rapport de la semaine {semaine}. Consulte d'abord recall "
+            "pour d'éventuelles leçons des semaines passées."
+        )
+    except Exception as exc:
+        # Budget épuisé sans converger : la boucle mémorise AUSSI ses échecs —
+        # la leçon guidera le prochain battement, et l'état reste cohérent.
+        lecons.remember(
+            f"semaine {semaine} : ÉCHEC ({type(exc).__name__}) — critères non "
+            "atteints dans le budget ; détailler davantage le plan avant d'écrire",
+            subject="rapport-hebdo",
+        )
+        etat["historique"].append({"semaine": semaine, "echec": type(exc).__name__})
+        ETAT.write_text(json.dumps(etat, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"❌ battement en échec ({type(exc).__name__}) — leçon mémorisée, "
+              "état sauvegardé ; le cron retentera au prochain battement")
+        return
 
     # ── clôture du battement : leçon + état pour le prochain ──
     if corrections["n"]:
