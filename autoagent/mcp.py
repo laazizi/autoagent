@@ -248,6 +248,7 @@ class MCPClient:
         include: Iterable[str] | None = None,
         exclude: Iterable[str] | None = None,
         prefix: str = "",
+        untrusted: bool = False,
     ) -> list[Callable[..., Any]]:
         """Build one autoagent-compatible handler per server tool.
 
@@ -268,7 +269,7 @@ class MCPClient:
                 continue
             if server_name in exclude_set:
                 continue
-            handlers.append(self._make_handler(tool_def, prefix))
+            handlers.append(self._make_handler(tool_def, prefix, untrusted))
         return handlers
 
     def mount(
@@ -278,21 +279,32 @@ class MCPClient:
         include: Iterable[str] | None = None,
         exclude: Iterable[str] | None = None,
         prefix: str = "",
+        untrusted: bool = False,
     ) -> list[str]:
         """Register every (filtered) server tool on ``agent``.
 
         Returns the registered tool names. ``agent`` is anything with an
         ``add_tool(handler)`` — an ``Agent`` — or an ``add_function``
         (a bare ``ToolRegistry``).
+
+        ``untrusted=True`` marks EVERY mounted tool as returning external,
+        potentially injection-carrying content (0.15.0): outputs get framed
+        as data-not-instructions and the run becomes *tainted* — a signal
+        your ``tool_policy`` can gate on. Recommended for any third-party
+        server whose content you don't control (web fetchers, mail readers).
         """
         add = getattr(agent, "add_tool", None) or getattr(agent, "add_function")
         names: list[str] = []
-        for handler in self.tools(include=include, exclude=exclude, prefix=prefix):
+        for handler in self.tools(
+            include=include, exclude=exclude, prefix=prefix, untrusted=untrusted
+        ):
             add(handler)
             names.append(handler.__autoagent_tool_spec__.name)  # type: ignore[attr-defined]
         return names
 
-    def _make_handler(self, tool_def: JsonDict, prefix: str) -> Callable[..., Any]:
+    def _make_handler(
+        self, tool_def: JsonDict, prefix: str, untrusted: bool = False
+    ) -> Callable[..., Any]:
         server_name = str(tool_def["name"])
         exposed_name = f"{prefix}{server_name}"
         description = tool_def.get("description") or f"MCP tool {server_name}"
@@ -308,6 +320,7 @@ class MCPClient:
             name=exposed_name,
             description=description,
             input_schema=input_schema,
+            untrusted=untrusted,
         )
         return handler
 

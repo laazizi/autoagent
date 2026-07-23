@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autoagent-core"
-version = "0.14.0"
+version = "0.15.0"
 description = "LLM agent library with tool use, dynamic tool generation, and software evolution capabilities"
 readme = "README.md"
 license = { text = "MIT" }

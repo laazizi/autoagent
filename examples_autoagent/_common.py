@@ -30,7 +30,7 @@ DEFAULTS = {
     "deepseek": "deepseek-chat",
     "openai": "gpt-4o-mini",
     "anthropic": "claude-sonnet-4-5",
-    "kimi": "kimi-k2-turbo-preview",   # écrasable : --model ou KIMI_MODEL dans .env
+    "kimi": "kimi-k3",   # écrasable : --model ou KIMI_MODEL dans .env
 }
 KEYS = {
     "gemini": "GEMINI_API_KEY",

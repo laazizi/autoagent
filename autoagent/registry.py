@@ -168,6 +168,7 @@ class ToolRegistry:
         description: str | None = None,
         input_schema: JsonDict | None = None,
         permissions: list[str] | None = None,
+        untrusted: bool = False,
     ):
         def decorator(handler: ToolHandler) -> ToolHandler:
             spec = ToolSpec(
@@ -175,6 +176,7 @@ class ToolRegistry:
                 description=description or inspect.getdoc(handler) or handler.__name__,
                 input_schema=input_schema or schema_from_callable(handler),
                 permissions=permissions or [],
+                untrusted=untrusted,
             )
             self.add(spec, handler)
             return handler
@@ -228,6 +230,7 @@ def tool(
     description: str | None = None,
     input_schema: JsonDict | None = None,
     permissions: list[str] | None = None,
+    untrusted: bool = False,
 ):
     def decorator(handler: ToolHandler) -> ToolHandler:
         spec = ToolSpec(
@@ -235,6 +238,7 @@ def tool(
             description=description or inspect.getdoc(handler) or handler.__name__,
             input_schema=input_schema or schema_from_callable(handler),
             permissions=permissions or [],
+            untrusted=untrusted,
         )
         handler.__autoagent_tool_spec__ = spec  # type: ignore[attr-defined]
         return handler

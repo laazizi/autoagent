@@ -94,6 +94,7 @@ someone else's abstraction stack instead of your own code.
 | **`OTelTraceExporter`** | the trace tree becomes real OpenTelemetry spans (`agent.run → llm → tool.<name>`) for Jaeger / Tempo / Langfuse / Phoenix; `opentelemetry-api` is an *optional* extra, the core stays dependency-free |
 | **`RunState` + `resume`** | durable runs: a JSON checkpoint after every completed step; resume after a crash, a restart, or past a raised `max_steps` / `token_budget` (`exc.state` is ready to resume) |
 | **`tool_policy`** | one hook for allow / deny / **human approval** / quota-audit, checked for every tool call *before* any side effect; a crashing policy denies (fail-closed); `ApprovalRequired` pauses the run with a resumable snapshot |
+| **Taint tracking** | mark a tool's output untrusted (`@agent.tool(untrusted=True)`, `mcp.mount(untrusted=True)`) → its result is framed as data-not-instructions and the run is *tainted*; `tool_policy` sees `ctx.tainted` and can gate sensitive tools acting on externally-sourced content — **indirect prompt-injection defense as testable code**, not a probabilistic filter |
 | **`EvolutionRuntime`** | let an agent modify a live project: read state, propose a module, run validation, roll back on failure |
 
 ## Quickstart
@@ -461,6 +462,12 @@ your stack *is* part of your attack surface. autoagent's position, in verifiable
 - **The human stays in the loop by construction.** `tool_policy` is fail-closed: a
   crashing policy denies. Sensitive calls pause *before* any side effect and resume only
   after approval.
+- **Indirect prompt injection is bounded by code.** Tools that read external content
+  (web, email, third-party MCP servers) are marked `untrusted`; their output is framed as
+  data-not-instructions and taints the run. Your policy can then refuse to let a
+  *tainted* run drive a sensitive tool — so a poisoned web page cannot make the agent
+  exfiltrate, even if the model falls for the trick. Demonstrated deterministically in
+  `examples_autoagent/20_injection_dejouee.py`.
 
 None of this makes an agent "secure" by itself — but it means the boundaries are code
 you can unit-test and audit, not behaviors you hope for.

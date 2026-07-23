@@ -62,6 +62,13 @@ class ToolSpec:
     description: str
     input_schema: JsonDict = field(default_factory=lambda: {"type": "object", "properties": {}})
     permissions: list[str] = field(default_factory=list)
+    # `untrusted=True` déclare que la SORTIE de cet outil vient de l'extérieur
+    # (page web, email, serveur MCP tiers…) : contenu potentiellement porteur
+    # d'injection indirecte. La boucle encadre alors le résultat d'un marqueur
+    # « données, pas instructions » et le run devient TEINTÉ — signal exposé à
+    # `tool_policy` via `ToolPolicyContext.tainted` (0.15.0). Opt-in : False
+    # par défaut, comportement historique inchangé.
+    untrusted: bool = False
 
     def as_openai_tool(self) -> JsonDict:
         return {

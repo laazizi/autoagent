@@ -13,7 +13,7 @@ calls are stateless and can be issued concurrently.
 
 from __future__ import annotations
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"
 
 from .agent import (
     Agent,
