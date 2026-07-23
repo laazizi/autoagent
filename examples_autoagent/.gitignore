@@ -8,3 +8,6 @@ faits_martin.json
 faits_appelant.json
 corpus_cache/
 faits_martin.json.vectors.json
+boucle_etat.json
+boucle_lecons.json
+boucle_rapports/
