@@ -13,7 +13,7 @@ calls are stateless and can be issued concurrently.
 
 from __future__ import annotations
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 
 from .agent import (
     Agent,
@@ -34,8 +34,17 @@ from .errors import (
     MaxStepsExceeded,
     TokenBudgetExceeded,
     ProviderError,
+    ReplayMismatch,
     ToolError,
     ToolValidationError,
+)
+from .replay import (
+    RecordSession,
+    RecordingProvider,
+    RecordingRegistry,
+    ReplayProvider,
+    ReplayRegistry,
+    ReplaySession,
 )
 from .evolution import EVOLUTION_CAPABILITIES, EvolutionRuntime, enable_software_evolution
 from .logging import get_logger
@@ -114,6 +123,13 @@ __all__ = [
     "PostTurnHook",
     "ProjectWorkspace",
     "ProviderError",
+    "RecordSession",
+    "RecordingProvider",
+    "RecordingRegistry",
+    "ReplayMismatch",
+    "ReplayProvider",
+    "ReplayRegistry",
+    "ReplaySession",
     "RoutingProvider",
     "Step",
     "StreamChunk",

@@ -1,4 +1,4 @@
-# examples_autoagent — le potentiel d'autoagent en 20 démos
+# examples_autoagent — le potentiel d'autoagent en 21 démos
 
 Quinze scripts courts, **exécutables tels quels**, montrant chacun UNE facette
 de la lib (la n°13 les combine). Rangés du plus simple au plus avancé.
@@ -38,6 +38,7 @@ présente. Pour forcer : `--provider gemini --model gemini-2.5-flash`.
 | 18 | `18_corpus_url.py` | **Gros corpus depuis une URL** (~1M tokens) : l'agent TÉLÉCHARGE, le host INDEXE, l'agent navigue par outils (`chercher`/`lire_passage`) — répond en consommant ~1 % du corpus au lieu de tout injecter. Recherche par le SENS (embeddings + cache) si GEMINI_API_KEY, sinon lexical | oui |
 | 19 | `19_boucle_autonome.py` | **Boucle autonome fermée** (« Loops ») : plan → build → VÉRIFICATEUR en code → auto-correction → leçons en `FactMemory`, état persisté entre les battements, relançable par cron — le pattern complet sans framework | oui |
 | 20 | `20_injection_dejouee.py` | **Injection indirecte déjouée** : un outil `untrusted=True` lit une page piégée → le run est *teinté* → `tool_policy` met en PAUSE tout outil sensible avant effet de bord. La barrière est du code, prouvée déterministe | oui |
+| 21 | `21_record_replay.py` | **Record / replay déterministe** : un vrai run est gelé dans un fixture JSONL puis rejoué HORS-LIGNE (zéro réseau, zéro effet de bord, sortie identique) ; une divergence lève `ReplayMismatch`. N'importe quel run → test CI gratuit | oui |
 
 ## Par où commencer
 

@@ -5,6 +5,7 @@ __all__ = [
     "MCPError",
     "MaxStepsExceeded",
     "ProviderError",
+    "ReplayMismatch",
     "TokenBudgetExceeded",
     "ToolError",
     "ToolValidationError",
@@ -62,6 +63,18 @@ class ApprovalRequired(AutoAgentError):
             (idempotent), a rejected one should get a ``str`` verdict so
             the model sees the refusal and re-plans.
         calls: The turn's pending ``ToolCall`` list (nothing executed).
+    """
+
+
+class ReplayMismatch(AutoAgentError):
+    """Raised during replay when the run DIVERGES from the recorded fixture
+    (0.16.0).
+
+    Either the request signature at position N no longer matches the recorded
+    one (different tool requested, different message shape — with ``strict``),
+    or the run asks for more calls than the fixture holds. This divergence is
+    a FEATURE: it tells you the agent's behaviour changed since the recording
+    (a prompt edit, a code change), and points at the exact step.
     """
 
 

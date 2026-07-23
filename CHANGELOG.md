@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-16
+
+### Added
+- **Record / replay — reproducibility as plumbing.** `RecordSession` wraps a
+  real provider (and, optionally, the registry) and freezes a whole run into a
+  JSONL fixture; `ReplaySession` replays it. Two modes: **full offline**
+  (`rep.provider()` + `rep.registry()` — zero network, zero tool side effects,
+  deterministic — turns any real run into a free CI regression test with no API
+  key) and **LLM-only** (`rep.provider()` alone — tools re-execute, for
+  debugging). Replay exercises YOUR code (loop, policy, memory, parsing), not
+  the LLM/tools. Divergence (a prompt/code change) raises `ReplayMismatch`
+  pointing at the exact step. LLM responses matched by position, tool results
+  by `call_id` (robust to `parallel_tool_calls`). Secrets scrubbed from the
+  fixture by default. Zero core change — pure wrappers over `provider=` /
+  `registry=`. New `LLMResponse.to_dict/from_dict`, `ToolResult.to_dict/from_dict`.
+
+### Fixed
+- **`schema_from_callable` now resolves PEP 563 stringized annotations**
+  (`from __future__ import annotations`). Previously `n: int` arrived as the
+  string `"int"` and silently degraded to `{"type": "string"}`, breaking
+  validation for any int/float/bool/Literal parameter — a real bug surfaced by
+  the record/replay work. Now resolved via `get_type_hints` (graceful fallback).
+
 ## [0.15.0] - 2026-07-16
 
 ### Added

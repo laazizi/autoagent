@@ -348,6 +348,43 @@ class LLMResponse:
     reasoning_content: str | None = None
     usage: TokenUsage | None = None
 
+    def to_dict(self) -> JsonDict:
+        """Sérialisation JSON-safe (0.16.0) pour le record/replay.
+
+        ``raw`` (réponse provider brute, debug, non fiablement sérialisable)
+        est VOLONTAIREMENT omis — il n'est pas nécessaire pour rejouer un run.
+        Round-trip sans perte via ``from_dict`` sur les champs utiles.
+        """
+        out: JsonDict = {"content": self.content}
+        if self.tool_calls:
+            out["tool_calls"] = [tc.to_dict() for tc in self.tool_calls]
+        if self.model is not None:
+            out["model"] = self.model
+        if self.reasoning_content is not None:
+            out["reasoning_content"] = self.reasoning_content
+        if self.usage is not None:
+            out["usage"] = {
+                "input_tokens": self.usage.input_tokens,
+                "output_tokens": self.usage.output_tokens,
+                "total_tokens": self.usage.total_tokens,
+            }
+        return out
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> "LLMResponse":
+        usage = data.get("usage")
+        return cls(
+            content=data.get("content", ""),
+            tool_calls=[ToolCall.from_dict(tc) for tc in data.get("tool_calls") or []],
+            model=data.get("model"),
+            reasoning_content=data.get("reasoning_content"),
+            usage=TokenUsage(
+                input_tokens=usage.get("input_tokens"),
+                output_tokens=usage.get("output_tokens"),
+                total_tokens=usage.get("total_tokens"),
+            ) if usage else None,
+        )
+
 
 @dataclass
 class StreamChunk:

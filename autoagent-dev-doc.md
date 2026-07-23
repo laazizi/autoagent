@@ -3,7 +3,7 @@
 > Référence technique complète pour intégrer, étendre et tester `autoagent` dans un projet Python.
 > **Public visé** : devs qui vont écrire des tools, brancher l'agent sur leur app, ou éventuellement contribuer à la lib.
 
-**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-07-16 · **Couvre autoagent** : 0.15.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
+**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-07-16 · **Couvre autoagent** : 0.16.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
 
 ---
 
@@ -41,6 +41,7 @@
 20. [`tool_policy` — politique d'exécution des outils & approval gate](#20-tool_policy--politique-dexécution-des-outils--approval-gate) *(0.11.0)*
 21. [`FactMemory` — mémoire factuelle tenue à jour](#21-factmemory--mémoire-factuelle-tenue-à-jour) *(0.12.0)*
 22. [Taint tracking — défense contre l'injection indirecte](#22-taint-tracking--défense-contre-linjection-indirecte) *(0.15.0)*
+23. [Record / replay — reproductibilité des runs](#23-record--replay--reproductibilité-des-runs) *(0.16.0)*
 
 ---
 
@@ -2412,6 +2413,7 @@ parsé — le modèle ne peut pas répondre mal formé.
 | 0.13.0 | `FactMemory` v2 : `background=True` (consolidation sleep-time) + `embed_fn=` (recall sémantique) (§21) |
 | 0.14.0 | consolidation scalable (`max_consolidation_facts`, §21) ; fixes Windows trouvés par la CI (env sandbox non vide, `docker_available` exige un démon linux) |
 | 0.15.0 | taint tracking : `untrusted=True` sur les tools/MCP + `ToolPolicyContext.tainted` (défense injection indirecte, §22) |
+| 0.16.0 | record/replay : `RecordSession`/`ReplaySession` (§23) + `ReplayMismatch` ; fix PEP 563 dans `schema_from_callable` ; `to_dict`/`from_dict` sur `LLMResponse`/`ToolResult` |
 | — | `RoutingProvider` (providers/routing.py) |
 
 ## 17. `MCPClient` — outils MCP branchés comme des tools locaux
@@ -2687,6 +2689,52 @@ décider d'envoyer) est couvert car il s'étale sur deux tours.
 **Ce que ça ne fait PAS** : pas de provenance fine (quel argument vient de
 quelle source), pas de Q-LLM/P-LLM séparés. Ça borne ce que la manipulation
 peut DÉCLENCHER, pas ce que le LLM peut DIRE. Démo `20_injection_dejouee.py`.
+
+## 23. Record / replay — reproductibilité des runs
+
+> `autoagent/replay.py`, 0.16.0. Le non-déterminisme (2 à 4 trajectoires sur
+> 10 runs même à T=0) rend les bugs de prod irreproductibles. On gèle un vrai
+> run dans un fixture JSONL, puis on le REJOUE à l'identique. Pure PLOMBERIE
+> sur `provider=`/`registry=` — zéro modif du cœur.
+
+```python
+from autoagent import Agent, RecordSession, ReplaySession
+
+# enregistrer un vrai run
+with RecordSession("run.jsonl") as rec:
+    agent = Agent(rec.provider(vrai_provider), registry=rec.registry())
+    for t in outils: agent.add_tool(t)
+    agent.run("…")
+
+# rejouer, hors-ligne
+with ReplaySession("run.jsonl") as rep:
+    agent = Agent(rep.provider(), registry=rep.registry())
+    result = agent.run("…")           # trajectoire identique, 0 réseau, 0 outil
+```
+
+**Deux modes** (le seul réglage = fournir ou non le registre rejoué) :
+
+| Mode | Construction | Métier |
+|---|---|---|
+| **Total (hors-ligne)** | `rep.provider()` + `registry=rep.registry()` | CI / non-régression : ni clé API ni exécution des vrais outils (emails, base de prod). Test gratuit et déterministe |
+| **LLM seul** | `rep.provider()` + registre RÉEL | debug / dev d'outils : le LLM redit la même chose, les outils tournent en vrai (breakpoint, inspection) |
+
+**Ce que le replay teste** : NI le LLM NI les outils (gelés), mais TON code —
+boucle, `tool_policy`, `post_turn_hook`, mémoire, bornement, parsing, taint.
+C'est la couche où vivent tes bugs et où arrivent tes changements.
+
+**Mécanique** :
+* Réponses LLM appariées par POSITION (les appels provider sont séquentiels) ;
+  résultats d'outils par `call_id` (robuste aux `parallel_tool_calls`).
+* **Divergence** = feature : prompt/code modifié → la trajectoire dévie →
+  `ReplayMismatch` pointe l'étape exacte (« appel LLM #3 : outils enregistrés
+  [a], obtenus [] »). `strict=False` pour un positionnel best-effort.
+* **Secrets scrubés** du fixture par défaut (`redact=True`) — sûr à committer.
+* Fixture JSONL lisible ; `LLMResponse`/`ToolResult` ont `to_dict`/`from_dict`.
+
+**Ce que ça ne fait PAS** : rendre le LLM déterministe (impossible) — ça rend
+le REPLAY déterministe, ce qu'il faut pour déboguer et tester. Démo
+`21_record_replay.py`.
 
 ---
 

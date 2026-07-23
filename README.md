@@ -95,6 +95,7 @@ someone else's abstraction stack instead of your own code.
 | **`RunState` + `resume`** | durable runs: a JSON checkpoint after every completed step; resume after a crash, a restart, or past a raised `max_steps` / `token_budget` (`exc.state` is ready to resume) |
 | **`tool_policy`** | one hook for allow / deny / **human approval** / quota-audit, checked for every tool call *before* any side effect; a crashing policy denies (fail-closed); `ApprovalRequired` pauses the run with a resumable snapshot |
 | **Taint tracking** | mark a tool's output untrusted (`@agent.tool(untrusted=True)`, `mcp.mount(untrusted=True)`) → its result is framed as data-not-instructions and the run is *tainted*; `tool_policy` sees `ctx.tainted` and can gate sensitive tools acting on externally-sourced content — **indirect prompt-injection defense as testable code**, not a probabilistic filter |
+| **Record / replay** | `RecordSession` freezes a real run into a JSONL fixture; `ReplaySession` replays it deterministically — full-offline (zero network, zero tool side effects: **any real run becomes a free CI regression test, no API key**) or LLM-only (tools re-run, for debugging). A behavior change raises `ReplayMismatch` at the exact step. Pure wrappers, zero core change |
 | **`EvolutionRuntime`** | let an agent modify a live project: read state, propose a module, run validation, roll back on failure |
 
 ## Quickstart

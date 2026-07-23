@@ -35,6 +35,24 @@ class TestSchemaFromCallable:
         schema = schema_from_callable(f)
         assert schema["required"] == ["a"]
 
+    def test_pep563_stringized_annotations(self) -> None:
+        # Sous `from __future__ import annotations`, les annotations arrivent
+        # comme des CHAÎNES ("int", "float"…). schema_from_callable doit les
+        # résoudre (get_type_hints), sinon tout retombe en {"type":"string"}
+        # et la validation casse. Régression trouvée via le record/replay.
+        import textwrap
+
+        ns: dict = {}
+        exec(textwrap.dedent("""
+            from __future__ import annotations
+            def f(n: int, x: float, ok: bool, nom: str): ...
+        """), ns)
+        schema = schema_from_callable(ns["f"])
+        assert schema["properties"]["n"] == {"type": "integer"}
+        assert schema["properties"]["x"] == {"type": "number"}
+        assert schema["properties"]["ok"] == {"type": "boolean"}
+        assert schema["properties"]["nom"] == {"type": "string"}
+
     def test_context_param_excluded(self) -> None:
         def f(a: str, context: dict[str, Any] | None = None) -> str: ...
 

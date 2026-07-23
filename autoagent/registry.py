@@ -6,7 +6,7 @@ import json
 import threading
 import types
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Union, get_args, get_origin
+from typing import Any, Callable, Literal, Union, get_args, get_origin, get_type_hints
 
 import jsonschema
 from jsonschema import Draft202012Validator
@@ -39,6 +39,20 @@ class ToolResult:
             ensure_ascii=False,
             default=repr,
         )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Sérialisation JSON-safe (0.16.0) pour le record/replay.
+
+        ``result`` peut contenir des objets non-JSON : on repasse par le même
+        chemin tolérant que ``to_message_content`` (``default=repr``) puis on
+        recharge, pour garantir un round-trip sûr par ``from_dict``.
+        """
+        safe = json.loads(json.dumps(self.result, ensure_ascii=False, default=repr))
+        return {"ok": self.ok, "result": safe, "error": self.error}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ToolResult":
+        return cls(ok=data["ok"], result=data.get("result"), error=data.get("error"))
 
 
 @dataclass
@@ -250,6 +264,15 @@ def tool(
 
 def schema_from_callable(func: ToolHandler) -> JsonDict:
     signature = inspect.signature(func)
+    # PEP 563 : sous `from __future__ import annotations` (recommandé, courant),
+    # `n: int` arrive comme la CHAÎNE "int". `get_type_hints` la résout en vrai
+    # type — sinon `int`/`float`/`bool`/`Literal` retomberaient tous en
+    # {"type": "string"} et la validation casserait. Repli sur l'annotation
+    # brute si la résolution échoue (forward ref indisponible).
+    try:
+        hints = get_type_hints(func)
+    except Exception:  # noqa: BLE001 — annotation exotique / import manquant
+        hints = {}
     properties: dict[str, Any] = {}
     required: list[str] = []
 
@@ -263,7 +286,8 @@ def schema_from_callable(func: ToolHandler) -> JsonDict:
             inspect.Parameter.VAR_KEYWORD,
         ):
             continue
-        properties[name] = schema_from_annotation(parameter.annotation)
+        annotation = hints.get(name, parameter.annotation)
+        properties[name] = schema_from_annotation(annotation)
         if parameter.default is inspect.Parameter.empty:
             required.append(name)
 
