@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-07-24
+
+### Fixed (hardening — three weaknesses sharing one root: subsystems make LLM calls outside the agent's provider)
+- **Taint can no longer be "laundered" by memory compaction.** Taint is now a
+  monotonic run flag persisted in `RunState.tainted` (survives resume) AND a
+  sentinel that `SummarizingMemory`/`FactMemory` carry into their compacted
+  system message (survives folding). Previously, once an untrusted tool output
+  was summarized away, a later sensitive action saw `tainted=False` — a hole in
+  the 0.15 injection defense. `is_tainted` + the markers now live in `schema.py`.
+- **`token_budget` now counts memory's own LLM spend.** `SummarizingMemory` and
+  `FactMemory` call their own provider (summary/extraction); that spend was
+  invisible to the budget, so `token_budget` under-counted and `AgentResult.usage`
+  under-reported. Both now expose `last_usage`, folded into the run's accounting.
+- **Record/replay supports multiple providers via channels.** `RecordSession
+  .provider(wraps, channel=...)` / `ReplaySession.provider(channel=...)` — the
+  agent and the memory provider record/replay on independent positional streams,
+  so replaying an agent that also has summarizing/fact memory no longer collides.
+  (Backward compatible: default channel `"agent"`.)
+
 ## [0.16.0] - 2026-07-16
 
 ### Added

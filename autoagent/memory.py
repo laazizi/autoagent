@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable
 
 from .logging import get_logger
-from .schema import LLMRequest, Message
+from .schema import TAINT_SENTINEL, LLMRequest, Message, TokenUsage, is_tainted
 
 if TYPE_CHECKING:  # import de type uniquement — pas de cycle à l'exécution
     from .providers.base import LLMProvider
@@ -194,10 +194,13 @@ class SummarizingMemory:
         self._summary = ""
         self._covered = 0  # nb de messages non-système déjà repliés dans le résumé
         self._archive: list[Message] = []  # tout ce qui a été replié (pour recall)
+        self._tainted = False  # 0.17 : préserve la teinte à travers la compaction
+        self.last_usage: TokenUsage | None = None  # 0.17 : coût du dernier compact
 
     _MARKER = "[Résumé de la conversation antérieure]"
 
     def compact(self, messages: list[Message]) -> list[Message]:
+        self.last_usage = None  # coût mesuré de CE compact (lu par la boucle pour le budget)
         system_msgs = [m for m in messages if m.role == "system"]
         others = [m for m in messages if m.role != "system"]
         # Un hôte qui persiste l'historique COMPACTÉ (le pattern courant :
@@ -207,8 +210,14 @@ class SummarizingMemory:
         inband = [m for m in system_msgs if (m.content or "").startswith(self._MARKER)]
         if inband:
             system_msgs = [m for m in system_msgs if m not in inband]
+            if TAINT_SENTINEL in (inband[-1].content or ""):
+                self._tainted = True  # réabsorbe la teinte d'un historique persisté
             if not self._summary:
-                self._summary = inband[-1].content[len(self._MARKER) :].strip()
+                self._summary = inband[-1].content[len(self._MARKER) :].split(TAINT_SENTINEL)[0].strip()
+        # Teinte : dès qu'on replie du contenu externe non fiable, on la retient
+        # (elle survivra dans le message de résumé via la sentinelle).
+        if is_tainted(others):
+            self._tainted = True
         if self._covered > len(others):
             # L'historique a raccourci : soit l'hôte nous repasse un historique
             # DÉJÀ compacté (résumé in-band réabsorbé ci-dessus -> on le garde),
@@ -252,11 +261,14 @@ class SummarizingMemory:
         return [self._archive[i] for i in picked]
 
     def _assemble(self, system_msgs: list[Message], tail: list[Message]) -> list[Message]:
+        suffixe = f"\n{TAINT_SENTINEL}" if self._tainted else ""
         if not self._summary:
+            if self._tainted:  # teinte sans résumé encore : on la porte quand même
+                return [*system_msgs, Message(role="system", content=self._MARKER + suffixe), *tail]
             return [*system_msgs, *tail]
         summary_msg = Message(
             role="system",
-            content="[Résumé de la conversation antérieure]\n" + self._summary,
+            content=self._MARKER + "\n" + self._summary + suffixe,
         )
         return [*system_msgs, summary_msg, *tail]
 
@@ -281,6 +293,7 @@ class SummarizingMemory:
                 tool_choice="none",
             )
         )
+        self.last_usage = response.usage   # coût compté par la boucle (token_budget)
         return (response.content or "").strip() or self._summary
 
 
@@ -393,20 +406,30 @@ class FactMemory:
         self._lock = threading.Lock()  # garde _facts/_next_id (worker + hôte)
         self._job: dict[str, Any] | None = None  # extraction en cours (mode background)
         self._vectors: dict[int, list[float]] = {}  # id de fait -> embedding
+        self._tainted = False  # 0.17 : préserve la teinte à travers la compaction
+        self.last_usage: TokenUsage | None = None  # 0.17 : coût de la dernière extraction
         if self.path is not None and self.path.exists():
             self._load()
 
     # ── protocole Memory ─────────────────────────────────────────────────
 
     def compact(self, messages: list[Message]) -> list[Message]:
+        self.last_usage = None  # coût de CE compact (sync) ; en background, renseigné plus tard
         system_msgs = [m for m in messages if m.role == "system"]
         others = [m for m in messages if m.role != "system"]
         # Réabsorption : l'hôte qui persiste l'historique compacté nous
         # repasse notre message de faits in-band — on le retire (il sera
         # ré-injecté frais), la base de faits vit ailleurs (self/path).
+        if any((m.content or "").startswith(self._MARKER) and TAINT_SENTINEL in (m.content or "")
+               for m in system_msgs):
+            self._tainted = True  # réabsorbe la teinte d'un historique persisté
         system_msgs = [
             m for m in system_msgs if not (m.content or "").startswith(self._MARKER)
         ]
+        # Teinte : dès qu'on voit du contenu externe non fiable, on la retient
+        # (portée ensuite par le message [Faits mémorisés] via la sentinelle).
+        if is_tainted(others):
+            self._tainted = True
         if self._covered > len(others) or (
             self._covered and _prefix_fingerprint(others[: self._covered]) != self._covered_fp
         ):
@@ -637,6 +660,7 @@ class FactMemory:
                 response_format={"type": "json_object"},
             )
         )
+        self.last_usage = response.usage   # coût compté par la boucle (token_budget)
         with self._lock:
             self._apply_operations(_parse_operations(response.content or ""))
             self._save()
@@ -707,7 +731,7 @@ class FactMemory:
     def _assemble(self, system_msgs: list[Message], tail: list[Message]) -> list[Message]:
         with self._lock:
             facts_now = [dict(f) for f in self._facts]
-        if not facts_now:
+        if not facts_now and not self._tainted:
             return [*system_msgs, *tail]
         # Les plus récemment mis à jour d'abord, bornés, ré-ordonnés par id
         # pour un rendu stable.
@@ -717,6 +741,8 @@ class FactMemory:
         for fact in chosen:
             subject = f" ({fact['subject']})" if fact.get("subject") else ""
             lines.append(f"- {fact['fact']}{subject}")
+        if self._tainted:  # porte la teinte pour qu'elle survive à la persistance
+            lines.append(TAINT_SENTINEL)
         return [*system_msgs, Message(role="system", content="\n".join(lines)), *tail]
 
     def _save(self) -> None:

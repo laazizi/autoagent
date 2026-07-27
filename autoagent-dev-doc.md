@@ -3,7 +3,7 @@
 > Référence technique complète pour intégrer, étendre et tester `autoagent` dans un projet Python.
 > **Public visé** : devs qui vont écrire des tools, brancher l'agent sur leur app, ou éventuellement contribuer à la lib.
 
-**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-07-16 · **Couvre autoagent** : 0.16.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
+**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-07-24 · **Couvre autoagent** : 0.17.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
 
 ---
 
@@ -2414,6 +2414,7 @@ parsé — le modèle ne peut pas répondre mal formé.
 | 0.14.0 | consolidation scalable (`max_consolidation_facts`, §21) ; fixes Windows trouvés par la CI (env sandbox non vide, `docker_available` exige un démon linux) |
 | 0.15.0 | taint tracking : `untrusted=True` sur les tools/MCP + `ToolPolicyContext.tainted` (défense injection indirecte, §22) |
 | 0.16.0 | record/replay : `RecordSession`/`ReplaySession` (§23) + `ReplayMismatch` ; fix PEP 563 dans `schema_from_callable` ; `to_dict`/`from_dict` sur `LLMResponse`/`ToolResult` |
+| 0.17.0 | durcissement (racine commune : sous-systèmes appelant le LLM hors du provider de l'agent) : teinte monotone survivant à la compaction (§22), `token_budget` compte la dépense mémoire (§21), record/replay multi-provider par `channel=` (§23) |
 | — | `RoutingProvider` (providers/routing.py) |
 
 ## 17. `MCPClient` — outils MCP branchés comme des tools locaux
@@ -2632,6 +2633,13 @@ qui raccourcit ne vide pas la base — c'est le but) ; réabsorption du message
 backend lourd (Graphiti/Mem0) via le protocole `Memory` ou un serveur mémoire
 MCP (§17). La recherche sémantique, elle, est couverte par `embed_fn=`.
 
+**Coût compté (0.17)** : `SummarizingMemory`/`FactMemory` appellent LEUR propre
+provider (résumé/extraction). Chaque `compact()` expose `last_usage` (TokenUsage
+du dernier appel interne), que la boucle ajoute au budget ET à
+`AgentResult.usage` — donc `token_budget` couvre AUSSI la dépense mémoire (avant
+0.17 elle était invisible). NB background : l'extraction en thread renseigne
+`last_usage` après coup, comptée au `compact()` suivant.
+
 ## 22. Taint tracking — défense contre l'injection indirecte
 
 > `agent.py` + `schema.py` + `mcp.py`, 0.15.0. L'attaque n°1 sur les agents :
@@ -2671,9 +2679,13 @@ def envoyer_mail(dest: str, corps: str) -> dict: ...
 | `ToolPolicyContext.tainted: bool` | vrai si une sortie untrusted est DÉJÀ dans le transcript au moment du check ; la politique décide (deny / `ApprovalRequired` / laisser passer l'inoffensif) |
 
 **Décisions de design** :
-* **Dérivé, pas stocké** : la teinte se recalcule en scannant le transcript
-  (marqueur dans un message tool) → survit à checkpoint/resume GRATUITEMENT
-  (le `RunState` contient les messages). Aucun état séparé à gérer.
+* **Flag MONOTONE + sentinelle (durci en 0.17)** : la teinte est un booléen qui
+  passe à True dès une sortie untrusted et le reste, persisté dans
+  `RunState.tainted` (survit au resume). En complément, `SummarizingMemory`/
+  `FactMemory` portent une **sentinelle** dans leur message compacté →
+  `is_tainted` la reconnaît, donc **la teinte survit à la compaction** (avant
+  0.17, replier un vieux tour untrusted « lavait » la teinte : trou corrigé).
+  `is_tainted` + marqueurs vivent dans `schema.py`.
 * **Opt-in** : `untrusted=False` partout par défaut → comportement historique
   inchangé (les 546 tests passent sans modification).
 * **La lib FOURNIT le signal, la politique DÉCIDE** : on ne bloque rien
@@ -2726,6 +2738,11 @@ C'est la couche où vivent tes bugs et où arrivent tes changements.
 **Mécanique** :
 * Réponses LLM appariées par POSITION (les appels provider sont séquentiels) ;
   résultats d'outils par `call_id` (robuste aux `parallel_tool_calls`).
+* **Multi-provider par `channel=` (0.17)** : un agent AVEC mémoire résumante a
+  DEUX providers (agent + mémoire). Enregistre/rejoue chacun sur son canal —
+  `rec.provider(agent_prov, channel="agent")`, `rec.provider(cheap, channel="memory")`,
+  idem au replay — pour que les appels internes de la mémoire ne décalent pas
+  la trajectoire de l'agent. Défaut `"agent"` (rétrocompatible).
 * **Divergence** = feature : prompt/code modifié → la trajectoire dévie →
   `ReplayMismatch` pointe l'étape exacte (« appel LLM #3 : outils enregistrés
   [a], obtenus [] »). `strict=False` pour un positionnel best-effort.

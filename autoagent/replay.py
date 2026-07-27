@@ -109,9 +109,10 @@ class _Recorder:
             self._f.write(json.dumps(event, ensure_ascii=False) + "\n")
             self._f.flush()
 
-    def llm(self, request: LLMRequest, response: LLMResponse) -> None:
+    def llm(self, request: LLMRequest, response: LLMResponse, channel: str = "agent") -> None:
         self._write({
             "kind": "llm",
+            "channel": channel,
             "request": _signature(request, self._redact),
             "response": _maybe_redact(response.to_dict(), self._redact),
         })
@@ -133,16 +134,23 @@ class _Recorder:
 class RecordingProvider:
     """Enveloppe un provider réel : passe tout au vrai provider et enregistre
     chaque échange. Duck-typé comme un ``LLMProvider`` (``config``/``complete``
-    /``stream``)."""
+    /``stream``).
 
-    def __init__(self, wraps: Any, recorder: _Recorder) -> None:
+    ``channel`` sépare les flux quand PLUSIEURS providers sont enregistrés dans
+    le même fixture (0.17) : l'agent sur ``"agent"``, la mémoire résumante /
+    factuelle sur ``"memory"``, etc. Chaque canal est apparié par position
+    indépendamment — sinon les appels internes de la mémoire décaleraient la
+    trajectoire de l'agent au replay."""
+
+    def __init__(self, wraps: Any, recorder: _Recorder, channel: str = "agent") -> None:
         self._wraps = wraps
         self._rec = recorder
+        self._channel = channel
         self.config = getattr(wraps, "config", None)
 
     def complete(self, request: LLMRequest) -> LLMResponse:
         response = self._wraps.complete(request)
-        self._rec.llm(request, response)
+        self._rec.llm(request, response, self._channel)
         return response
 
     def stream(self, request: LLMRequest) -> Iterator[StreamChunk]:
@@ -153,7 +161,7 @@ class RecordingProvider:
             yield chunk
         if final is None:  # provider sans chunk final — filet
             final = LLMResponse(content="")
-        self._rec.llm(request, final)
+        self._rec.llm(request, final, self._channel)
 
 
 class RecordingRegistry(ToolRegistry):
@@ -181,8 +189,8 @@ class RecordSession:
     def __init__(self, path: str | Path, *, redact: bool = True) -> None:
         self._recorder = _Recorder(path, redact_secrets=redact)
 
-    def provider(self, wraps: Any) -> RecordingProvider:
-        return RecordingProvider(wraps, self._recorder)
+    def provider(self, wraps: Any, channel: str = "agent") -> RecordingProvider:
+        return RecordingProvider(wraps, self._recorder, channel)
 
     def registry(self) -> RecordingRegistry:
         return RecordingRegistry(self._recorder)
@@ -206,7 +214,7 @@ class _Player:
 
     def __init__(self, path: str | Path, *, strict: bool = True) -> None:
         self.strict = strict
-        self._llm: list[dict[str, Any]] = []
+        self._llm: dict[str, list[dict[str, Any]]] = {}   # canal -> événements ordonnés
         self._tools: dict[str, dict[str, Any]] = {}
         for line in Path(path).read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -214,24 +222,27 @@ class _Player:
                 continue
             event = json.loads(line)
             if event.get("kind") == "llm":
-                self._llm.append(event)
+                self._llm.setdefault(event.get("channel", "agent"), []).append(event)
             elif event.get("kind") == "tool":
                 self._tools[event["call_id"]] = event
-        self._llm_cursor = 0
+        self._cursors: dict[str, int] = {}
         self._lock = threading.Lock()
-        self.model = next((e["response"].get("model") for e in self._llm), None)
+        agent_evts = self._llm.get("agent", [])
+        self.model = next((e["response"].get("model") for e in agent_evts), None)
 
-    def next_llm(self, request: LLMRequest) -> LLMResponse:
+    def next_llm(self, request: LLMRequest, channel: str = "agent") -> LLMResponse:
         with self._lock:
-            if self._llm_cursor >= len(self._llm):
+            events = self._llm.get(channel, [])
+            cursor = self._cursors.get(channel, 0)
+            if cursor >= len(events):
                 raise ReplayMismatch(
-                    f"le run demande un appel LLM #{self._llm_cursor + 1} mais le "
-                    f"fixture n'en contient que {len(self._llm)} — le run a divergé "
-                    "après la fin de l'enregistrement."
+                    f"canal « {channel} » : le run demande un appel LLM #{cursor + 1} "
+                    f"mais le fixture n'en contient que {len(events)} — le run a "
+                    "divergé après la fin de l'enregistrement."
                 )
-            event = self._llm[self._llm_cursor]
-            self._llm_cursor += 1
-        cursor = self._llm_cursor
+            event = events[cursor]
+            self._cursors[channel] = cursor + 1
+        cursor += 1
         if self.strict:
             recorded = event["request"]
             actual = _signature(request, do_redact=True)
@@ -259,17 +270,19 @@ class _Player:
 
 
 class ReplayProvider:
-    """Rejoue les réponses LLM enregistrées, sans réseau. Duck-typé LLMProvider."""
+    """Rejoue les réponses LLM enregistrées, sans réseau. Duck-typé LLMProvider.
+    ``channel`` doit correspondre à celui utilisé à l'enregistrement."""
 
-    def __init__(self, player: _Player) -> None:
+    def __init__(self, player: _Player, channel: str = "agent") -> None:
         self._player = player
+        self._channel = channel
         self.config = ModelConfig(provider="replay", model=player.model or "replay")
 
     def complete(self, request: LLMRequest) -> LLMResponse:
-        return self._player.next_llm(request)
+        return self._player.next_llm(request, self._channel)
 
     def stream(self, request: LLMRequest) -> Iterator[StreamChunk]:
-        response = self._player.next_llm(request)
+        response = self._player.next_llm(request, self._channel)
         if response.content:
             yield StreamChunk(type="text", text=response.content)
         yield StreamChunk(type="final", response=response)
@@ -299,8 +312,8 @@ class ReplaySession:
     def __init__(self, path: str | Path, *, strict: bool = True) -> None:
         self._player = _Player(path, strict=strict)
 
-    def provider(self) -> ReplayProvider:
-        return ReplayProvider(self._player)
+    def provider(self, channel: str = "agent") -> ReplayProvider:
+        return ReplayProvider(self._player, channel)
 
     def registry(self) -> ReplayRegistry:
         return ReplayRegistry(self._player)

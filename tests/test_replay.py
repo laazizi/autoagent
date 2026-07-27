@@ -147,6 +147,23 @@ def test_streaming_replay(tmp_path) -> None:
     assert done and done[0].output == "bonjour"
 
 
+def test_channels_dont_collide(tmp_path) -> None:
+    # deux providers (agent + mémoire) enregistrés dans le MÊME fixture ne
+    # doivent pas se décaler : chaque canal est apparié par position à part.
+    fx = tmp_path / "chan.jsonl"
+    from autoagent.schema import LLMRequest, Message
+    req = lambda: LLMRequest(messages=[Message(role="user", content="q")])  # noqa: E731
+    with RecordSession(fx) as rec:
+        agent_prov = rec.provider(FakeLLMProvider([_text("réponse agent")]), channel="agent")
+        mem_prov = rec.provider(FakeLLMProvider([_text("résumé mémoire")]), channel="memory")
+        mem_prov.complete(req())         # ordre entrelacé : mémoire d'abord
+        agent_prov.complete(req())
+
+    with ReplaySession(fx) as rep:
+        assert rep.provider(channel="agent").complete(req()).content == "réponse agent"
+        assert rep.provider(channel="memory").complete(req()).content == "résumé mémoire"
+
+
 def test_redaction_scrubs_secrets(tmp_path) -> None:
     fx = tmp_path / "secret.jsonl"
     with RecordSession(fx, redact=True) as rec:

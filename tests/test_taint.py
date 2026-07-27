@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from autoagent.agent import Agent, RunState, ToolPolicyContext, UNTRUSTED_OPEN, _is_tainted
+from autoagent.agent import Agent, RunState, ToolPolicyContext
+from autoagent.schema import UNTRUSTED_OPEN, is_tainted as _is_tainted
 from autoagent.errors import ApprovalRequired
 from autoagent.schema import LLMResponse, Message, ToolCall
 
@@ -128,8 +129,8 @@ def test_no_untrusted_tool_never_tainted() -> None:
 
 
 def test_taint_survives_resume() -> None:
-    # la teinte est DÉRIVÉE du transcript → un RunState qui contient une sortie
-    # untrusted reste teinté après reprise (gratuit).
+    # la teinte est reconnue dans le transcript (marqueur tool OU sentinelle
+    # système laissée par la compaction mémoire).
     tainted_msgs = [
         Message(role="system", content="sys"),
         Message(role="user", content="q"),
@@ -139,6 +140,19 @@ def test_taint_survives_resume() -> None:
     assert _is_tainted(tainted_msgs) is True
     clean = [Message(role="tool", name="calculer", tool_call_id="c2", content="5")]
     assert _is_tainted(clean) is False
+    # la sentinelle système (post-compaction) est aussi reconnue
+    from autoagent.schema import TAINT_SENTINEL
+    folded = [Message(role="system", content=f"[Faits mémorisés]\n- x\n{TAINT_SENTINEL}")]
+    assert _is_tainted(folded) is True
+
+
+def test_taint_persists_in_runstate_across_resume() -> None:
+    # flag monotone : un RunState teinté reste teinté après from_dict (survit
+    # même si le marqueur a été compacté hors du transcript).
+    import json
+    state = RunState(messages=[Message(role="user", content="q")], step=1, tainted=True)
+    back = RunState.from_dict(json.loads(json.dumps(state.to_dict())))
+    assert back.tainted is True
 
 
 def test_mcp_mount_untrusted_marks_specs() -> None:
