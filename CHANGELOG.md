@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Tooling — visual builder (`constructeur_autoagent.html`)
+- **Smarter drag-and-drop insertion.** During a drag, the canvas now shows a
+  live drop *slot* (in the dragged module's category color, labelled with its
+  name) and lights up + spreads apart the two adjacent blocks (previous/next),
+  so you see exactly where the block will land. Works for both new blocks from
+  the palette and reordering existing ones.
+- **Graphical palette.** Each module family now has an inline SVG glyph (core,
+  tools, security, memory, observability, multi-agent, control, flow, run) —
+  offline, CSP-safe — instead of a plain colored dot. Flow connectors (`▾`)
+  between stacked blocks make the execution order visible.
+- **Two output modes.** A toolbar toggle emits either a *standalone script*
+  (`agent.run()` + `__main__`) or a *`build_agent()` function* that returns the
+  configured agent for import into an existing app (no run, no print, no
+  `__main__`). The function mode is disabled for flows (Orchestrator/Chain/
+  Parallel), which remain scripts by nature.
+
 ## [0.17.0] - 2026-07-24
 
 ### Fixed (hardening — three weaknesses sharing one root: subsystems make LLM calls outside the agent's provider)

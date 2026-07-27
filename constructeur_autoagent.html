@@ -96,6 +96,8 @@
   .sel-theme{display:flex; gap:2px; border:1px solid var(--line); border-radius:8px; overflow:hidden}
   .sel-theme button{background:var(--panel-2); border:0; padding:7px 10px; font-size:12px; color:var(--ink-soft)}
   .sel-theme button[aria-pressed="true"]{background:var(--c-core); color:#fff}
+  .sel-theme button:not([disabled]){cursor:pointer}
+  .sel-theme button[disabled]{opacity:.4; cursor:not-allowed}
   .menu-wrap{position:relative}
   #preset-btn{white-space:nowrap}
   .menu{
@@ -318,6 +320,10 @@
     <div class="menu-wrap">
       <button class="btn ghost" id="preset-btn" aria-haspopup="true" aria-expanded="false">Charger un exemple ▾</button>
       <div class="menu" id="preset-menu" role="menu"></div>
+    </div>
+    <div class="sel-theme" role="group" aria-label="Format du code généré">
+      <button id="mode-script" aria-pressed="true" title="Un script exécutable directement (agent.run + __main__)">Script autonome</button>
+      <button id="mode-integ" aria-pressed="false" title="Une fonction build_agent() à importer dans ton app (sans run ni __main__)">Fonction à intégrer</button>
     </div>
     <button class="btn ghost" id="clear">Vider</button>
     <button class="btn" id="copy">Copier le code</button>
@@ -588,6 +594,7 @@ let stack = [];
 let uid = 1;
 let insertIdx = null;          // position d'insertion pendant un drag
 let dragging = null;           // {label, cat} du module en cours de glissement (pour l'aperçu)
+let codeMode = "script";       // "script" (autonome) | "integration" (fonction build_agent)
 
 function defaults(type){
   const f = {};
@@ -702,10 +709,20 @@ function generate(){
 
   const L = [];
   const env = ENV[(agentB?a.prov:(orchB?orchB.f.prov:(chaineB?chaineB.f.prov:parB.f.prov)))] || "GEMINI_API_KEY";
+  // Mode « fonction à intégrer » : seulement pour un programme AGENT (les flux
+  // Orchestrator/Chaîne/Parallèle restent des scripts par nature).
+  const integ = codeMode==="integration" && agentB && !orchB && !chaineB && !parB;
   L.push(`"""Généré avec le Constructeur autoagent.`);
   L.push(``);
-  L.push(`Lancer :  ${env}=...  python ce_fichier.py`);
-  L.push(`(place ce fichier là où le paquet « autoagent » est importable.)`);
+  if(integ){
+    L.push(`Fonction à intégrer : importe build_agent() dans ton app.`);
+    L.push(`    from mon_agent import build_agent`);
+    L.push(`    agent = build_agent()`);
+    L.push(`    print(agent.run("…").output)`);
+  }else{
+    L.push(`Lancer :  ${env}=...  python ce_fichier.py`);
+    L.push(`(place ce fichier là où le paquet « autoagent » est importable.)`);
+  }
   L.push(`"""`);
   L.push(``);
   if(agentB && ckpt){ L.push(`import json`); L.push(`import pathlib`); L.push(``); }
@@ -928,8 +945,10 @@ function generate(){
       L.push(`${mv}.mount(${margs.join(", ")})`);
       L.push(``);
     }
-    // lancer
-    if(run){
+    // lancer — omis en mode « fonction à intégrer » (l'hôte pilote l'agent)
+    if(integ){
+      // rien : build_agent() retournera l'agent (voir l'enveloppe en fin de generate)
+    }else if(run){
       const ckArg = ckpt ? `, checkpoint=sauvegarder` : ``;
       if(run.f.stream){
         L.push(`# Streaming : on consomme les événements au fil de l'eau.`);
@@ -1043,8 +1062,37 @@ function generate(){
     L.push(`print(final.output)`);
   }
 
-  const code = L.join("\n").replace(/\n{3,}/g,"\n\n").trimEnd()+"\n";
-  return {code, env, loc: code.split("\n").length};
+  let code = L.join("\n").replace(/\n{3,}/g,"\n\n").trimEnd()+"\n";
+  if(integ) code = wrapAsFunction(code, av);
+  // canInteg : le programme PEUT devenir une fonction (agent seul, pas un flux).
+  const canInteg = !!(agentB && !orchB && !chaineB && !parB);
+  return {code, env, loc: code.split("\n").length, integ, canInteg};
+}
+
+/* Transforme un script en fonction `build_agent()` réutilisable : garde les
+   imports au niveau module, indente tout le reste sous la fonction, et
+   retourne l'agent (au lieu de le lancer). Pour l'intégration dans une app. */
+function wrapAsFunction(code, av){
+  const lines = code.split("\n");
+  let lastImport = -1;
+  for(let i=0;i<lines.length;i++){
+    const t = lines[i].trim();
+    if(t.startsWith("from ") || t.startsWith("import ")) lastImport = i;
+  }
+  const header = lines.slice(0, lastImport+1);
+  let body = lines.slice(lastImport+1);
+  while(body.length && body[0].trim()==="") body.shift();
+  while(body.length && body[body.length-1].trim()==="") body.pop();
+  const indented = body.map(l => l.trim()==="" ? "" : "    "+l);
+  return [
+    ...header, "", "",
+    "def build_agent():",
+    '    """Construit et retourne l\'agent configuré — à piloter par ton app."""',
+    ...indented,
+    "",
+    `    return ${av}`,
+    "",
+  ].join("\n");
 }
 function pyTriDoc(s){ return `"""${String(s).replace(/\\/g,"\\\\").replace(/"""/g,'\\"\\"\\"')}"""`; }
 
@@ -1250,12 +1298,22 @@ function renderStack(){
 function render(){ renderPalette(); renderStack(); regen(); }
 
 function regen(){
-  const {code, env, loc} = generate();
+  const {code, env, loc, integ, canInteg} = generate();
   $("#code").innerHTML = highlight(code);
   window.__lastCode = code; window.__lastEnv = env; window.__lastName = "mon_agent.py";
   $("#loc-count").textContent = loc>1 ? `${loc} lignes` : "";
+  // Le mode « fonction à intégrer » n'a de sens que pour un agent seul :
+  // un flux (Orchestrator/Chaîne/Parallèle) reste un script → bouton grisé.
+  const mi = $("#mode-integ");
+  if(mi){
+    mi.disabled = !canInteg;
+    mi.title = canInteg
+      ? "Une fonction build_agent() à importer dans ton app (sans run ni __main__)"
+      : "Indisponible : un flux (Orchestrateur/Chaîne/Parallèle) reste un script autonome";
+  }
   const rc = $("#run-cmd");
-  if(env){ rc.innerHTML = `<span class="k">${env}</span>=…&nbsp;&nbsp;python&nbsp;mon_agent.py`; }
+  if(integ) rc.innerHTML = `<span class="k">from</span>&nbsp;mon_agent&nbsp;<span class="k">import</span>&nbsp;build_agent&nbsp;&nbsp;→&nbsp;agent&nbsp;=&nbsp;build_agent()`;
+  else if(env) rc.innerHTML = `<span class="k">${env}</span>=…&nbsp;&nbsp;python&nbsp;mon_agent.py`;
   else rc.textContent = "";
 }
 
@@ -1520,6 +1578,16 @@ $("#th-light").addEventListener("click", ()=>setTheme("light"));
 $("#th-dark").addEventListener("click", ()=>setTheme("dark"));
 // thème initial = préférence OS
 setTheme(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light");
+
+// Format du code : script autonome vs fonction build_agent() à intégrer
+function setMode(mode){
+  codeMode = mode;
+  $("#mode-script").setAttribute("aria-pressed", mode==="script");
+  $("#mode-integ").setAttribute("aria-pressed", mode==="integration");
+  regen();
+}
+$("#mode-script").addEventListener("click", ()=>setMode("script"));
+$("#mode-integ").addEventListener("click", ()=>setMode("integration"));
 
 // démarrage : lien profond ?exemple=<id> (preset ou vitrine), sinon le 1er
 // exemple — pour montrer un résultat concret tout de suite.

@@ -29,7 +29,8 @@ That's the whole API for the common case. The JSON schema for `add` is generated
 type annotations. The loop, retries, and provider wire formats are handled for you.
 
 Prefer assembling visually? **[Try the visual builder online](https://laazizi.github.io/autoagent/)** —
-drag blocks (agent, tools, memory, MCP, checkpoint…), get runnable Python. Fully offline,
+drag blocks (agent, tools, memory, MCP, checkpoint…), get runnable Python. Emit either a
+standalone script or a `build_agent()` function to import into your own app. Fully offline,
 also ships in the repo as `constructeur_autoagent.html`.
 
 [![The visual builder cycling through presets: tools, fact memory, MCP, checkpoint — blocks on the left, runnable Python on the right](assets/constructeur.gif)](https://laazizi.github.io/autoagent/)
