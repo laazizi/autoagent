@@ -2,13 +2,41 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from typing import Any
 
 from autoagent.schema import LLMRequest, LLMResponse, ModelConfig, StreamChunk
+
+
+def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge ``overlay`` into ``base``; mutates and returns ``base``.
+
+    Nested dicts are merged key by key; anything else (scalars, lists) is
+    replaced by the ``overlay`` value.
+    """
+    for key, value in overlay.items():
+        current = base.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            deep_merge(current, value)
+        else:
+            base[key] = value
+    return base
 
 
 class LLMProvider(ABC):
     def __init__(self, config: ModelConfig):
         self.config = config
+
+    def _with_extra_body(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Deep-merge ``config.extra_body`` into a freshly built payload.
+
+        Escape hatch for model-specific knobs ``LLMRequest`` does not map —
+        Gemini's ``thinkingConfig``, OpenAI's ``reasoning_effort``… Every
+        provider calls this on the way out of ``_build_payload``, so the
+        mechanism is uniform and costs nothing when ``extra_body`` is empty.
+        """
+        if not self.config.extra_body:
+            return payload
+        return deep_merge(payload, self.config.extra_body)
 
     @abstractmethod
     def complete(self, request: LLMRequest) -> LLMResponse:

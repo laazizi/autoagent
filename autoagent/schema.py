@@ -64,6 +64,13 @@ class ModelConfig:
     base_url: str | None = None
     timeout: float = 60.0
     extra_headers: dict[str, str] = field(default_factory=dict)
+    # `extra_body` est fusionné EN PROFONDEUR dans le payload envoyé au provider :
+    # c'est l'échappatoire pour les réglages propres à un modèle que `LLMRequest`
+    # ne mappe pas — `thinkingConfig` de Gemini, `reasoning_effort` d'OpenAI…
+    # La récursivité n'est pas un luxe : passer
+    # `{"generationConfig": {"thinkingConfig": …}}` en simple écrasement ferait
+    # perdre la `temperature` et le `maxOutputTokens` déjà posés par la requête.
+    extra_body: JsonDict = field(default_factory=dict)
 
     def resolved_api_key(self) -> str:
         if self.api_key:

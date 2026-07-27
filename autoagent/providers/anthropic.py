@@ -54,7 +54,7 @@ class AnthropicProvider(LLMProvider):
                 payload["tool_choice"] = {"type": "tool", "name": choice}
         if request.temperature is not None:
             payload["temperature"] = request.temperature
-        return payload
+        return self._with_extra_body(payload)
 
     def _headers(self) -> dict[str, str]:
         return {

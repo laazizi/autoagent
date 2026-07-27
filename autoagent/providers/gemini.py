@@ -85,7 +85,7 @@ class GeminiProvider(LLMProvider):
             generation_config["responseMimeType"] = "application/json"
         if generation_config:
             payload["generationConfig"] = generation_config
-        return payload
+        return self._with_extra_body(payload)
 
     def _parse_parts(
         self, parts: list[dict[str, Any]], tool_calls: list[ToolCall], text_parts: list[str]
@@ -197,9 +197,36 @@ class GeminiProvider(LLMProvider):
             for call in (message.tool_calls or [])
             if call.id and call.name
         }
+        # Tool results are carried by a `functionResponse` part under role
+        # "user" — NOT "tool". Older models tolerated role "tool", but Gemini
+        # 3.6+ rejects it with a 400 ("Role 'tool' is not supported"). And when
+        # the model made SEVERAL calls in one turn (parallel_tool_calls), all
+        # their responses must live in a SINGLE "user" content with multiple
+        # parts — consecutive "user" contents would break the user/model turn
+        # alternation. We therefore buffer consecutive tool messages and flush
+        # them as one content before any non-tool message (and at the end).
+        pending_tool_parts: list[dict[str, Any]] = []
+
+        def _flush_tools() -> None:
+            if pending_tool_parts:
+                contents.append({"role": "user", "parts": list(pending_tool_parts)})
+                pending_tool_parts.clear()
+
         for message in messages:
             if message.role == "system":
                 continue
+            if message.role == "tool":
+                pending_tool_parts.append(
+                    {
+                        "functionResponse": {
+                            "name": message.name
+                            or call_names.get(message.tool_call_id or "", "tool"),
+                            "response": {"result": message.content},
+                        }
+                    }
+                )
+                continue
+            _flush_tools()  # any non-tool message closes the tool-response group
             if message.role == "assistant":
                 parts: list[dict[str, Any]] = []
                 if message.content:
@@ -221,21 +248,6 @@ class GeminiProvider(LLMProvider):
                         part["thoughtSignature"] = call.thought_signature
                     parts.append(part)
                 contents.append({"role": "model", "parts": parts or [{"text": ""}]})
-            elif message.role == "tool":
-                contents.append(
-                    {
-                        "role": "tool",
-                        "parts": [
-                            {
-                                "functionResponse": {
-                                    "name": message.name
-                                    or call_names.get(message.tool_call_id or "", "tool"),
-                                    "response": {"result": message.content},
-                                }
-                            }
-                        ],
-                    }
-                )
             else:
                 # User message — may include image attachments via Gemini's
                 # `inline_data: {mime_type, data}` part format.
@@ -248,4 +260,5 @@ class GeminiProvider(LLMProvider):
                 if not user_parts:
                     user_parts = [{"text": ""}]
                 contents.append({"role": "user", "parts": user_parts})
+        _flush_tools()  # conversation ending on tool results (before re-calling the model)
         return contents
