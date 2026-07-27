@@ -144,7 +144,17 @@
   .paletteItem[aria-disabled="true"]{opacity:.4; pointer-events:none}
   .paletteItem .pi-name{font-weight:700; font-size:13px}
   .paletteItem .pi-sub{font-size:11px; color:var(--ink-faint); display:block; margin-top:1px}
-  .paletteItem .dot{width:9px; height:9px; border-radius:50%; background:var(--cat); flex-shrink:0}
+  /* Glyphe SVG par catégorie : une petite icône colorée, plus parlante qu'un point */
+  .paletteItem .pi-glyph{
+    width:30px; height:30px; flex-shrink:0; border-radius:8px;
+    display:grid; place-items:center;
+    background:color-mix(in srgb, var(--cat) 16%, transparent);
+    border:1px solid color-mix(in srgb, var(--cat) 40%, var(--line));
+  }
+  .paletteItem .pi-glyph svg{width:17px; height:17px; stroke:var(--cat); fill:none;
+    stroke-width:1.9; stroke-linecap:round; stroke-linejoin:round}
+  .paletteItem .pi-glyph svg .fillcat{fill:var(--cat); stroke:none}
+  .paletteItem:hover .pi-glyph{background:color-mix(in srgb, var(--cat) 26%, transparent)}
   .paletteItem .txt{min-width:0}
   .wire-note{
     font-size:11.5px; color:var(--ink-soft); background:var(--panel-2);
@@ -180,14 +190,41 @@
     padding:34px 20px; text-align:center; color:var(--ink-faint); font-size:13px;
   }
   .drop-empty strong{color:var(--ink-soft); display:block; margin-bottom:4px; font-size:14px}
-  .insert-line{height:0; border-top:2px solid var(--c-core); margin:4px 2px; border-radius:2px}
+
+  /* ── Aperçu d'insertion : un "slot" qui montre où et QUOI on dépose ── */
+  .slot{
+    display:flex; align-items:center; gap:8px;
+    border:2px dashed var(--slotcat, var(--c-core)); border-radius:var(--radius);
+    background:color-mix(in srgb, var(--slotcat, var(--c-core)) 10%, transparent);
+    color:var(--slotcat, var(--c-core)); font-weight:700; font-size:12.5px;
+    padding:12px 14px; margin:6px 0; animation:slotIn .14s ease;
+  }
+  .slot .slot-dot{width:10px; height:10px; border-radius:50%; background:var(--slotcat, var(--c-core))}
+  .slot .slot-arrow{margin-left:auto; font-size:15px; opacity:.7}
+  @keyframes slotIn{from{opacity:0; transform:scaleY(.4)} to{opacity:1; transform:scaleY(1)}}
 
   .block{
+    position:relative;
     background:var(--panel); border:1px solid var(--line);
     border-left:5px solid var(--cat); border-radius:var(--radius);
-    margin-bottom:12px; box-shadow:var(--shadow); overflow:hidden;
+    margin-bottom:22px; box-shadow:var(--shadow); overflow:visible;
+    transition:margin .16s ease, box-shadow .16s ease, transform .16s ease;
   }
-  .block.dragging{opacity:.5}
+  /* Connecteur de flux : une flèche verticale reliant chaque bloc au précédent */
+  .block:not(:first-child)::before{
+    content:"▾"; position:absolute; top:-19px; left:50%; transform:translateX(-50%);
+    color:var(--ink-faint); font-size:14px; line-height:1; pointer-events:none;
+  }
+  .block:not(:first-child)::after{
+    content:""; position:absolute; top:-22px; left:50%; width:2px; height:11px;
+    transform:translateX(-50%); background:var(--line); pointer-events:none;
+  }
+  .block .block-head{overflow:hidden; border-top-left-radius:var(--radius); border-top-right-radius:var(--radius)}
+  .block.dragging{opacity:.4; transform:scale(.98)}
+  /* Voisins du point d'insertion : on les écarte et on les met en évidence */
+  .block.neighbor-before{margin-bottom:40px; box-shadow:0 6px 18px color-mix(in srgb, var(--cat) 30%, transparent)}
+  .block.neighbor-after{margin-top:18px; box-shadow:0 -6px 18px color-mix(in srgb, var(--cat) 30%, transparent)}
+  .block.neighbor-before, .block.neighbor-after{border-color:var(--cat)}
   .block-head{
     display:flex; align-items:center; gap:9px; padding:9px 11px;
     background:linear-gradient(90deg, color-mix(in srgb, var(--cat) 14%, transparent), transparent 70%);
@@ -339,6 +376,24 @@ const CATS = {
   flow:  {color:"var(--c-flow)",  label:"Flux (Orchestrator)"},
   run:   {color:"var(--c-run)",   label:"Exécution"},
 };
+
+// Glyphe SVG par catégorie (inline, hors-ligne, dans la couleur de catégorie).
+// Une forme parlante par famille : cerveau=cœur, engrenage=outils, bouclier=
+// sécurité, cylindre=mémoire, onde=observabilité, réseau=multi-agent,
+// coche=contrôle, organigramme=flux, éclair=exécution.
+const GLYPHS = {
+  core:  '<circle cx="12" cy="12" r="4" class="fillcat"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/>',
+  tool:  '<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.5 4.5l2.2 2.2M17.3 17.3l2.2 2.2M19.5 4.5l-2.2 2.2M6.7 17.3l-2.2 2.2"/>',
+  safe:  '<path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/><path d="M9 12l2 2 4-4"/>',
+  mem:   '<ellipse cx="12" cy="5.5" rx="7" ry="2.6" class="fillcat"/><path d="M5 5.5v13c0 1.4 3.1 2.6 7 2.6s7-1.2 7-2.6v-13M5 12c0 1.4 3.1 2.6 7 2.6s7-1.2 7-2.6"/>',
+  trace: '<path d="M3 12h3l2-6 4 12 2.5-8 1.5 2h5"/>',
+  multi: '<circle cx="6" cy="6" r="2.4"/><circle cx="18" cy="6" r="2.4"/><circle cx="12" cy="18" r="2.4"/><path d="M7.6 7.8l3.2 8M16.4 7.8l-3.2 8M8 6h8"/>',
+  hook:  '<path d="M4 12l5 5L20 6"/>',
+  flow:  '<rect x="8.5" y="2.5" width="7" height="5" rx="1"/><rect x="2.5" y="16.5" width="7" height="5" rx="1"/><rect x="14.5" y="16.5" width="7" height="5" rx="1"/><path d="M12 7.5v4M12 11.5H6v5M12 11.5h6v5"/>',
+  run:   '<path d="M13 2L5 13h6l-2 9 8-12h-6z" class="fillcat"/>',
+};
+const svgGlyph = cat =>
+  `<span class="pi-glyph"><svg viewBox="0 0 24 24" aria-hidden="true">${GLYPHS[cat] || GLYPHS.core}</svg></span>`;
 
 const DEFS = {
   agent: {
@@ -532,6 +587,7 @@ const ENV = {gemini:"GEMINI_API_KEY", openai:"OPENAI_API_KEY", anthropic:"ANTHRO
 let stack = [];
 let uid = 1;
 let insertIdx = null;          // position d'insertion pendant un drag
+let dragging = null;           // {label, cat} du module en cours de glissement (pour l'aperçu)
 
 function defaults(type){
   const f = {};
@@ -1077,9 +1133,10 @@ function renderPalette(){
       b.className="paletteItem"; b.style.setProperty("--cat", CATS[cat].color);
       b.setAttribute("draggable","true");
       b.setAttribute("aria-disabled", used?"true":"false");
-      b.innerHTML = `<span class="dot"></span><span class="txt"><span class="pi-name">${def.name}</span><span class="pi-sub">${def.sub}</span></span>`;
+      b.innerHTML = `${svgGlyph(cat)}<span class="txt"><span class="pi-name">${def.name}</span><span class="pi-sub">${def.sub}</span></span>`;
       b.addEventListener("click", ()=> addBlock(type));
-      b.addEventListener("dragstart", e=>{ e.dataTransfer.setData("text/newblock", type); e.dataTransfer.effectAllowed="copy"; });
+      b.addEventListener("dragstart", e=>{ e.dataTransfer.setData("text/newblock", type); e.dataTransfer.effectAllowed="copy"; dragging={label:def.name, cat:def.cat}; });
+      b.addEventListener("dragend", ()=>{ dragging=null; clearInsert(); });
       piw.appendChild(b);
       // icône info + infobulle
       const info = document.createElement("span");
@@ -1174,8 +1231,9 @@ function blockEl(block, index){
   el.addEventListener("dragstart", e=>{
     e.dataTransfer.setData("text/moveid", String(block.id));
     e.dataTransfer.effectAllowed="move"; el.classList.add("dragging");
+    dragging={label:def.name, cat:def.cat};
   });
-  el.addEventListener("dragend", ()=>{ el.classList.remove("dragging"); clearInsert(); });
+  el.addEventListener("dragend", ()=>{ el.classList.remove("dragging"); dragging=null; clearInsert(); });
   return el;
 }
 
@@ -1205,7 +1263,12 @@ function regen(){
    6. DRAG & DROP sur la pile (insertion + réordonnancement)
    ══════════════════════════════════════════════════════════════════════ */
 const stackEl = $("#stack");
-function clearInsert(){ const l=stackEl.querySelector(".insert-line"); if(l) l.remove(); insertIdx=null; }
+function clearInsert(){
+  const l=stackEl.querySelector(".slot"); if(l) l.remove();
+  stackEl.querySelectorAll(".neighbor-before,.neighbor-after")
+    .forEach(b=>b.classList.remove("neighbor-before","neighbor-after"));
+  insertIdx=null;
+}
 function indexFromY(y){
   const blocks=[...stackEl.querySelectorAll(".block")];
   for(let k=0;k<blocks.length;k++){
@@ -1215,11 +1278,21 @@ function indexFromY(y){
   return blocks.length;
 }
 function showInsert(idx){
+  if(idx===insertIdx && stackEl.querySelector(".slot")) return;  // pas de rebuild inutile (anti-flicker)
   clearInsert();
-  const line=document.createElement("div"); line.className="insert-line"; insertIdx=idx;
+  insertIdx=idx;
   const blocks=[...stackEl.querySelectorAll(".block")];
-  if(idx>=blocks.length) stackEl.appendChild(line);
-  else stackEl.insertBefore(line, blocks[idx]);
+  // Aperçu du slot : montre CE qui va tomber, dans la couleur de la catégorie.
+  const slot=document.createElement("div"); slot.className="slot";
+  const cat = dragging ? dragging.cat : "core";
+  slot.style.setProperty("--slotcat", CATS[cat] ? CATS[cat].color : "var(--c-core)");
+  const label = dragging ? dragging.label : "Module";
+  slot.innerHTML = `<span class="slot-dot"></span><span>${label} — déposer ici</span><span class="slot-arrow">↳</span>`;
+  if(idx>=blocks.length) stackEl.appendChild(slot);
+  else stackEl.insertBefore(slot, blocks[idx]);
+  // Allume et ÉCARTE les deux voisins (précédent + suivant) du point d'insertion.
+  if(idx-1>=0 && blocks[idx-1]) blocks[idx-1].classList.add("neighbor-before");
+  if(idx<blocks.length && blocks[idx]) blocks[idx].classList.add("neighbor-after");
 }
 stackEl.addEventListener("dragover", e=>{
   e.preventDefault();
@@ -1232,7 +1305,7 @@ stackEl.addEventListener("drop", e=>{
   const idx = insertIdx!=null?insertIdx:stack.length;
   const newType = e.dataTransfer.getData("text/newblock");
   const moveId  = e.dataTransfer.getData("text/moveid");
-  clearInsert();
+  clearInsert(); dragging=null;
   if(newType){ addBlock(newType, idx); return; }
   if(moveId){
     const id=+moveId; const from=stack.findIndex(b=>b.id===id); if(from<0) return;
