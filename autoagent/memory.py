@@ -293,7 +293,10 @@ class SummarizingMemory:
                 tool_choice="none",
             )
         )
-        self.last_usage = response.usage   # coût compté par la boucle (token_budget)
+        # `getattr` : la comptabilité de jetons est un BONUS, pas une exigence. Un
+        # provider tiers ou un double de test qui renvoie un objet sans `usage` ne
+        # doit pas faire échouer une compaction — elle est best-effort par contrat.
+        self.last_usage = getattr(response, "usage", None)
         return (response.content or "").strip() or self._summary
 
 
@@ -660,7 +663,10 @@ class FactMemory:
                 response_format={"type": "json_object"},
             )
         )
-        self.last_usage = response.usage   # coût compté par la boucle (token_budget)
+        # `getattr` : la comptabilité de jetons est un BONUS, pas une exigence. Un
+        # provider tiers ou un double de test qui renvoie un objet sans `usage` ne
+        # doit pas faire échouer une compaction — elle est best-effort par contrat.
+        self.last_usage = getattr(response, "usage", None)
         with self._lock:
             self._apply_operations(_parse_operations(response.content or ""))
             self._save()
