@@ -1,0 +1,6 @@
+# Dépendances de la DÉMO (un consommateur d'autoagent) — la lib, elle, reste
+# zéro-dépendance. autoagent est importé depuis la racine du dépôt (voir main.py),
+# ou remplacer par `autoagent-core` si installé depuis PyPI.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+jsonschema>=4.0        # requis par autoagent

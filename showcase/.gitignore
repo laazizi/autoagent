@@ -1,0 +1,5 @@
+# Données d'exécution : sessions, workspace de l'agent, outils générés, traces.
+data/
+*.jsonl
+__pycache__/
+.venv/

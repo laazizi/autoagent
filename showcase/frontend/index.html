@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>autoagent — app vivante</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#161922; --panel-2:#1d212c; --line:#2a2f3c;
+    --ink:#e7ebf3; --ink-soft:#9aa4b8; --accent:#6ea8fe; --accent-2:#8b7cf6;
+    --ok:#4ade80; --warn:#fbbf24; --radius:12px; --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0; font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+       background:var(--bg); color:var(--ink); height:100vh; overflow:hidden}
+  /* Disposition : Chat (gauche) · Écran HTML de l'agent (centre, la vedette) · Historique (droite) */
+  .app{display:grid; grid-template-columns:360px 1fr 280px; height:100vh}
+  .col{display:flex; flex-direction:column; min-height:0; border-right:1px solid var(--line)}
+  #chat{order:1} #canvas{order:2} #histo{order:3}
+  #histo{border-right:0}
+  .col h2{font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--ink-soft);
+          margin:0; padding:14px 16px; border-bottom:1px solid var(--line)}
+
+  /* ── sidebar historique ── */
+  #histo{background:var(--panel); overflow-y:auto}
+  .newbtn{margin:12px; padding:10px; border:1px dashed var(--line); border-radius:var(--radius);
+          background:transparent; color:var(--ink); cursor:pointer; font-weight:600}
+  .newbtn:hover{border-color:var(--accent); color:var(--accent)}
+  .sess{display:flex; align-items:center; gap:6px; padding:8px 10px 8px 14px; margin:2px 8px;
+        border-radius:10px; color:var(--ink-soft)}
+  .sess:hover{background:var(--panel-2); color:var(--ink)}
+  .sess.active{background:var(--panel-2); color:var(--ink); box-shadow:inset 3px 0 0 var(--accent)}
+  .sess .s-main{flex:1; min-width:0; cursor:pointer}
+  .sess .t{display:block; color:inherit; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .sess .m{font-size:11px; color:var(--ink-soft)}
+  .sess .s-del{flex:none; border:0; background:transparent; color:var(--ink-soft); cursor:pointer;
+        font-size:14px; padding:4px 6px; border-radius:7px; opacity:.35; transition:opacity .12s}
+  .sess:hover .s-del{opacity:.8}
+  .sess .s-del:hover{opacity:1; background:color-mix(in srgb, #f87171 22%, transparent); color:#fff}
+
+  /* ── chat ── */
+  #chat{background:var(--bg)}
+  #msgs{flex:1; overflow-y:auto; padding:20px 22px; display:flex; flex-direction:column; gap:14px}
+  .bubble{max-width:78%; padding:11px 14px; border-radius:14px; white-space:pre-wrap; word-wrap:break-word}
+  .bubble.user{align-self:flex-end; background:var(--accent); color:#08101f; border-bottom-right-radius:4px}
+  .bubble.assistant{align-self:flex-start; background:var(--panel-2); border:1px solid var(--line); border-bottom-left-radius:4px}
+  .bubble.assistant .cursor{display:inline-block; width:7px; height:15px; background:var(--accent);
+          margin-left:2px; animation:blink 1s steps(2) infinite; vertical-align:text-bottom}
+  @keyframes blink{50%{opacity:0}}
+  /* carte d'approbation (gate humain) */
+  .approval{align-self:stretch; border:1px solid var(--warn); border-radius:14px; overflow:hidden;
+          background:color-mix(in srgb, var(--warn) 8%, var(--panel-2))}
+  .approval .ap-h{padding:9px 13px; font-weight:700; color:var(--warn);
+          border-bottom:1px solid color-mix(in srgb, var(--warn) 30%, var(--line))}
+  .approval .ap-b{padding:11px 13px; font-size:13px; line-height:1.45}
+  .approval .ap-a{display:flex; gap:8px; padding:0 13px 13px}
+  .approval button{flex:1; padding:8px; border:0; border-radius:9px; font-weight:700; cursor:pointer}
+  .approval .ap-ok{background:var(--ok); color:#04220f}
+  .approval .ap-no{background:var(--panel); color:var(--ink); border:1px solid var(--line)}
+  .approval button:disabled{opacity:.45; cursor:default}
+  .empty{margin:auto; text-align:center; color:var(--ink-soft); max-width:340px}
+  .empty b{color:var(--ink)}
+  .composer{display:flex; gap:10px; padding:14px 16px; border-top:1px solid var(--line); background:var(--panel)}
+  .composer textarea{flex:1; resize:none; background:var(--panel-2); color:var(--ink); border:1px solid var(--line);
+          border-radius:var(--radius); padding:10px 12px; font:inherit; max-height:120px}
+  .composer button{padding:0 18px; border:0; border-radius:var(--radius); background:var(--accent);
+          color:#08101f; font-weight:700; cursor:pointer}
+  .composer button:disabled{opacity:.5; cursor:default}
+
+  /* ── canvas agent : VRAI HTML dans un iframe sandboxé ── */
+  #canvas{background:var(--panel)}
+  #canvas .top{display:flex; align-items:center; gap:10px; padding:10px 14px; border-bottom:1px solid var(--line)}
+  .badge{display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:20px;
+          font-size:12px; font-weight:600; border:1px solid var(--line)}
+  .badge .dot{width:8px; height:8px; border-radius:50%}
+  .badge.reel{color:var(--ok)} .badge.reel .dot{background:var(--ok)}
+  .badge.factice{color:var(--warn)} .badge.factice .dot{background:var(--warn)}
+  #ecran-titre{font-size:12px; color:var(--ink-soft); overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  #canvas .body{flex:1; position:relative; min-height:0}
+  #frame{width:100%; height:100%; border:0; background:#fff; display:none}
+  #placeholder{position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+        padding:24px; text-align:center; color:var(--ink-soft); font-size:12.5px}
+  #placeholder .in{max-width:280px}
+  /* onglets galerie (pages persistantes générées par l'agent) */
+  #pages{display:flex; gap:6px; padding:8px 12px 0; overflow-x:auto; background:var(--panel)}
+  #pages:empty{display:none}
+  .tab{white-space:nowrap; padding:5px 11px; border:1px solid var(--line); border-bottom:0;
+        border-radius:9px 9px 0 0; font-size:12px; color:var(--ink-soft); cursor:pointer; background:var(--panel-2)}
+  .tab:hover{color:var(--ink)}
+  .tab.active{color:var(--ink); background:var(--bg); box-shadow:inset 0 2px 0 var(--accent)}
+  /* trace vivante de l'essaim */
+  #trace{border-top:1px solid var(--line); background:var(--bg); display:flex; flex-direction:column; max-height:200px}
+  .tr-h{padding:7px 12px; font-size:11px; letter-spacing:.05em; text-transform:uppercase;
+        color:var(--ink-soft); border-bottom:1px solid var(--line)}
+  #tr-hint{text-transform:none; letter-spacing:0; opacity:.7}
+  #tr-lignes{overflow-y:auto; padding:6px 10px; display:flex; flex-direction:column; gap:2px}
+  .tr{font-family:var(--mono); font-size:11px; padding:2px 6px; border-radius:5px; color:var(--ink-soft)}
+  .tr.run{color:var(--accent)} .tr.tool{color:var(--accent-2)} .tr.tool.err{color:#f87171}
+  .tr.done{color:var(--ok)} .tr b{color:var(--ink)}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- HISTORIQUE -->
+  <div class="col" id="histo">
+    <h2>Conversations</h2>
+    <button class="newbtn" id="new">+ Nouvelle conversation</button>
+    <div id="liste"></div>
+  </div>
+
+  <!-- CHAT -->
+  <div class="col" id="chat">
+    <h2>Chat</h2>
+    <div id="msgs"><div class="empty"><b>App vivante</b><br>Un chat où l'agent pilotera bientôt l'écran et fabriquera ses propres outils. Commence par écrire un message.</div></div>
+    <div class="composer">
+      <textarea id="input" rows="1" placeholder="Écris ton message…  (Entrée pour envoyer)"></textarea>
+      <button id="send">Envoyer</button>
+    </div>
+  </div>
+
+  <!-- CANVAS AGENT -->
+  <div class="col" id="canvas">
+    <h2>Écran piloté par l'agent</h2>
+    <div class="top">
+      <span class="badge" id="mode"><span class="dot"></span><span id="mode-txt">…</span></span>
+      <span id="ecran-titre"></span>
+    </div>
+    <div id="pages"></div>
+    <div class="body">
+      <iframe id="frame" sandbox="allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer"></iframe>
+      <div id="placeholder"><div class="in">L'agent HTML affichera ici de <b>vraies pages</b> qu'il génère (tableaux, cartes, fiches, formulaires…). Demande par ex. « la météo de Lyon sur 7 jours » ou « une fiche produit ».</div></div>
+    </div>
+    <div id="trace"><div class="tr-h">Trace de l'essaim <span id="tr-hint">— orchestrateur → sous-agents → outils</span></div><div id="tr-lignes"></div></div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let session = null, streaming = false;
+
+// ── Historique ──────────────────────────────────────────────────────────────
+async function chargerListe(){
+  const r = await fetch("/api/sessions"); const arr = await r.json();
+  const box = $("#liste"); box.innerHTML = "";
+  for(const s of arr){
+    const el = document.createElement("div");
+    el.className = "sess" + (s.id===session ? " active" : "");
+    el.innerHTML = `<div class="s-main"><span class="t">${escapeHtml(s.titre)}</span><span class="m">${s.tours} tour(s)</span></div>`
+      + `<button class="s-del" title="Supprimer cette conversation (chat, écrans, outils, trace)">🗑</button>`;
+    el.querySelector(".s-main").onclick = () => ouvrir(s.id);
+    el.querySelector(".s-del").onclick = (e) => { e.stopPropagation(); supprimerSession(s.id, s.titre); };
+    box.appendChild(el);
+  }
+}
+async function supprimerSession(id, titre){
+  if(!confirm(`Supprimer définitivement « ${titre||id} » ?\nChat, écrans générés, outils dynamiques et trace seront effacés (front + back).`)) return;
+  try{ await fetch("/api/sessions/"+id, {method:"DELETE"}); }catch(e){}
+  if(session===id){
+    session=null; pagesSession=[]; rebuildTabs(); resetTrace(); clearEcran();
+    $("#msgs").innerHTML = `<div class="empty"><b>Conversation supprimée</b><br>Choisis-en une autre ou démarre une nouvelle.</div>`;
+  }
+  chargerListe();
+}
+async function ouvrir(id){
+  session = id;
+  const r = await fetch("/api/sessions/"+id); const d = await r.json();
+  $("#msgs").innerHTML = ""; resetTrace();
+  for(const m of d.messages) bulle(m.role, m.content);
+  // Les métadonnées seules arrivent ici ; le HTML de la page affichée est
+  // chargé à la demande (une page, pas toute la galerie).
+  pagesSession = d.pages || []; rebuildTabs();
+  if(pagesSession.length) ouvrirPage(pagesSession.length-1); else clearEcran();
+  scrollBas(); chargerListe();
+}
+$("#new").onclick = () => { session=null; pagesSession=[]; rebuildTabs(); resetTrace(); clearEcran();
+  $("#msgs").innerHTML = `<div class="empty"><b>Nouvelle conversation</b><br>Écris ton premier message.</div>`;
+  chargerListe(); };
+
+// ── Écran piloté par l'agent (vrai HTML, iframe sandboxé) ────────────────────
+// Pont « API vivante » injecté dans la page : window.appelerAPI(outil, args)
+// → fetch /api/live/<session>/<outil>. La session est scellée ici (le front la
+// connaît), l'iframe reste sandboxé (origine null) — CORS ouvert côté serveur.
+function pontAPI(){
+  const base = JSON.stringify(location.origin), sid = JSON.stringify(session || "");
+  return `<scr`+`ipt>window.appelerAPI=async(outil,args={})=>{`
+    + `const u=${base}+"/api/live/"+${sid}+"/"+encodeURIComponent(outil)+"?args="+encodeURIComponent(JSON.stringify(args));`
+    + `const r=await fetch(u);if(!r.ok)throw new Error("API HTTP "+r.status);`
+    + `const j=await r.json();`                                     // enveloppe stable {ok,resultat,erreur}
+    + `if(j&&j.ok===false)throw new Error(j.erreur||"erreur de l'outil");`
+    + `return (j&&Object.prototype.hasOwnProperty.call(j,"resultat"))?j.resultat:j;};</scr`+`ipt>`;
+}
+function rendreEcran(titre, html){
+  const f = $("#frame"); f.srcdoc = pontAPI() + (html || ""); f.style.display = "block";
+  $("#ecran-titre").textContent = titre || "";
+  $("#placeholder").style.display = "none";
+}
+function clearEcran(){
+  const f = $("#frame"); f.srcdoc = ""; f.style.display = "none";
+  $("#ecran-titre").textContent = "";
+  $("#placeholder").style.display = "flex";
+}
+
+// ── Galerie de pages (l'app accumule des vues persistantes) ──────────────────
+let pagesSession = [];   // {titre, fichier, html?} — html chargé paresseusement
+function rebuildTabs(){
+  const box = $("#pages"); box.innerHTML = "";
+  pagesSession.forEach((pg, i) => {
+    const t = document.createElement("div"); t.className = "tab";
+    t.textContent = pg.titre || ("page " + (i+1));
+    t.onclick = () => ouvrirPage(i);
+    box.appendChild(t);
+  });
+}
+// Affiche la page i : utilise le HTML déjà en mémoire (page produite dans ce
+// tour) ou le récupère du serveur (session rechargée) — jamais toute la galerie.
+async function ouvrirPage(i){
+  const pg = pagesSession[i]; if(!pg) return;
+  activerOnglet(i);
+  if(pg.html){ rendreEcran(pg.titre, pg.html); return; }
+  $("#ecran-titre").textContent = (pg.titre || "") + " — chargement…";
+  try{
+    const r = await fetch(`/api/pages/${session}/${encodeURIComponent(pg.fichier)}`);
+    if(!r.ok) throw new Error("HTTP " + r.status);
+    pg.html = (await r.json()).html;          // mémorisé pour les clics suivants
+    rendreEcran(pg.titre, pg.html);
+  }catch(e){
+    $("#ecran-titre").textContent = (pg.titre || "") + " — page introuvable";
+  }
+}
+function activerOnglet(i){ [...$("#pages").children].forEach((t, j) => t.classList.toggle("active", j===i)); }
+
+// ── Trace vivante de l'essaim (arbre reconstruit via parent_id) ──────────────
+let profondeur = {};
+function resetTrace(){ profondeur = {}; $("#tr-lignes").innerHTML = ""; }
+function traceLigne(te){
+  const d = (te.parent_id != null && (te.parent_id in profondeur)) ? profondeur[te.parent_id] + 1 : 0;
+  profondeur[te.span_id] = d;
+  const p = te.payload || {}; let cls = "", txt = null;
+  if(te.type==="run_start"){ cls="run"; txt=`▸ run <b>${escapeHtml(p.model||"")}</b> · ${p.tool_count||0} outils`; }
+  else if(te.type==="run_end"){ cls="done"; txt=`■ run ${escapeHtml(p.status||"")} — ${p.steps||0} tours`; }
+  else if(te.type==="llm_request"){ txt=`· llm → (étape ${p.step??"?"})`; }
+  else if(te.type==="llm_response"){ txt=`· llm ← ${p.tool_call_count||0} appel(s) d'outil`; }
+  else if(te.type==="tool_call_start"){ cls="tool"; txt=`⚙ <b>${escapeHtml(p.name||"")}</b>(…)`; }
+  else if(te.type==="tool_call_end"){ cls="tool"+(p.status==="error"?" err":""); txt=`${p.status==="error"?"✗":"✓"} ${escapeHtml(p.name||"")} · ${p.duration_ms||0}ms`; }
+  if(txt===null) return;
+  const box = $("#tr-lignes"); if(!box) return;
+  const el = document.createElement("div"); el.className = "tr " + cls;
+  el.style.paddingLeft = (6 + d*16) + "px"; el.innerHTML = txt;
+  box.appendChild(el); box.scrollTop = 1e9;
+}
+function act(txt, cls=""){ const box = $("#tr-lignes"); if(!box) return;
+  const a = document.createElement("div"); a.className = "tr " + cls;
+  a.innerHTML = txt; box.appendChild(a); box.scrollTop = 1e9; }
+
+// ── Chat + SSE (via fetch streaming) ─────────────────────────────────────────
+function bulle(role, texte){
+  const empty = $("#msgs .empty"); if(empty) empty.remove();
+  const b = document.createElement("div");
+  b.className = "bubble " + role; b.textContent = texte;
+  $("#msgs").appendChild(b); scrollBas(); return b;
+}
+function scrollBas(){ const m=$("#msgs"); m.scrollTop = m.scrollHeight; }
+
+// Lit un flux SSE (chat OU approve) et met à jour la bulle assistant `b`.
+async function lireFlux(resp, b){
+  const reader = resp.body.getReader(); const dec = new TextDecoder(); let buf = "", acc = "";
+  while(true){
+    const {value, done} = await reader.read(); if(done) break;
+    buf += dec.decode(value, {stream:true});
+    const frames = buf.split("\n\n"); buf = frames.pop();     // dernier = incomplet
+    for(const f of frames){
+      const ev = /event: (.*)/.exec(f), da = /data: (.*)/.exec(f);
+      if(!ev||!da) continue;
+      const type = ev[1].trim(), data = JSON.parse(da[1]);
+      if(type==="session"){ session = data.session_id; }
+      else if(type==="text"){ acc += data.delta; b.innerHTML = escapeHtml(acc)+'<span class="cursor"></span>'; scrollBas(); }
+      else if(type==="trace"){ traceLigne(data); }
+      else if(type==="tool"){ /* détaillé par la trace ; rien ici */ }
+      else if(type==="render"){ rendreEcran(data.titre, data.html);
+        pagesSession.push({titre:data.titre, fichier:data.fichier||"", html:data.html});
+        rebuildTabs(); activerOnglet(pagesSession.length-1);
+        act(`🖥 écran rendu : <b>${escapeHtml(data.titre||"")}</b>`, "done"); }
+      else if(type==="approval"){ carteApprobation(data); act(`⏸ validation requise : ${escapeHtml(data.outil||"")}`, "tool"); }
+      else if(type==="done"){ b.innerHTML = escapeHtml(acc || data.output); }
+      else if(type==="error"){ b.innerHTML = escapeHtml(acc)+`<br><span style="color:#f87171">⚠ ${escapeHtml(data.error)}</span>`; act("✗ "+escapeHtml(data.error), "tool err"); }
+    }
+  }
+  return acc;
+}
+
+async function envoyer(){
+  const input = $("#input"); const texte = input.value.trim();
+  if(!texte || streaming) return;
+  input.value=""; input.style.height="auto";
+  bulle("user", texte);
+  const b = bulle("assistant", ""); b.innerHTML = '<span class="cursor"></span>';
+  streaming = true; $("#send").disabled = true; resetTrace();
+  try{
+    const resp = await fetch("/api/chat", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({session_id: session, message: texte})});
+    await lireFlux(resp, b);
+  }catch(e){ b.innerHTML += `<br><span style="color:#f87171">⚠ ${escapeHtml(String(e))}</span>`; }
+  finally{ streaming = false; $("#send").disabled = false; chargerListe(); input.focus(); }
+}
+
+// ── Gate d'approbation : carte Autoriser / Refuser dans le chat ──────────────
+function carteApprobation(info){
+  const card = document.createElement("div");
+  card.className = "approval";
+  card.innerHTML =
+    `<div class="ap-h">⏸ L'agent veut créer un outil</div>
+     <div class="ap-b"><b>${escapeHtml(info.tool_name||"")}</b><br>${escapeHtml(info.capability||"")}</div>
+     <div class="ap-a"><button class="ap-ok">✓ Autoriser</button><button class="ap-no">✗ Refuser</button></div>`;
+  $("#msgs").appendChild(card); scrollBas();
+  const fin = () => card.querySelectorAll("button").forEach(x=>x.disabled=true);
+  card.querySelector(".ap-ok").onclick = () => { fin(); decider(info.call_id, "allow"); };
+  card.querySelector(".ap-no").onclick = () => { fin(); decider(info.call_id, "deny"); };
+}
+async function decider(call_id, decision){
+  const b = bulle("assistant", ""); b.innerHTML = '<span class="cursor"></span>';
+  streaming = true; $("#send").disabled = true;
+  try{
+    const resp = await fetch("/api/approve", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({session_id: session, call_id, decision})});
+    await lireFlux(resp, b);
+  }catch(e){ b.innerHTML += `<br><span style="color:#f87171">⚠ ${escapeHtml(String(e))}</span>`; }
+  finally{ streaming = false; $("#send").disabled = false; chargerListe(); input.focus(); }
+}
+$("#send").onclick = envoyer;
+$("#input").addEventListener("keydown", e => { if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); envoyer(); } });
+$("#input").addEventListener("input", e => { e.target.style.height="auto"; e.target.style.height=Math.min(e.target.scrollHeight,120)+"px"; });
+
+function escapeHtml(s){ return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+
+// ── Démarrage ────────────────────────────────────────────────────────────────
+(async function(){
+  const h = await (await fetch("/api/health")).json();
+  const badge = $("#mode"); badge.classList.add(h.reel ? "reel" : "factice");
+  badge.title = h.reel ? `Provider ${h.provider} · modèle ${h.modele}` : "Aucune clé — provider factice hors-ligne";
+  $("#mode-txt").textContent = h.reel ? `${h.provider} · ${h.modele}` : "démo hors-ligne (factice)";
+  chargerListe();
+})();
+</script>
+</body>
+</html>
