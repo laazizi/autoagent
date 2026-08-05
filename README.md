@@ -7,9 +7,9 @@
 **A minimal, auditable LLM agent core for Python. Not a framework.**
 
 `autoagent` is a small library that gives you the agent loop — LLM ↔ tools, done right —
-and the safety rails around it, without pulling in a framework's worldview. You can read
-the entire core in an hour, and every boundary your agent has is **Python code you wrote**,
-not a prompt you hope it respects.
+and the safety rails around it, without pulling in a framework's worldview. The loop lives
+in one file you can read end to end, and every boundary your agent has is **Python code you
+wrote**, not a prompt you hope it respects.
 
 ```python
 from autoagent import Agent
@@ -55,8 +55,9 @@ someone else's abstraction stack instead of your own code.
 
 `autoagent`'s theses:
 
-1. **The agent must be readable.** The core loop is a few hundred lines of plain Python.
-   No metaclasses, no callbacks-on-callbacks, no YAML.
+1. **The agent must be readable.** One loop, in one file — plain Python, no metaclasses,
+   no callbacks-on-callbacks, no YAML. You can follow a run from prompt to tool call to
+   answer without leaving `agent.py`.
 2. **Bounding is code, not prompts.** File access goes through `ProjectWorkspace`
    (allowlists, anti path-traversal, write history + rollback). Generated tools run in a
    **sandbox** (Docker isolation when available, hardened AST denylist otherwise) and are
@@ -421,7 +422,7 @@ excellent at what they do:
 
 | | **autoagent** | LangChain / LangGraph | CrewAI | AutoGen | OpenAI Agents SDK | smolagents |
 |---|---|---|---|---|---|---|
-| **Core size** | ~6k LOC total, core loop readable in an hour | very large | large | large | medium | small |
+| **Core size** | ~9.8k LOC total, the loop itself in one file you can read in a sitting | very large | large | large | medium | small |
 | **Core dependencies** | **0** (stdlib) + `jsonschema` | many | many | many | `openai` sdk | `huggingface_hub` etc. |
 | **Providers** | OpenAI, Anthropic, DeepSeek, Gemini — raw wire, no SDKs | very many (via integrations) | via LiteLLM | via extensions | OpenAI-first | via LiteLLM |
 | **Control flow** | your Python (`run` / `run_messages` / `Orchestrator` for host-driven flows) | graphs/chains DSL | role/crew abstraction | multi-agent conversation | handoffs | code-as-actions |

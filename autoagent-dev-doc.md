@@ -54,7 +54,7 @@
 
 `autoagent` est un **noyau d'agent** Python — pas un framework. Sa thèse :
 
-- **L'agent doit être lisible** : tu peux lire toute la lib en une heure (~800 LOC)
+- **L'agent doit être lisible** : ~9,8k lignes au total, mais la boucle tient dans un seul fichier (`agent.py`) — auditable de bout en bout, sans indirection
 - **Le bornement est du code Python, pas du prompt** : `ProjectWorkspace` + permissions + AST + sandbox
 - **Zéro dépendance** pour le cœur : Python ≥3.10 + `urllib` + `dataclasses`
 - **Multi-provider** sans abstractions inutiles : un `Provider` = une méthode `complete(LLMRequest)`
@@ -165,7 +165,7 @@ print(len(result.messages))  # historique complet
 python examples/demo_autoagent.py        # 3 agents + workspace borné, 55 lignes
 python examples/demo_pure_python.py      # LA MÊME chose sans la lib : 164 lignes
 
-# Les 17 démos thématiques (une facette chacune — voir leur README) :
+# Les 21 démos thématiques (une facette chacune — voir leur README) :
 python examples_autoagent/01_hello_tools.py
 python examples_autoagent/17_memoire_factuelle.py
 ```
