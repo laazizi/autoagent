@@ -414,6 +414,8 @@ const DEFS = {
       {k:"budget",l:"token_budget", kind:"number", def:"", w:"third", hint:"vide = illimité"},
       {k:"cap_res",l:"max_tool_result_chars", kind:"number", def:"", w:"third", hint:"borne UN résultat d'outil (vide = pas de borne)"},
       {k:"cap_rep",l:"max_repeated_tool_calls", kind:"number", def:"", w:"third", hint:"refuse le N+1e appel identique (vide = off)"},
+      {k:"trifecta",l:"trifecta_guard", kind:"select", opts:["deny","approve","off"], def:"deny", w:"third", hint:"sortie bloquée si le run est teinté"},
+      {k:"tsearch",l:"tool_search (divulgation progressive)", kind:"check", def:false},
       {k:"parallel", l:"parallel_tool_calls (outils I/O en parallèle)", kind:"check", def:false},
       {k:"baseurl", l:"base_url (provider avancé)", kind:"text", def:"", w:"half", hint:"ex. api.moonshot.ai/v1 (Kimi), localhost:11434/v1 (Ollama)"},
       {k:"keyenv",  l:"api_key_env (nom de var d'env)", kind:"text", def:"", w:"half", hint:"vide = auto"},
@@ -430,6 +432,8 @@ const DEFS = {
       {k:"doc",   l:"docstring (vue par le modèle)", kind:"text", def:"Compte les occurrences d'un mot (un LLM ne sait pas compter)."},
       {k:"body",  l:"corps", kind:"textarea", def:"return texte.lower().count(mot.lower())"},
       {k:"share", l:"donner aussi aux sous-agents", kind:"check", def:false},
+      {k:"untrusted", l:"sortie NON FIABLE (web, e-mail) → teinte le run", kind:"check", def:false},
+      {k:"egress", l:"peut faire SORTIR de l'information (mail, HTTP)", kind:"check", def:false},
     ],
   },
   workspace: {
@@ -493,6 +497,8 @@ const DEFS = {
       {k:"path", l:"fichier de faits (FactMemory)", kind:"text", def:"faits_agent.json", hint:"JSON lisible, 1 par identité"},
       {k:"recall", l:"donner l'outil recall à l'agent", kind:"check", def:true},
       {k:"remember", l:"donner l'outil remember (FactMemory)", kind:"check", def:true},
+      {k:"rmode", l:"recall_mode (FactMemory)", kind:"select", opts:["hybrid","lexical","semantic"], def:"hybrid", w:"half", hint:"hybride = BM25 + cosinus fusionnés (RRF)"},
+      {k:"forget", l:"donner l'outil forget (FactMemory, dry-run)", kind:"check", def:false},
     ],
   },
   trace: {
@@ -781,7 +787,13 @@ function generate(){
         L.push(`# Mémoire FACTUELLE : faits atomiques tenus À JOUR (add/update/delete) —`);
         L.push(`# une contradiction REMPLACE le fait périmé. JSON lisible par identité.`);
         L.push(`resumeur = create_provider(ModelConfig(${pyStr(a.prov)}, ${pyStr(a.model)}))`);
-        L.push(`memoire = FactMemory(resumeur, path=${pyStr(mem.f.path||"faits_agent.json")}, max_messages=${num(mem.f.maxm,40)}, keep_recent=${num(mem.f.keep,12)})`);
+        {
+          const margs = [`path=${pyStr(mem.f.path||"faits_agent.json")}`,
+                         `max_messages=${num(mem.f.maxm,40)}`,
+                         `keep_recent=${num(mem.f.keep,12)}`];
+          if(mem.f.rmode && mem.f.rmode!=="hybrid") margs.push(`recall_mode=${pyStr(mem.f.rmode)}`);
+          L.push(`memoire = FactMemory(resumeur, ${margs.join(", ")})`);
+        }
       }else{
         L.push(`# La mémoire résume les vieux tours (un LLM, moins cher, s'en charge).`);
         L.push(`resumeur = create_provider(ModelConfig(${pyStr(a.prov)}, ${pyStr(a.model)}))`);
@@ -840,6 +852,7 @@ function generate(){
     if(a.budget!=="" && a.budget!=null) kwTail.push(`token_budget=${num(a.budget,0)}`);
     if(a.cap_res!=="" && a.cap_res!=null) kwTail.push(`max_tool_result_chars=${num(a.cap_res,0)}`);
     if(a.cap_rep!=="" && a.cap_rep!=null) kwTail.push(`max_repeated_tool_calls=${num(a.cap_rep,0)}`);
+    if(a.trifecta && a.trifecta!=="deny") kwTail.push(`trifecta_guard=${pyStr(a.trifecta)}`);
     if(a.parallel) kwTail.push(`parallel_tool_calls=True`);
     if(dyn) kwTail.push(`max_dynamic_tools_per_run=${num(dyn.f.maxrun,3)}`);
     if(hasTrace) kwTail.push(`trace=trace`);
@@ -871,6 +884,11 @@ function generate(){
     }
     if(mem && mem.f.kind==="FactMemory" && mem.f.remember){
       L.push(`${av}.register_remember_tool()   # l'agent mémorise volontairement (tracé)`);
+    }
+    if(mem && mem.f.kind==="FactMemory" && mem.f.forget){
+      L.push(`# Oubli en langue naturelle. confirm=True (défaut) = DRY RUN : l'outil`);
+      L.push(`# dit ce qui SERAIT supprimé, c'est l'hôte qui confirme.`);
+      L.push(`${av}.register_forget_tool()`);
       L.push(``);
     }
     if(dyn){
@@ -892,10 +910,20 @@ function generate(){
     }
     // outils propres à l'agent principal (@decorator)
     for(const t of ownTools){
-      L.push(`@${av}.tool`);
+      const flags = [];
+      if(t.f.untrusted) flags.push("untrusted=True");
+      if(t.f.egress) flags.push("egress=True");
+      L.push(flags.length ? `@${av}.tool(${flags.join(", ")})` : `@${av}.tool`);
       L.push(`def ${(t.f.fname||"outil").trim()}(${t.f.params||""}) -> ${t.f.ret||"dict"}:`);
       if(t.f.doc) L.push(`    ${pyTriDoc(t.f.doc)}`);
       L.push(indentBody(t.f.body, "    "));
+      L.push(``);
+    }
+    // divulgation progressive des schémas d'outils (0.18)
+    if(agentB && agentB.f.tsearch){
+      L.push(`# Divulgation progressive : au-delà du seuil, on n'envoie que find_tools`);
+      L.push(`# + les schémas déjà révélés. tool_policy/taint voient TOUJOURS tout.`);
+      L.push(`${av}.enable_tool_search(threshold=15)`);
       L.push(``);
     }
     // outils du workspace (écriture + lecture / liste / remplacement / annulation)
