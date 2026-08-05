@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
+import re
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -166,6 +168,7 @@ class ToolPolicyContext:
     messages: list[Message]
     context: dict[str, Any]
     tainted: bool = False
+    egress: bool = False
 
 
 # None = allow. A str = deny with that reason (the model sees it as a tool
@@ -210,9 +213,127 @@ PostTurnHook = Callable[["AgentTurnContext"], "Message | None"]
 # compaction mémoire qui effacerait le marqueur (trou de la 0.15).
 
 
-def _tool_message(call: ToolCall, tool_result: Any, *, untrusted: bool = False) -> Message:
-    """The transcript message carrying one tool result back to the LLM."""
+_TRUNCATION_NOTE = (
+    "\n[TRUNCATED — {omitted} of {total} characters omitted in the middle. "
+    "Narrow your query, filter, or request one portion at a time.]\n"
+)
+
+
+def _truncate_tool_result(content: str, max_chars: int) -> tuple[str, bool]:
+    """Bound ONE tool result to ``max_chars``, keeping the head and the tail.
+
+    Middle-out on purpose: the head carries the shape of the payload (keys,
+    headers, first rows) and the tail carries what a truncated read would
+    otherwise hide (totals, error trailers, "next page" cursors).
+
+    The marker counts against the budget — a bound that can be exceeded is
+    not a bound. Returns ``(content, truncated?)``.
+    """
+    total = len(content)
+    if max_chars <= 0 or total <= max_chars:
+        return content, total > max_chars
+    note = _TRUNCATION_NOTE.format(omitted=total - max_chars, total=total)
+    budget = max_chars - len(note)
+    if budget <= 0:  # budget smaller than the marker itself: hard cut, no marker
+        return content[:max_chars], True
+    head = budget - budget // 3
+    tail = budget - head
+    # Recompute the omitted count now that head/tail are known, then re-fit:
+    # the note's own length shifts by a few digits, so keep the total bounded
+    # by trimming the head rather than letting the marker push us over.
+    note = _TRUNCATION_NOTE.format(omitted=total - head - tail, total=total)
+    head = max(0, max_chars - len(note) - tail)
+    out = content[:head] + note + (content[-tail:] if tail else "")
+    return out[:max_chars], True
+
+
+def _call_signature(call: ToolCall) -> str:
+    """Identity of a tool call for repetition detection: name + sorted arguments.
+
+    Sorted keys so the same call written in a different key order counts as the
+    same call. A plain string (not a hash) keeps traces debuggable.
+    """
+    try:
+        args = json.dumps(call.arguments or {}, sort_keys=True, ensure_ascii=False, default=repr)
+    except (TypeError, ValueError):  # pragma: no cover — arguments are JSON from the wire
+        args = repr(call.arguments)
+    return f"{call.name}({args})"
+
+
+def _count_call_signatures(messages: Sequence[Message]) -> dict[str, int]:
+    """How many times each call signature was already REQUESTED in this run."""
+    counts: dict[str, int] = {}
+    for message in messages:
+        for call in message.tool_calls or ():
+            signature = _call_signature(call)
+            counts[signature] = counts.get(signature, 0) + 1
+    return counts
+
+
+_FIND_TOOLS_NAME = "find_tools"
+
+
+def _find_tools_spec() -> ToolSpec:
+    """Meta-tool of progressive disclosure (see ``Agent.enable_tool_search``)."""
+    return ToolSpec(
+        name=_FIND_TOOLS_NAME,
+        description=(
+            "Search the tools available to you by keyword when the tool you need is "
+            "not already listed. Returns matching tool names and descriptions; their "
+            "full schemas then become available so you can call them directly."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "What you are trying to do, or a tool name "
+                                   "(e.g. 'read a file', 'send email').",
+                }
+            },
+            "required": ["query"],
+        },
+    )
+
+
+def _words(text: str) -> set[str]:
+    """Words of 3+ characters, lowercased — the unit of the lexical match."""
+    return {w for w in re.split(r"[^a-z0-9]+", (text or "").lower()) if len(w) >= 3}
+
+
+def _score_tools(query: str, specs: Sequence[ToolSpec]) -> list[ToolSpec]:
+    """Rank specs by word overlap with the query: name hits count double.
+
+    Lexical on purpose — zero dependency, deterministic, and debuggable. Hosts
+    that want semantic search can pre-filter the registry themselves.
+    """
+    terms = _words(query)
+    if not terms:
+        return []
+    scored: list[tuple[int, int, ToolSpec]] = []
+    for index, spec in enumerate(specs):
+        name_words = _words(spec.name)
+        desc_words = _words(spec.description)
+        score = 2 * len(terms & name_words) + len(terms & desc_words)
+        # A query naming the tool outright ("use read_file") must always win.
+        if spec.name.lower() in (query or "").lower():
+            score += 5
+        if score:
+            scored.append((-score, index, spec))  # index keeps ties stable
+    scored.sort()
+    return [spec for _, _, spec in scored]
+
+
+def _tool_message(call: ToolCall, tool_result: Any, *, untrusted: bool = False,
+                  max_chars: int | None = None) -> Message:
+    """The transcript message carrying one tool result back to the LLM.
+
+    ``max_chars`` bounds the RESULT (before the untrusted framing, which is a
+    fixed-size safety marker and must never be cut).
+    """
     content = tool_result.to_message_content()
+    if max_chars is not None:
+        content, _ = _truncate_tool_result(content, max_chars)
     if untrusted:
         content = f"{UNTRUSTED_OPEN}\n{content}\n{UNTRUSTED_CLOSE}"
     return Message(
@@ -297,6 +418,30 @@ class Agent:
             approval-gate case. A policy that itself crashes DENIES the
             call (fail-closed: this is a security boundary, unlike
             trace/checkpoint callbacks which fail-open).
+        max_tool_result_chars: Optional CODE-LEVEL bound on how much of
+            ONE tool result enters the transcript (0.18.0). ``None``
+            (default) keeps the historical behaviour: whatever the tool
+            returns is injected verbatim. Set it and an oversized result
+            is truncated MIDDLE-OUT (head + tail kept) with an explicit
+            marker telling the model what happened, so it can narrow its
+            query instead of silently working on a cut payload. Bounding
+            is code: a single unbounded tool (an HTTP fetch, a wide SQL
+            SELECT) otherwise blows the context window, burns the
+            ``token_budget``, and degrades attention. The bound covers
+            the result only — the untrusted framing markers are never
+            cut. See also ``ProjectWorkspace(max_read_chars=...)``, which
+            bounds workspace reads specifically.
+        max_repeated_tool_calls: Optional loop guard (0.18.0). ``None``
+            (default) keeps the historical behaviour. Set to N and the
+            (N+1)-th IDENTICAL call — same tool, same arguments — is not
+            executed: the model receives a deterministic ``RepeatedCall``
+            tool error on the same channel a policy denial uses, so it
+            re-plans instead of burning the budget. Two things this buys
+            beyond ``max_steps``: the side effect stops repeating (an
+            HTTP POST, an e-mail, a sub-agent run), and the trace names
+            the failure (``loop_guard_block``) instead of ending on a
+            mute ``max_steps``. Counted from the transcript, so it
+            survives checkpoint/resume.
     """
 
     def __init__(
@@ -316,6 +461,9 @@ class Agent:
         parallel_tool_calls: bool = False,
         token_budget: int | None = None,
         tool_policy: ToolPolicy | None = None,
+        max_tool_result_chars: int | None = None,
+        max_repeated_tool_calls: int | None = None,
+        trifecta_guard: str = "deny",
     ) -> None:
         self.provider = provider
         self.registry = registry or ToolRegistry()
@@ -331,8 +479,18 @@ class Agent:
         self.parallel_tool_calls = parallel_tool_calls
         self.token_budget = token_budget
         self.tool_policy = tool_policy
+        self.max_tool_result_chars = max_tool_result_chars
+        self.max_repeated_tool_calls = max_repeated_tool_calls
+        self.trifecta_guard = trifecta_guard
         self.dynamic_builder: DynamicToolBuilder | None = None
         self._dynamic_tools_built_this_run = 0
+        # Divulgation progressive (opt-in via enable_tool_search) : désactivée,
+        # donc `_visible_specs` renvoie tout — comportement historique.
+        self._tool_search = False
+        self._tool_search_threshold = 15
+        self._tool_search_always: set[str] = set()
+        self._tool_search_max_results = 5
+        self._revealed_tools: set[str] = set()
 
     @classmethod
     def from_model(
@@ -356,6 +514,7 @@ class Agent:
         input_schema: dict[str, Any] | None = None,
         permissions: list[str] | None = None,
         untrusted: bool = False,
+        egress: bool = False,
     ):
         return self.registry.register(
             func,
@@ -364,10 +523,94 @@ class Agent:
             input_schema=input_schema,
             permissions=permissions,
             untrusted=untrusted,
+            egress=egress,
         )
 
     def add_tool(self, func: Callable[..., Any]) -> Callable[..., Any]:
         return self.registry.add_function(func)
+
+    def enable_tool_search(
+        self,
+        *,
+        threshold: int = 15,
+        always: Sequence[str] = (),
+        max_results: int = 5,
+    ) -> None:
+        """Progressive disclosure of tool SCHEMAS — opt-in (0.18.0).
+
+        Every request normally carries the full schema of every registered
+        tool. Mount two MCP servers and that prefix alone can dominate the
+        request: schemas are re-sent at EVERY step of EVERY run, and a model
+        given 100 tools also picks worse than one given 6. The industry
+        converged on the same fix in 2026 (Anthropic's tool-search tool,
+        code-execution-with-MCP, Cloudflare's code mode): stop shipping
+        schemas the model has not asked for.
+
+        With this enabled, a run that has more than ``threshold`` tools sends
+        only a ``find_tools`` meta-tool plus the schemas of the tools already
+        revealed (and those named in ``always``). ``find_tools(query)`` returns
+        matching names + descriptions — a cheap catalogue, no schemas — and
+        reveals them for the remainder of the run, so the very next step can
+        call them.
+
+        Deliberately lexical (stdlib only, no embeddings): scoring is a word
+        overlap on names and descriptions. A query that matches nothing returns
+        the bare catalogue of names rather than an empty result, so the model
+        can never be cornered.
+
+        Under the threshold nothing changes — no meta-tool, no filtering, same
+        bytes on the wire as before. Revealed tools are re-derived from the
+        transcript at the start of each run, so ``resume`` after an approval
+        pause keeps the tools the model had already loaded.
+
+        Args:
+            threshold: Send everything while the registry holds at most this
+                many tools (the meta-tool itself is not counted).
+            always: Tool names that stay visible without being searched for —
+                the handful an agent needs on every task.
+            max_results: How many matches ``find_tools`` returns at once.
+        """
+        self._tool_search = True
+        self._tool_search_threshold = threshold
+        self._tool_search_always = set(always)
+        self._tool_search_max_results = max_results
+
+        def find_tools(query: str) -> dict[str, Any]:
+            catalogue = [s for s in self.registry.specs() if s.name != _FIND_TOOLS_NAME]
+            matches = _score_tools(query, catalogue)[: self._tool_search_max_results]
+            if not matches:
+                # Never corner the model: hand back the bare list of names.
+                return {
+                    "matches": [],
+                    "available": sorted(s.name for s in catalogue),
+                    "hint": "No name/description matched. Pick one from `available` "
+                            "and search for it by name.",
+                }
+            self._revealed_tools.update(s.name for s in matches)
+            return {
+                "matches": [{"name": s.name, "description": s.description} for s in matches],
+                "hint": "Their full schemas are now available — call them directly.",
+            }
+
+        self.registry.replace(spec=_find_tools_spec(), handler=find_tools)
+
+    def _visible_specs(self) -> list[ToolSpec]:
+        """Specs to advertise on the NEXT request (progressive disclosure).
+
+        Returns every spec unless tool search is enabled AND the registry is
+        above the threshold. `tool_policy`, taint lookups and execution always
+        see the FULL registry — visibility bounds what the model is offered,
+        never what the host can govern.
+        """
+        specs = self.registry.specs()
+        if not self._tool_search:
+            return specs
+        catalogue = [s for s in specs if s.name != _FIND_TOOLS_NAME]
+        if len(catalogue) <= self._tool_search_threshold:
+            return [s for s in specs if s.name != _FIND_TOOLS_NAME]
+        keep = self._revealed_tools | self._tool_search_always
+        visible = [s for s in specs if s.name == _FIND_TOOLS_NAME or s.name in keep]
+        return visible
 
     def enable_dynamic_tools(self, builder: DynamicToolBuilder) -> None:
         self.dynamic_builder = builder
@@ -551,6 +794,72 @@ class Agent:
                 },
             ),
             handler=_remember,
+        )
+
+    def register_forget_tool(
+        self,
+        *,
+        name: str = "forget",
+        description: str | None = None,
+        confirm: bool = True,
+    ) -> None:
+        """Register a ``forget`` tool wrapping ``memory.forget_matching`` (0.18.0).
+
+        The third side of memory: ``recall`` reads, ``remember`` writes, this one
+        ERASES — in natural language (« oublie tout ce qui concerne mon ancien
+        employeur »). No-op unless the configured memory exposes
+        ``forget_matching``.
+
+        ``confirm=True`` (default) makes the tool a DRY RUN: it reports what would
+        be erased and erases nothing. Deleting a user's data on a model's decision
+        alone is not something a library should default to — the host wires the
+        second step (a UI confirmation, or an `apply=True` policy) once it has
+        shown the list to a human. Set ``confirm=False`` for an agent explicitly
+        trusted to erase.
+        """
+        if self.memory is None or not hasattr(self.memory, "forget_matching"):
+            return
+
+        agent_self = self
+        described = description or (
+            "Erase durable memories matching an instruction in plain language "
+            "(e.g. 'forget everything about my previous employer'). "
+            + ("Returns what WOULD be erased; a human confirms before anything is "
+               "deleted." if confirm else "Erases immediately — use with care.")
+        )
+
+        def _forget(instruction: str) -> dict[str, Any]:
+            mem = agent_self.memory
+            if mem is None or not hasattr(mem, "forget_matching"):
+                return {"erased": False, "error": "No fact-capable memory is attached."}
+            try:
+                touched = mem.forget_matching(instruction, dry_run=confirm)
+            except Exception as exc:
+                return {"erased": False, "error": f"{type(exc).__name__}: {exc}"}
+            return {
+                "erased": not confirm and bool(touched),
+                "pending_confirmation": confirm and bool(touched),
+                "facts": [{"id": f["id"], "fact": f["fact"]} for f in touched],
+                "count": len(touched),
+            }
+
+        self.registry.replace(
+            ToolSpec(
+                name=name,
+                description=described,
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "instruction": {
+                            "type": "string",
+                            "description": "What to forget, in plain language.",
+                        },
+                    },
+                    "required": ["instruction"],
+                    "additionalProperties": False,
+                },
+            ),
+            handler=_forget,
         )
 
     def as_tool(
@@ -886,6 +1195,17 @@ class Agent:
             except Exception:
                 _log.exception("memory.compact raised; using messages unchanged")
         self._dynamic_tools_built_this_run = 0
+        # Divulgation progressive : les outils déjà révélés sont RE-DÉRIVÉS du
+        # transcript, pas gardés en mémoire d'instance. Un `resume` après une
+        # pause d'approbation retrouve donc ce que le modèle avait chargé, sans
+        # nouveau champ dans RunState.
+        if self._tool_search:
+            self._revealed_tools = {
+                call.name
+                for m in working_messages
+                for call in (m.tool_calls or [])
+                if call.name != _FIND_TOOLS_NAME
+            }
         corrections = resume_from.corrections if resume_from else 0
         turn_start = resume_from.turn_start if resume_from else len(working_messages)
         spent_in = resume_from.input_tokens if resume_from else 0
@@ -948,6 +1268,7 @@ class Agent:
                     call=call, spec=spec, step=step,
                     messages=working_messages, context=context or {},
                     tainted=tainted,
+                    egress=bool(spec is not None and spec.egress),
                 )
                 try:
                     verdict = self.tool_policy(policy_ctx)
@@ -984,11 +1305,115 @@ class Agent:
                 )
             return overrides
 
+        def _loop_guard_overrides(
+            calls: list[ToolCall], step: int, req_span: str | None
+        ) -> dict[str, ToolResult]:
+            """Refuse a tool call the model has already made IDENTICALLY N times.
+
+            An agent that re-issues the same (name, arguments) call in a loop
+            burns `max_steps` and the whole `token_budget` at full price, and
+            re-runs side effects each time. `max_steps` bounds the damage but
+            does not diagnose it. Here the repetition is CODE-detected and the
+            model gets a deterministic refusal on the SAME channel a policy
+            denial uses — the re-planning path that already works — instead of
+            a prompt begging it to stop.
+
+            Counted from the transcript (like taint and revealed tools), so the
+            count survives checkpoint/resume with no extra RunState field.
+            """
+            overrides: dict[str, ToolResult] = {}
+            if self.max_repeated_tool_calls is None:
+                return overrides
+            # (garde anti-boucle ci-dessous ; la garde trifecta a sa propre passe)
+            # NB: l'appel COURANT est déjà dans le transcript (le message assistant
+            # est ajouté avant l'exécution) — `seen` compte donc les demandes
+            # jusqu'ici INCLUSE. On bloque au-delà du plafond, pas à l'atteinte,
+            # sinon `max_repeated_tool_calls=1` refuserait le PREMIER appel.
+            already = _count_call_signatures(working_messages)
+            for call in calls:
+                signature = _call_signature(call)
+                seen = already.get(signature, 0)
+                if seen <= self.max_repeated_tool_calls:
+                    continue
+                overrides[call.id] = ToolResult(
+                    ok=False,
+                    error=(
+                        f"RepeatedCall: you already called `{call.name}` with these exact "
+                        f"arguments {self.max_repeated_tool_calls} times and it was not run "
+                        f"again. Change the arguments, use a different tool, or stop and "
+                        f"report what you have."
+                    ),
+                )
+                self._emit(
+                    "loop_guard_block",
+                    {"step": step, "name": call.name, "call_id": call.id, "repeats": seen},
+                    parent_id=req_span,
+                )
+            return overrides
+
+        def _trifecta_overrides(
+            calls: list[ToolCall], step: int, req_span: str | None
+        ) -> dict[str, ToolResult]:
+            """Block an EGRESS tool once the run has ingested untrusted content.
+
+            The lethal trifecta made concrete: private data + untrusted content +
+            a way out = exfiltration by indirect injection, with no software
+            vulnerability involved. The library already instrumented the first two
+            legs (`untrusted=True`, network-less sandbox); this closes the third
+            so a host that forgets the rule is not exfiltrable by default.
+
+            Fires only for tools the host explicitly marked ``egress=True`` — no
+            existing code has that flag, so the default ``"deny"`` cannot change
+            the behaviour of an already-deployed agent.
+            """
+            overrides: dict[str, ToolResult] = {}
+            if self.trifecta_guard == "off":
+                return overrides
+            if not (taint[0] or is_tainted(working_messages)):
+                return overrides                      # rien d'externe n'est entré
+            for call in calls:
+                if not self._is_egress(call):
+                    continue
+                if self.trifecta_guard == "approve":
+                    pause = ApprovalRequired(
+                        f"egress tool `{call.name}` requested after untrusted content "
+                        f"entered the run (lethal trifecta) — human approval required"
+                    )
+                    pause.state = _snapshot(step)     # aucun outil du tour n'a tourné
+                    pause.calls = list(calls)
+                    self._emit(
+                        "trifecta_approval_required",
+                        {"step": step, "name": call.name, "call_id": call.id},
+                        parent_id=req_span,
+                    )
+                    raise pause
+                overrides[call.id] = ToolResult(
+                    ok=False,
+                    error=(
+                        f"EgressBlocked: `{call.name}` can send data out of the system and "
+                        f"this run has already ingested untrusted external content. The "
+                        f"call was refused by policy, not by the model. Summarise your "
+                        f"finding to the user instead of transmitting it."
+                    ),
+                )
+                self._emit(
+                    "trifecta_block",
+                    {"step": step, "name": call.name, "call_id": call.id},
+                    parent_id=req_span,
+                )
+            return overrides
+
         def _run_turn_tools(
             calls: list[ToolCall], step: int, req_span: str | None
         ) -> Iterator[StreamEvent]:
             """Execute one turn's tool calls (policy-checked), append results."""
-            overrides = _policy_overrides(calls, step, req_span)
+            overrides = _loop_guard_overrides(calls, step, req_span)
+            overrides.update(_trifecta_overrides(calls, step, req_span))
+            # La politique de l'hôte passe en DERNIER : elle ne peut qu'AJOUTER des
+            # refus (retourner None n'efface rien), donc elle ne peut jamais
+            # dé-bloquer une garde intégrée — l'hôte reste souverain sans pouvoir
+            # affaiblir la frontière par inadvertance.
+            overrides.update(_policy_overrides(calls, step, req_span))
 
             def _timed(call: ToolCall) -> tuple[Any, int]:
                 denied = overrides.get(call.id)
@@ -1024,7 +1449,8 @@ class Agent:
                     if untrusted:
                         taint[0] = True                     # teinte monotone
                     working_messages.append(
-                        _tool_message(call, tool_result, untrusted=untrusted)
+                        _tool_message(call, tool_result, untrusted=untrusted,
+                                      max_chars=self.max_tool_result_chars)
                     )
             else:
                 for call in calls:
@@ -1041,7 +1467,8 @@ class Agent:
                     if untrusted:
                         taint[0] = True                     # teinte monotone
                     working_messages.append(
-                        _tool_message(call, tool_result, untrusted=untrusted)
+                        _tool_message(call, tool_result, untrusted=untrusted,
+                                      max_chars=self.max_tool_result_chars)
                     )
 
         model = getattr(getattr(self.provider, "config", None), "model", None)
@@ -1118,7 +1545,7 @@ class Agent:
 
                 request = LLMRequest(
                     messages=working_messages,
-                    tools=self.registry.specs(),
+                    tools=self._visible_specs(),
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                 )
@@ -1231,6 +1658,31 @@ class Agent:
         """La sortie de cet outil est-elle déclarée non fiable (spec 0.15) ?"""
         spec = next((s for s in self.registry.specs() if s.name == call.name), None)
         return bool(spec is not None and spec.untrusted)
+
+    def _is_egress(self, call: ToolCall) -> bool:
+        """Cet outil peut-il faire SORTIR de l'information du système (spec 0.18) ?"""
+        spec = next((s for s in self.registry.specs() if s.name == call.name), None)
+        return bool(spec is not None and spec.egress)
+
+    def audit_trifecta(self) -> list[str]:
+        """Lint de configuration : la « lethal trifecta » est-elle réunie ? (0.18.0)
+
+        Renvoie une liste de constats lisibles (vide = rien à signaler). À appeler
+        AU DÉMARRAGE, pas en boucle : c'est une vérification de câblage, pas un
+        contrôle d'exécution. Réunir « contenu non fiable » et « capacité de
+        sortie » dans le même agent, c'est le motif exact des exfiltrations par
+        injection indirecte — mieux vaut le voir au boot qu'après l'incident.
+        """
+        untrusted = sorted(s.name for s in self.registry.specs() if s.untrusted)
+        egress = sorted(s.name for s in self.registry.specs() if s.egress)
+        if not (untrusted and egress):
+            return []
+        return [
+            f"lethal trifecta: untrusted input tools {untrusted} coexist with egress "
+            f"tools {egress} in the same agent. trifecta_guard={self.trifecta_guard!r} "
+            f"governs what happens once the run is tainted "
+            f"({'blocked' if self.trifecta_guard == 'deny' else self.trifecta_guard})."
+        ]
 
     def _emit_tool_start(self, call: ToolCall, req_span: str | None) -> str | None:
         return self._emit(

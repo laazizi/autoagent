@@ -41,6 +41,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import threading
 import time
 from pathlib import Path
@@ -300,6 +301,25 @@ class SummarizingMemory:
         return (response.content or "").strip() or self._summary
 
 
+_FORGET_SYSTEM = (
+    "Tu appliques une demande d'OUBLI sur la mémoire factuelle d'un agent. On te "
+    "donne une INSTRUCTION en langue naturelle et une liste de FAITS numérotés.\n"
+    'Réponds UNIQUEMENT par un objet JSON : {"forget": [ids], "reason": "..."}.\n'
+    "Règles STRICTES :\n"
+    "- ne mets dans `forget` que les ids des faits RÉELLEMENT visés par "
+    "l'instruction ;\n"
+    "- attention aux COLLISIONS de préfixe : « Paul Martin » n'est pas "
+    "« Paul Martineau » ; « dossier 12 » n'est pas « dossier 120 » ;\n"
+    "- reconnais les VARIANTES d'un même identifiant (espaces, tirets, casse, "
+    "formulation dans une autre langue) ;\n"
+    "- un fait COMPOSÉ qui ne concerne l'instruction que PARTIELLEMENT ne doit "
+    "PAS être supprimé (le signaler dans `reason`) ;\n"
+    "- en cas de DOUTE sur un fait, ne le supprime pas. Mieux vaut oublier trop "
+    "peu que détruire une donnée juste.\n"
+    'Si rien ne correspond, renvoie {"forget": [], "reason": "aucune correspondance"}.'
+)
+
+
 _FACTS_SYSTEM = (
     "Tu maintiens la MÉMOIRE FACTUELLE d'un agent : une liste de faits courts, "
     "atomiques et ACTUELS (préférences, décisions, valeurs, identifiants, dates, "
@@ -385,6 +405,7 @@ class FactMemory:
         background: bool = False,
         embed_fn: Callable[[list[str]], list[list[float]]] | None = None,
         max_consolidation_facts: int = 30,
+        recall_mode: str = "hybrid",
     ) -> None:
         if max_messages < 2 or keep_recent < 1 or keep_recent >= max_messages:
             raise ValueError("exige max_messages >= 2 et 1 <= keep_recent < max_messages")
@@ -402,6 +423,9 @@ class FactMemory:
         self.background = background
         self.embed_fn = embed_fn
         self.max_consolidation_facts = max_consolidation_facts
+        if recall_mode not in ("hybrid", "lexical", "semantic"):
+            raise ValueError("recall_mode doit valoir 'hybrid', 'lexical' ou 'semantic'")
+        self.recall_mode = recall_mode
         self._facts: list[dict[str, Any]] = []
         self._next_id = 1
         self._covered = 0  # nb de messages non-système déjà passés par l'extraction
@@ -517,38 +541,89 @@ class FactMemory:
         return not job["thread"].is_alive()
 
     def recall(self, query: str, k: int = 5) -> list[Message]:
+        """Retrouve les faits pertinents. Voir `recall_mode` (0.18.0).
+
+        `hybrid` (défaut) fusionne un classement LEXICAL (BM25) et un classement
+        SÉMANTIQUE (cosinus, si `embed_fn`) par RRF. Les deux signaux échouent sur
+        des requêtes opposées : le sémantique perd les correspondances exactes
+        (n° de contrat, SIREN, plaque, identifiant), le lexical perd les
+        synonymes. Les fusionner rattrape les deux angles morts ; sans `embed_fn`,
+        BM25 tourne seul et reste très supérieur à l'ancienne intersection de mots
+        (qui n'avait ni IDF, ni normalisation de longueur, ni tokenisation).
+        """
         with self._lock:
-            snapshot = [dict(f) for f in self._facts]
+            # Faits COURANTS uniquement : on ne sert jamais un fait périmé comme
+            # s'il était vrai (le mode d'échec n°1 des mémoires d'agent).
+            snapshot = [dict(f) for f in self._valid()]
         if not snapshot:
             return []
-        if self.embed_fn is not None:
+
+        lexical = self._bm25_rank(query, snapshot)
+        semantic: list[dict[str, Any]] = []
+        if self.recall_mode in ("hybrid", "semantic") and self.embed_fn is not None:
             try:
-                ranked = self._semantic_rank(query, snapshot, k)
-                if ranked is not None:
-                    return ranked
+                semantic = self._semantic_rank(query, snapshot)
             except Exception:
+                # Contrat inchangé : un embed_fn en panne ne casse pas le recall.
                 _log.exception("embed_fn failed; falling back to lexical recall")
-        terms = {t for t in query.lower().split() if len(t) > 2}
-        if not terms:
-            return []
-        scored = []
-        for fact in snapshot:
-            haystack = set(
-                (fact["fact"] + " " + (fact.get("subject") or "")).lower().split()
-            )
-            score = len(terms & haystack)
-            if score:
-                scored.append((score, fact["id"], fact["fact"]))
-        scored.sort(key=lambda item: (-item[0], item[1]))
+                semantic = []
+
+        if self.recall_mode == "lexical" or not semantic:
+            ranked = lexical
+        elif self.recall_mode == "semantic":
+            ranked = semantic
+        else:
+            ranked = _rrf_fuse(lexical, semantic)
+
         return [
-            Message(role="user", content=f"[Fait #{fid}] {texte}")
-            for _, fid, texte in scored[:k]
+            Message(role="user", content=f"[Fait #{fact['id']}] {fact['fact']}")
+            for fact in ranked[:k]
         ]
 
-    def _semantic_rank(
-        self, query: str, snapshot: list[dict[str, Any]], k: int
-    ) -> list[Message] | None:
-        """Classement par cosinus d'embeddings ; None = repli lexical."""
+    def _bm25_rank(self, query: str, snapshot: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Classement BM25 (Okapi) sur `fact` + `subject`.
+
+        De l'arithmétique pure — aucune dépendance, aucun appel réseau. Deux
+        propriétés que l'intersection de mots n'avait pas : l'IDF (un terme rare
+        pèse plus qu'un mot passe-partout) et la saturation/normalisation de
+        longueur (un fait court et ciblé n'est pas noyé par un fait bavard).
+        """
+        terms = _tokenize(query)
+        if not terms:
+            return []
+        docs = [
+            (fact, _tokenize(f"{fact['fact']} {fact.get('subject') or ''}"))
+            for fact in snapshot
+        ]
+        n = len(docs)
+        avg_len = sum(len(tokens) for _, tokens in docs) / n if n else 0.0
+        if not avg_len:
+            return []
+        k1, b = 1.5, 0.75
+        doc_freq: dict[str, int] = {}
+        for _, tokens in docs:
+            for term in set(tokens):
+                doc_freq[term] = doc_freq.get(term, 0) + 1
+        scored: list[tuple[float, int, dict[str, Any]]] = []
+        for fact, tokens in docs:
+            if not tokens:
+                continue
+            score = 0.0
+            for term in terms:
+                tf = tokens.count(term)
+                if not tf:
+                    continue
+                df = doc_freq.get(term, 0)
+                idf = math.log(1 + (n - df + 0.5) / (df + 0.5))
+                norm = tf + k1 * (1 - b + b * len(tokens) / avg_len)
+                score += idf * (tf * (k1 + 1)) / norm
+            if score > 0:
+                scored.append((-score, fact["id"], fact))
+        scored.sort(key=lambda item: (item[0], item[1]))  # score desc, id asc (stable)
+        return [fact for _, _, fact in scored]
+
+    def _semantic_rank(self, query: str, snapshot: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Classement par cosinus d'embeddings (liste vide = pas de signal)."""
         missing = [f for f in snapshot if f["id"] not in self._vectors]
         if missing:
             vectors = self.embed_fn([f["fact"] for f in missing])
@@ -558,26 +633,20 @@ class FactMemory:
             self._save_vectors()
         query_vec = self.embed_fn([query])[0]
         with self._lock:
-            pairs = [
-                (fact, self._vectors.get(fact["id"])) for fact in snapshot
-            ]
+            pairs = [(fact, self._vectors.get(fact["id"])) for fact in snapshot]
         scored = [
-            (_cosine(query_vec, vector), fact)
+            (-_cosine(query_vec, vector), fact["id"], fact)
             for fact, vector in pairs
             if vector is not None
         ]
-        if not scored:
-            return None
-        scored.sort(key=lambda item: (-item[0], item[1]["id"]))
-        return [
-            Message(role="user", content=f"[Fait #{fact['id']}] {fact['fact']}")
-            for score, fact in scored[:k]
-            if score > 0
-        ]
+        scored = [item for item in scored if item[0] < 0]  # cosinus > 0
+        scored.sort(key=lambda item: (item[0], item[1]))
+        return [fact for _, _, fact in scored]
 
     # ── API factuelle ────────────────────────────────────────────────────
 
-    def remember(self, fact: str, *, subject: str | None = None) -> dict[str, Any]:
+    def remember(self, fact: str, *, subject: str | None = None,
+                 source: str = "host") -> dict[str, Any]:
         """Ajoute un fait DIRECTEMENT (sans appel LLM). Déduplique à
         l'identique (le fait existant est alors « touché » : sa date de
         mise à jour est rafraîchie). Retourne le fait stocké."""
@@ -585,12 +654,12 @@ class FactMemory:
         if not fact:
             raise ValueError("fact must be a non-empty string")
         with self._lock:
-            for existing in self._facts:
+            for existing in self._valid():
                 if existing["fact"].strip().lower() == fact.lower():
                     existing["updated"] = self._today()
                     self._save()
                     return dict(existing)
-            stored = self._add(fact, subject)
+            stored = self._add(fact, subject, source=source)
             self._save()
             return dict(stored)
 
@@ -605,10 +674,128 @@ class FactMemory:
                 self._save()
             return removed
 
-    def facts(self) -> list[dict[str, Any]]:
-        """Copie de la base de faits (pour inspection/audit hôte)."""
+    def forget_matching(self, instruction: str, *, dry_run: bool = False) -> list[dict[str, Any]]:
+        """Oublie les faits désignés en LANGUE NATURELLE (0.18.0).
+
+        « oublie tout ce qui concerne mon ancien employeur », « supprime les
+        données liées au dossier X ». Renvoie la liste des faits supprimés (copie
+        complète, pour la trace et la preuve d'effacement).
+
+        Pourquoi ça ne se réduit pas à ``forget(id)`` : jusqu'ici la seule
+        décision confiée au LLM était l'ÉCRITURE (extraction/consolidation dans
+        ``compact``). Or les architectures « décision à l'écriture seule » —
+        celle-ci — échouent sur la suppression INTENTIONNELLE : collision de
+        préfixe (« Paul Martin » vs « Paul Martineau »), faits composés (« il
+        travaille chez X et aime le thé » : n'oublier que l'employeur), variantes
+        d'identifiants, formulations d'une autre langue. Déplacer la décision au
+        moment de la MUTATION récupère ces cas — c'est le gain unitaire le plus
+        élevé de l'état de l'art 2026 sur l'oubli.
+
+        Le chemin de LECTURE n'est pas ralenti : ce coût (un appel LLM) n'est payé
+        qu'ici, quand un humain ou l'agent demande explicitement un oubli.
+
+        `dry_run=True` renvoie ce qui SERAIT supprimé sans rien toucher — à
+        utiliser pour faire confirmer un effacement avant de l'appliquer.
+        """
+        instruction = (instruction or "").strip()
+        if not instruction:
+            raise ValueError("instruction must be a non-empty string")
         with self._lock:
-            return [dict(f) for f in self._facts]
+            snapshot = [dict(f) for f in self._valid()]
+        if not snapshot:
+            return []
+
+        # Pré-filtre hybride : sur une grosse base, ne soumettre au LLM que les
+        # faits plausibles (même logique que `_relevant_for` pour la consolidation).
+        candidats = snapshot
+        if len(snapshot) > self.max_consolidation_facts:
+            pertinents = self._bm25_rank(instruction, snapshot)[: self.max_consolidation_facts]
+            candidats = pertinents or snapshot[: self.max_consolidation_facts]
+
+        listing = "\n".join(f"{f['id']}: {f['fact']}" for f in candidats)
+        try:
+            response = self.provider.complete(
+                LLMRequest(
+                    messages=[
+                        Message(role="system", content=_FORGET_SYSTEM),
+                        Message(role="user",
+                                content=f"INSTRUCTION D'OUBLI :\n{instruction}\n\n"
+                                        f"FAITS :\n{listing}"),
+                    ],
+                    temperature=0,
+                    max_tokens=self.extract_max_tokens,
+                    tool_choice="none",
+                    response_format={"type": "json_object"},
+                )
+            )
+        except Exception:
+            # Fail-CLOSED sur une SUPPRESSION : en cas de doute on ne supprime
+            # rien (contrairement à la compaction, best-effort par contrat).
+            _log.exception("forget_matching: appel LLM échoué — aucune suppression")
+            return []
+        self.last_usage = getattr(response, "usage", None)
+
+        ids = _parse_forget_ids(response.content or "")
+        vises = {f["id"] for f in candidats}          # jamais hors du lot soumis
+        a_supprimer = [f for f in snapshot if f["id"] in ids and f["id"] in vises]
+        if dry_run or not a_supprimer:
+            return [dict(f) for f in a_supprimer]
+        with self._lock:
+            cibles = {f["id"] for f in a_supprimer}
+            self._facts = [f for f in self._facts if f["id"] not in cibles]
+            for fid in cibles:
+                self._vectors.pop(fid, None)
+            self._save()
+        if self._vectors_path() is not None:
+            self._save_vectors()
+        return [dict(f) for f in a_supprimer]
+
+    def facts(self, *, include_invalid: bool = False) -> list[dict[str, Any]]:
+        """Copie de la base de faits (pour inspection/audit hôte).
+
+        Par défaut : uniquement les faits COURANTS — ce que voyaient déjà les
+        consommateurs avant la bi-temporalité (0.18.0), puisque `update`
+        écrasait alors le texte en place. `include_invalid=True` ajoute les faits
+        périmés (fenêtre fermée), pour un audit ou un « qu'est-ce qu'on croyait,
+        et quand ? ».
+        """
+        with self._lock:
+            source = self._facts if include_invalid else self._valid()
+            return [dict(f) for f in source]
+
+    def history(self, fact_id: int) -> list[dict[str, Any]]:
+        """Chaîne de supersession d'un fait, du plus ancien au plus récent (0.18.0).
+
+        Répond à « depuis quand ? » et « qu'est-ce qui a remplacé quoi ? ». On
+        remonte d'abord jusqu'à la racine (le fait que personne n'a supersédé),
+        puis on redescend la chaîne. Tolérant aux trous : `forget()` supprime
+        DUREMENT (droit à l'effacement), ce qui peut laisser un pointeur
+        pendant — la chaîne s'arrête alors proprement.
+        """
+        with self._lock:
+            par_id = {f["id"]: dict(f) for f in self._facts}
+            remplace_par = {  # qui supersède qui → pour remonter à la racine
+                f["superseded_by"]: f["id"]
+                for f in self._facts
+                if f.get("superseded_by") is not None
+            }
+        if fact_id not in par_id:
+            return []
+        racine = fact_id
+        vus = {racine}
+        while racine in remplace_par and remplace_par[racine] not in vus:
+            racine = remplace_par[racine]
+            vus.add(racine)
+        chaine, courant = [], racine
+        vus = {courant}
+        while courant is not None and courant in par_id:
+            chaine.append(par_id[courant])
+            suivant = par_id[courant].get("superseded_by")
+            if suivant in vus:  # garde anti-cycle (fichier trafiqué)
+                break
+            vus.add(suivant)
+            courant = suivant
+        return chaine
 
     # ── interne ──────────────────────────────────────────────────────────
 
@@ -616,27 +803,53 @@ class FactMemory:
     def _today() -> str:
         return time.strftime("%Y-%m-%d")
 
-    def _add(self, fact: str, subject: str | None) -> dict[str, Any]:
+    def _add(self, fact: str, subject: str | None, source: str = "agent") -> dict[str, Any]:
+        today = self._today()
         stored = {
             "id": self._next_id,
             "fact": fact,
             "subject": (subject or "").strip() or None,
-            "updated": self._today(),
+            "updated": today,
+            # ── bi-temporalité + provenance (0.18.0) ────────────────────────
+            # `source` : qui l'affirme. Une déclaration de l'utilisateur ne vaut
+            # pas une inférence de l'agent ; sans ce champ, impossible d'arbitrer.
+            "source": source if source in _SOURCES else "agent",
+            # `valid_from` / `invalid_at` : depuis quand c'est vrai DANS LE MONDE.
+            # `invalid_at=None` = valide aujourd'hui. Une contradiction FERME la
+            # fenêtre au lieu de détruire le fait — on ne sert jamais un fait
+            # périmé comme courant, mais on peut encore dire ce qu'on croyait.
+            "valid_from": today,
+            "invalid_at": None,
+            "superseded_by": None,
         }
         self._facts.append(stored)
         self._next_id += 1
-        if len(self._facts) > self.max_facts:
-            # Écarte les plus anciennement mis à jour (ordre stable sinon).
-            self._facts.sort(key=lambda f: f["updated"])
-            self._facts = self._facts[-self.max_facts :]
-            self._facts.sort(key=lambda f: f["id"])
+        self._evict()
         return stored
+
+    def _evict(self) -> None:
+        """Borne la base à `max_facts`. Appelé sous self._lock.
+
+        Ordre d'éviction : les faits PÉRIMÉS d'abord (ils ne peuvent plus être
+        remontés par `recall`, ils ne servent que l'historique), puis les plus
+        anciennement mis à jour. Sans cette priorité, la bi-temporalité aurait
+        évincé des faits COURANTS pour garder des périmés.
+        """
+        if len(self._facts) <= self.max_facts:
+            return
+        # clé de tri : (encore valide ?, date de mise à jour) — on coupe la TÊTE
+        self._facts.sort(key=lambda f: (f.get("invalid_at") is None, f.get("updated") or ""))
+        retires = self._facts[: len(self._facts) - self.max_facts]
+        self._facts = self._facts[len(self._facts) - self.max_facts :]
+        for retire in retires:
+            self._vectors.pop(retire["id"], None)
+        self._facts.sort(key=lambda f: f["id"])
 
     def _extract(self, to_fold: list[Message]) -> None:
         # Peut tourner dans le worker : instantané des faits sous verrou,
         # appel LLM HORS verrou, application des opérations sous verrou.
         with self._lock:
-            existants = [(f["id"], f["fact"]) for f in self._facts]
+            existants = [(f["id"], f["fact"]) for f in self._valid()]
         existants = self._relevant_for(to_fold, existants)
         lines = ["Faits existants :"]
         if existants:
@@ -714,18 +927,20 @@ class FactMemory:
             if kind == "add":
                 fact = str(op.get("fact") or "").strip()
                 if fact and not any(
-                    f["fact"].strip().lower() == fact.lower() for f in self._facts
+                    f["fact"].strip().lower() == fact.lower() for f in self._valid()
                 ):
                     self._add(fact, op.get("subject"))
             elif kind == "update":
                 target = by_id.get(op.get("id"))
                 fact = str(op.get("fact") or "").strip()
-                if target is not None and fact:
-                    target["fact"] = fact
-                    target["updated"] = self._today()
-                    self._vectors.pop(target["id"], None)  # texte changé → ré-embedder
-                else:
+                if target is None or not fact:
                     _log.debug("fact update ignoré (id inconnu ou fait vide): %r", op)
+                elif target.get("invalid_at") is not None:
+                    # Opération périmée : le fait a déjà été supersédé dans ce
+                    # même lot. On ne chaîne pas sur un fait mort.
+                    _log.debug("fact update ignoré (fait déjà périmé): %r", op)
+                else:
+                    self._supersede(target, fact, op.get("subject"))
             elif kind == "delete":
                 if op.get("id") in by_id:
                     self._facts = [f for f in self._facts if f["id"] != op["id"]]
@@ -734,9 +949,33 @@ class FactMemory:
             else:
                 _log.debug("opération de fait inconnue ignorée: %r", op)
 
+    def _supersede(self, ancien: dict[str, Any], nouveau_texte: str,
+                   subject: str | None = None) -> dict[str, Any]:
+        """Remplace un fait en FERMANT sa fenêtre de validité (0.18.0).
+
+        Appelé sous self._lock. L'ancien comportement écrasait le texte en place :
+        une extraction LLM ratée détruisait donc silencieusement une donnée juste,
+        et il devenait impossible de répondre « depuis quand ? ». Ici l'ancien fait
+        reste, marqué périmé et pointant vers son successeur.
+
+        Son embedding est purgé : un fait périmé ne peut plus être remonté par
+        `recall`, garder son vecteur ne servirait qu'à occuper de la place.
+        """
+        remplacant = self._add(nouveau_texte, subject if subject is not None
+                               else ancien.get("subject"), source="agent")
+        ancien["invalid_at"] = self._today()
+        ancien["superseded_by"] = remplacant["id"]
+        ancien["updated"] = self._today()
+        self._vectors.pop(ancien["id"], None)
+        return remplacant
+
+    def _valid(self) -> list[dict[str, Any]]:
+        """Faits COURANTS (fenêtre de validité ouverte). Appelé sous self._lock."""
+        return [f for f in self._facts if f.get("invalid_at") is None]
+
     def _assemble(self, system_msgs: list[Message], tail: list[Message]) -> list[Message]:
         with self._lock:
-            facts_now = [dict(f) for f in self._facts]
+            facts_now = [dict(f) for f in self._valid()]
         if not facts_now and not self._tainted:
             return [*system_msgs, *tail]
         # Les plus récemment mis à jour d'abord, bornés, ré-ordonnés par id
@@ -788,7 +1027,11 @@ class FactMemory:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             facts = data.get("facts")
             if isinstance(facts, list):
-                self._facts = [f for f in facts if isinstance(f, dict) and "id" in f and "fact" in f]
+                self._facts = [
+                    _migrate_fact(f)
+                    for f in facts
+                    if isinstance(f, dict) and "id" in f and "fact" in f
+                ]
             self._next_id = int(data.get("next_id") or (max((f["id"] for f in self._facts), default=0) + 1))
         except (OSError, ValueError):
             _log.exception("fact store unreadable (%s); starting empty", self.path)
@@ -805,6 +1048,109 @@ class FactMemory:
             except (OSError, ValueError):
                 _log.exception("vector sidecar unreadable (%s); will re-embed", vpath)
                 self._vectors = {}
+
+
+_SOURCES = frozenset({"user", "agent", "host"})
+
+
+def _repair_json_tail(text: str) -> tuple[str, bool] | None:
+    """Referme un JSON tronqué à la FIN. Rend `(réparé, coupé_en_pleine_valeur)`.
+
+    Observé en conditions réelles (Gemini 3.5, août 2026) : la réponse
+    d'extraction arrive amputée de son accolade finale —
+    ``{"operations": [ {...} ]`` — de façon reproductible et sans rapport avec
+    ``max_tokens``. `json.loads` échouait, les opérations étaient abandonnées, et
+    **la contradiction était perdue en silence** : la mémoire gardait le fait
+    périmé en le servant comme courant. Le pire mode d'échec possible pour une
+    mémoire.
+
+    On ne « devine » rien : on parcourt le texte en suivant l'état chaîne /
+    échappement, et on ne ferme que les délimiteurs RESTÉS ouverts. Un JSON dont
+    les délimiteurs sont incohérents (fermeture qui ne correspond pas) rend
+    ``None`` — ce n'est pas une simple troncature, on ne le touche pas.
+
+    Le second membre du tuple dit si la coupe est tombée EN PLEINE VALEUR (dans
+    une chaîne) : l'appelant sait alors que le dernier élément est douteux.
+    """
+    pile: list[str] = []
+    dans_chaine = False
+    echappe = False
+    for caractere in text:
+        if dans_chaine:
+            if echappe:
+                echappe = False
+            elif caractere == "\\":
+                echappe = True
+            elif caractere == '"':
+                dans_chaine = False
+            continue
+        if caractere == '"':
+            dans_chaine = True
+        elif caractere in "[{":
+            pile.append(caractere)
+        elif caractere in "]}":
+            attendu = "[" if caractere == "]" else "{"
+            if pile and pile[-1] == attendu:
+                pile.pop()
+            else:
+                return None  # incohérent : pas une troncature de queue
+    if not pile and not dans_chaine:
+        return None  # rien à réparer : l'échec de parsing vient d'ailleurs
+    repare = text + ('"' if dans_chaine else "")
+    for ouvrant in reversed(pile):
+        repare += "]" if ouvrant == "[" else "}"
+    return repare, dans_chaine
+
+
+def _migrate_fact(fact: dict[str, Any]) -> dict[str, Any]:
+    """Complète un fait de l'ANCIEN format (0.12→0.17) en place (0.18.0).
+
+    Migration en LECTURE, jamais destructive : un fichier écrit par une version
+    antérieure — et il en existe en production — se charge tel quel, les champs
+    absents prennent des valeurs qui reproduisent exactement l'ancien
+    comportement (aucun fait périmé, aucune supersession, provenance inconnue
+    déclarée `agent` puisque c'était l'extraction qui écrivait). Le fichier est
+    réécrit au format complet à la première sauvegarde suivante.
+    """
+    fact.setdefault("subject", None)
+    fact.setdefault("updated", "")
+    source = fact.get("source")
+    fact["source"] = source if source in _SOURCES else "agent"
+    fact.setdefault("valid_from", fact.get("updated") or "")
+    if "invalid_at" not in fact:
+        fact["invalid_at"] = None
+    if "superseded_by" not in fact:
+        fact["superseded_by"] = None
+    return fact
+
+
+def _tokenize(text: str) -> list[str]:
+    """Mots d'au moins 2 caractères, minuscules, accents PRÉSERVÉS.
+
+    L'ancien recall faisait `text.lower().split()` : « crêpes, » ne matchait donc
+    pas « crêpes », et un seuil à 3 caractères jetait « n° », « TVA », « ok ».
+    `\\w` est unicode-aware en Python 3 → « crêpes » et « héberger » survivent.
+    """
+    return [t for t in re.split(r"\W+", (text or "").lower(), flags=re.UNICODE) if len(t) >= 2]
+
+
+def _rrf_fuse(*rankings: list[dict[str, Any]], k: int = 60) -> list[dict[str, Any]]:
+    """Reciprocal Rank Fusion : score = Σ 1/(k + rang).
+
+    On fusionne des RANGS, pas des scores : un cosinus (0→1) et un score BM25
+    (non borné) ne sont pas comparables, mais leurs positions le sont. `k=60` est
+    la constante usuelle de la littérature ; elle amortit la tête de classement
+    pour qu'un seul signal très confiant ne balaie pas l'autre.
+    """
+    scores: dict[int, float] = {}
+    seen: dict[int, dict[str, Any]] = {}
+    for ranking in rankings:
+        for rank, fact in enumerate(ranking, start=1):
+            fid = fact["id"]
+            scores[fid] = scores.get(fid, 0.0) + 1.0 / (k + rank)
+            seen.setdefault(fid, fact)
+    ordered = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    return [seen[fid] for fid, _ in ordered]
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -827,12 +1173,18 @@ def _prefix_fingerprint(messages: list[Message]) -> str:
     return hasher.hexdigest()
 
 
-def _parse_operations(content: str) -> list[dict[str, Any]]:
-    """Extrait la liste d'opérations de la réponse d'extraction.
+def _parse_forget_ids(content: str) -> set[int]:
+    """Extrait les ids à oublier. Tolérant aux fences ```json.
 
-    Tolérant : fences ```json éventuelles (Anthropic est en best-effort
-    JSON), objet mal formé → liste vide (la compaction du tour est alors
-    un no-op factuel, jamais une erreur)."""
+    Fail-CLOSED : tout ce qui n'est pas un entier clairement listé est ignoré —
+    on ne devine JAMAIS une suppression.
+
+    Volontairement PAS de réparation de JSON tronqué ici, contrairement à
+    l'extraction (`_parse_operations`) : sur une troncature, `[123]` amputé donne
+    `[12]` — un id VALIDE mais faux, donc la suppression d'un fait innocent. Les
+    deux chemins n'ont pas le même risque : perdre une opération d'extraction se
+    rattrape au tour suivant, détruire la donnée d'un client ne se rattrape pas.
+    """
     text = content.strip()
     if text.startswith("```"):
         text = text.split("```", 2)[1] if text.count("```") >= 2 else text.strip("`")
@@ -841,7 +1193,62 @@ def _parse_operations(content: str) -> list[dict[str, Any]]:
     try:
         data = json.loads(text)
     except ValueError:
-        _log.warning("fact extraction returned non-JSON; no operations applied")
-        return []
+        _log.warning("forget_matching returned non-JSON; nothing deleted")
+        return set()
+    ids = data.get("forget") if isinstance(data, dict) else None
+    if not isinstance(ids, list):
+        return set()
+    out: set[int] = set()
+    for raw in ids:
+        if isinstance(raw, bool):
+            continue
+        if isinstance(raw, int):
+            out.add(raw)
+        elif isinstance(raw, str) and raw.strip().isdigit():
+            out.add(int(raw.strip()))
+    return out
+
+
+def _parse_operations(content: str) -> list[dict[str, Any]]:
+    """Extrait la liste d'opérations de la réponse d'extraction.
+
+    Tolérant : fences ```json éventuelles (Anthropic est en best-effort JSON),
+    objet mal formé → liste vide (la compaction du tour est alors un no-op
+    factuel, jamais une erreur).
+
+    Répare une TRONCATURE de queue (0.18.0) : constaté en réel, Gemini 3.5 renvoie
+    parfois `{"operations": [ {...} ]` sans l'accolade finale, de façon
+    reproductible et sans lien avec `max_tokens`. On perdait alors TOUTES les
+    opérations du tour — donc la contradiction — et la mémoire continuait à servir
+    le fait périmé comme courant. Si la coupe est tombée en pleine chaîne, le
+    dernier élément est ÉCARTÉ : un fait au texte amputé serait pire que pas de
+    fait.
+    """
+    text = content.strip()
+    if text.startswith("```"):
+        text = text.split("```", 2)[1] if text.count("```") >= 2 else text.strip("`")
+        if text.startswith("json"):
+            text = text[4:]
+    coupe_en_valeur = False
+    try:
+        data = json.loads(text)
+    except ValueError:
+        repair = _repair_json_tail(text)
+        if repair is None:
+            _log.warning("fact extraction returned non-JSON; no operations applied")
+            return []
+        repare, coupe_en_valeur = repair
+        try:
+            data = json.loads(repare)
+        except ValueError:
+            _log.warning("fact extraction returned non-JSON; no operations applied")
+            return []
+        _log.warning("fact extraction JSON was truncated; tail repaired%s",
+                     " (last operation dropped)" if coupe_en_valeur else "")
     operations = data.get("operations") if isinstance(data, dict) else None
-    return [op for op in operations if isinstance(op, dict)] if isinstance(operations, list) else []
+    if not isinstance(operations, list):
+        return []
+    valides = [op for op in operations if isinstance(op, dict)]
+    if coupe_en_valeur and valides:
+        valides.pop()  # élément probablement incomplet : on ne l'applique pas
+    return valides

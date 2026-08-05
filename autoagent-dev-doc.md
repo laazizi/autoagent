@@ -3,7 +3,7 @@
 > Référence technique complète pour intégrer, étendre et tester `autoagent` dans un projet Python.
 > **Public visé** : devs qui vont écrire des tools, brancher l'agent sur leur app, ou éventuellement contribuer à la lib.
 
-**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-07-24 · **Couvre autoagent** : 0.17.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
+**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-08-05 · **Couvre autoagent** : 0.18.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
 
 ---
 
@@ -42,6 +42,9 @@
 21. [`FactMemory` — mémoire factuelle tenue à jour](#21-factmemory--mémoire-factuelle-tenue-à-jour) *(0.12.0)*
 22. [Taint tracking — défense contre l'injection indirecte](#22-taint-tracking--défense-contre-linjection-indirecte) *(0.15.0)*
 23. [Record / replay — reproductibilité des runs](#23-record--replay--reproductibilité-des-runs) *(0.16.0)*
+24. [Bornes de contexte, garde anti-boucle, trifecta, tool search](#24-bornes-de-contexte-garde-anti-boucle-trifecta-tool-search) *(0.18.0)*
+25. [Recall hybride, oubli en langue naturelle, OTel GenAI, fiabilité pass^k](#25-recall-hybride-oubli-en-langue-naturelle-otel-genai-fiabilité-passk) *(0.18.0)*
+26. [Mémoire bi-temporelle et politique d'outils déclarative](#26-mémoire-bi-temporelle-et-politique-doutils-déclarative) *(0.18.0)*
 
 ---
 
@@ -1946,36 +1949,51 @@ Passe un `post_turn_hook` (§4.7) qui regarde `ctx.tool_calls` et retourne un `M
 
 ### Annexe A — Liste des fichiers de la lib
 
+*(vérifiée contre le disque à la 0.18.0 — 21 modules + 6 providers)*
+
 ```
 autoagent/
-├── __init__.py              # exports publics, __version__ = "0.6.0"
-├── agent.py                 # Agent, AgentResult, AgentTurnContext, PostTurnHook
-├── schema.py                # ToolSpec, ToolCall, Message, ModelConfig, ImageAttachment
-├── registry.py              # ToolRegistry + schema_from_callable
-├── workspace.py             # ProjectWorkspace + path traversal protection
-├── pipeline.py              # PipelineManager (pipeline.json)
+├── __init__.py              # exports publics + __version__
+├── agent.py                 # Agent, AgentResult, RunState, ToolPolicy(Context),
+│                            # AgentTurnContext, PostTurnHook, CheckpointHook
+├── schema.py                # Message, ToolCall, ToolSpec, ModelConfig, LLMRequest/Response,
+│                            # ImageAttachment, TokenUsage, StreamChunk/Event,
+│                            # marqueurs de teinte + normalize_schema_types (0.18)
+├── registry.py              # ToolRegistry, ToolResult + schema_from_callable
+├── workspace.py             # ProjectWorkspace (écritures bornées, anti-traversée, rollback)
+├── pipeline.py              # PipelineManager (slots pipeline.json)
 ├── evolution.py             # EvolutionRuntime, EVOLUTION_CAPABILITIES
-├── dynamic.py               # DynamicToolBuilder, ToolBuildRequest
+├── dynamic.py               # DynamicToolBuilder, ToolBuildRequest (l'agent écrit ses outils)
 ├── sandbox.py               # SubprocessSandbox, DockerSandbox, make_sandbox, pont host-function
-├── http.py                  # post_json / post_sse (urllib wrapper + retry/backoff)
-├── errors.py                # MaxStepsExceeded, AgentCancelled, ProviderError, TokenBudgetExceeded,
-│                            # MCPError + ApprovalRequired (0.11.0), ...
+├── approval.py              # ToolManifest (allowlist par hash) + promotion humaine + CLI
+├── orchestrator.py          # 0.9.0 — Orchestrator, Step, TurnEvent (flux piloté par l'hôte, §15)
+├── http.py                  # post_json / post_sse (urllib + retry/backoff, Retry-After)
+├── errors.py                # AutoAgentError, MaxStepsExceeded, AgentCancelled, ProviderError,
+│                            # TokenBudgetExceeded, MCPError, ApprovalRequired, ReplayMismatch
 ├── logging.py               # get_logger + SecretRedactingFilter + redact()
 ├── trace.py                 # 0.5.0 — TraceEmitter, TraceEvent, OnEvent, truncate_preview
 ├── memory.py                # 0.6.0 — Memory (Protocol), BufferMemory ; 0.10.0 — SummarizingMemory ;
-│                            # 0.12.0 — FactMemory (§21)
+│                            # 0.12→0.13 — FactMemory (+ sleep-time, embed_fn) ;
+│                            # 0.18.0 — recall hybride BM25+RRF, forget_matching,
+│                            # bi-temporalité + provenance (§25, §26)
 ├── mcp.py                   # 0.11.0 — MCPClient (serveur MCP stdio → tools locaux, §17)
-├── otel.py                  # 0.11.0 — OTelTraceExporter (trace → spans OTel, §18)
+├── otel.py                  # 0.11.0 — OTelTraceExporter ; 0.18.0 — semconv="gen_ai" (§18, §25.3)
+├── replay.py                # 0.16.0 — RecordSession / ReplaySession (§23)
+├── policy.py                # 0.18.0 — ToolPolicySpec : la politique d'outils en JSON (§26.2)
+├── eval.py                  # 0.18.0 — run_k : fiabilité pass^k, juge déterministe (§25.4)
 └── providers/
-    ├── __init__.py
-    ├── base.py              # Protocol LLMProvider
-    ├── openai.py            # 0.3.1 _uses_max_completion_tokens, 0.3.2 reasoning_content,
-    │                        # 0.4.0 image_url multi-part
-    ├── anthropic.py         # 0.4.0 image content block
-    ├── deepseek.py          # OpenAI-compat (hérite _uses_max_completion_tokens)
-    ├── gemini.py            # 0.4.0 inline_data parts
-    └── fake.py              # mock pour tests
+    ├── __init__.py          # create_provider (fabrique par nom)
+    ├── base.py              # LLMProvider (ABC) + deep-merge de config.extra_body
+    ├── openai.py            # OpenAI-compatible : DeepSeek/Groq/Kimi/Ollama via base_url
+    ├── anthropic.py         # blocs image, tool_choice, JSON best-effort
+    ├── gemini.py            # inline_data, thought_signature (Gemini 3),
+    │                        # functionResponse groupées sous role "user" (0.18)
+    └── routing.py           # RoutingProvider (dispatch par requête : texte → cheap, image → vision)
 ```
+
+> Pas de `providers/deepseek.py` ni de `providers/fake.py` : DeepSeek passe par
+> `openai.py` (compatible, changement de `base_url`), et le double de test vit dans
+> `tests/conftest.py` (`FakeLLMProvider`) — pas dans le paquet publié.
 
 ### Annexe B — Imports publics
 
@@ -2030,11 +2048,20 @@ from autoagent import (
     # Providers (instances directes si besoin)
     AnthropicProvider, DeepSeekProvider, GeminiProvider, OpenAIProvider, LLMProvider,
 
+    # 0.16.0 — record / replay
+    RecordSession, RecordingProvider, RecordingRegistry,
+    ReplaySession, ReplayProvider, ReplayRegistry, ReplayMismatch,
+
+    # 0.18.0 — politique déclarative + normalisation de schéma
+    ToolPolicySpec,             # §26.2 — la politique en DONNÉES
+    normalize_schema_types,     # §24.5 — types JSON Schema abaissés à la frontière
+
     # Erreurs
     AutoAgentError, MaxStepsExceeded, ProviderError, ToolError, ToolValidationError,
     TokenBudgetExceeded, MCPError,
 )
 from autoagent.trace import truncate_preview        # helper public pour previews redactés
+from autoagent.eval import run_k, ReliabilityReport  # 0.18.0 — fiabilité pass^k (§25.4)
 ```
 
 ### Annexe C — Cheat-sheet
@@ -2415,6 +2442,7 @@ parsé — le modèle ne peut pas répondre mal formé.
 | 0.15.0 | taint tracking : `untrusted=True` sur les tools/MCP + `ToolPolicyContext.tainted` (défense injection indirecte, §22) |
 | 0.16.0 | record/replay : `RecordSession`/`ReplaySession` (§23) + `ReplayMismatch` ; fix PEP 563 dans `schema_from_callable` ; `to_dict`/`from_dict` sur `LLMResponse`/`ToolResult` |
 | 0.17.0 | durcissement (racine commune : sous-systèmes appelant le LLM hors du provider de l'agent) : teinte monotone survivant à la compaction (§22), `token_budget` compte la dépense mémoire (§21), record/replay multi-provider par `channel=` (§23) |
+| 0.18.0 | bornes de contexte (`max_tool_result_chars`), garde anti-boucle (`max_repeated_tool_calls`), 3ᵉ jambe de la lethal trifecta (`egress=True` + `trifecta_guard`), divulgation progressive des outils (`enable_tool_search`) — §24 ; recall hybride BM25+RRF, `forget_matching`, OTel `semconv="gen_ai"`, fiabilité `pass^k` — §25 ; mémoire bi-temporelle + provenance, `ToolPolicySpec` — §26. Fixes : types JSON Schema normalisés à la frontière, `functionResponse` Gemini groupées sous role `user`, JSON d'extraction tronqué réparé, `extra_body` par `ModelConfig`, comptabilité de jetons qui ne fait plus échouer une compaction |
 | — | `RoutingProvider` (providers/routing.py) |
 
 ## 17. `MCPClient` — outils MCP branchés comme des tools locaux
@@ -2752,6 +2780,374 @@ C'est la couche où vivent tes bugs et où arrivent tes changements.
 **Ce que ça ne fait PAS** : rendre le LLM déterministe (impossible) — ça rend
 le REPLAY déterministe, ce qu'il faut pour déboguer et tester. Démo
 `21_record_replay.py`.
+
+---
+
+## 24. Bornes de contexte, garde anti-boucle, trifecta, tool search
+
+*(0.18.0)* Cinq réglages **opt-in** issus d'une veille des publications 2025-2026.
+Tous laissent le comportement historique par défaut : un agent déjà déployé qui ne
+passe pas le nouveau mot-clé envoie exactement les mêmes octets qu'avant.
+
+### 24.1 `max_tool_result_chars` — borner UN résultat d'outil
+
+Rien ne plafonnait ce qu'un outil injectait dans le transcript. Un seul outil non
+borné (fetch HTTP, `SELECT` large, lecture de fichier) faisait déborder la fenêtre
+de contexte, brûlait tout le `token_budget` et noyait l'attention du modèle.
+
+```python
+agent = Agent(provider, max_tool_result_chars=4000)
+```
+
+Troncature **par le milieu** : la tête garde la forme du payload (clés, en-têtes,
+premières lignes), la queue garde ce qu'une coupe simple cacherait (totaux,
+`CRITICAL` de fin, curseur de page suivante). Un marqueur explicite dit au modèle
+ce qui manque, pour qu'il affine sa requête au lieu de travailler sur un extrait
+sans le savoir. Le marqueur **compte dans le budget** — une borne dépassable n'est
+pas une borne. Le cadre `untrusted` n'est jamais coupé.
+
+> Vérifié en réel : sur un journal de 400 lignes borné à 800 caractères, le modèle
+> a trouvé le `CRITICAL` de la dernière ligne (queue préservée) **et** répondu
+> spontanément « non, je n'ai pas vu le journal en entier ».
+
+### 24.2 `max_repeated_tool_calls` — garde anti-boucle
+
+Un agent qui redemande le même `(outil, arguments)` consommait `max_steps` et tout
+le budget au tarif plein, **ré-exécutait l'effet de bord** à chaque tour, et
+finissait sur un `max_steps` muet.
+
+```python
+agent = Agent(provider, max_repeated_tool_calls=3)
+```
+
+Le 4ᵉ appel identique n'est pas exécuté : le modèle reçoit une erreur d'outil
+déterministe `RepeatedCall` sur **le même canal qu'un refus de politique** — le
+chemin de replanification déjà éprouvé. Ce n'est pas une supplication de prompt,
+c'est du code. Deux gains par-dessus `max_steps` : l'effet de bord cesse (un POST,
+un e-mail, un run de sous-agent) et la trace **nomme** l'échec
+(`loop_guard_block`). Compté depuis le transcript → survit à checkpoint/resume
+sans nouveau champ dans `RunState`.
+
+### 24.3 `egress=True` + `trifecta_guard` — la 3ᵉ jambe de la lethal trifecta
+
+Données privées + contenu non fiable + **capacité de sortie** = exfiltration par
+injection indirecte, sans aucune faille logicielle. La lib instrumentait déjà les
+deux premières jambes (`untrusted=True`, sandbox sans réseau) ; la troisième
+manquait, donc `ctx.tainted` restait une information que chaque hôte devait
+convertir en règle — et un hôte qui oublie est exfiltrable.
+
+```python
+@agent.tool(untrusted=True)
+def lire_page(url: str) -> str:
+    """Contenu externe : non fiable."""
+    ...
+
+@agent.tool(egress=True)          # ← peut faire SORTIR de l'information
+def envoyer_email(destinataire: str, corps: str) -> dict:
+    ...
+
+print(agent.audit_trifecta())     # lint AU DÉMARRAGE, pas en boucle
+```
+
+Une fois le run teinté, un appel `egress` est **bloqué** (`trifecta_guard="deny"`,
+défaut), **mis en pause pour un humain** (`"approve"` → `ApprovalRequired`
+reprenable) ou **laissé passer** (`"off"`). Rétrocompatible par construction :
+aucun code existant ne pose `egress=True`.
+
+**Précédence** : les gardes intégrées passent d'abord, la `tool_policy` de l'hôte
+ensuite. Comme une politique ne peut qu'**ajouter** des refus (retourner `None`
+n'efface rien), l'hôte reste souverain — il peut refuser davantage — sans pouvoir
+affaiblir la frontière par inadvertance.
+
+**Le prix, assumé** : une sortie *légitime* est aussi bloquée après lecture de
+contenu non fiable. C'est le compromis documenté de toutes les défenses
+structurelles de cette famille. Utilise `"approve"` quand le métier exige la
+sortie.
+
+> Vérifié en réel, en A/B : avec `deny`, l'e-mail n'est pas parti et la trace porte
+> `trifecta_block` ; avec `off`, le même scénario envoie l'e-mail. Le blocage est
+> donc bien la garde, pas une pudeur du modèle.
+
+### 24.4 `enable_tool_search()` — divulgation progressive des schémas
+
+Le schéma complet de chaque outil était renvoyé à **chaque étape de chaque run**.
+Deux serveurs MCP montés et ce préfixe domine la requête ; et un modèle à qui l'on
+présente 100 outils choisit moins bien qu'avec 6. L'industrie a convergé sur le
+même remède en 2026 (tool-search d'Anthropic, code-execution avec MCP, code mode
+de Cloudflare) : ne plus expédier les schémas que le modèle n'a pas demandés.
+
+```python
+agent.enable_tool_search(threshold=15, always=("lire_fichier",), max_results=5)
+```
+
+Au-delà de `threshold` outils, la requête ne porte que le méta-outil `find_tools`
+plus les schémas déjà **révélés** (et ceux de `always`). `find_tools(query)` rend
+un catalogue nom + description (pas de schémas) et révèle les correspondances pour
+le reste du run. Scoring **lexical** volontairement (stdlib, zéro embedding,
+déterministe, débogable) ; une requête sans correspondance rend la liste nue des
+noms — le modèle n'est jamais coincé. Les outils révélés sont **re-dérivés du
+transcript**, donc un `resume` après pause d'approbation retrouve ce qui était
+chargé.
+
+**Invariant de gouvernance** : `tool_policy`, le taint et l'exécution voient
+TOUJOURS le registre complet. La visibilité borne ce qu'on **propose** au modèle,
+jamais ce que l'hôte peut **gouverner**.
+
+> Vérifié en réel : avec 38 outils et un seuil de 10, Gemini a appelé `find_tools`
+> puis directement `compter_lettres`, et a répondu juste.
+
+### 24.5 Normalisation des types de JSON Schema (correctif)
+
+Un `input_schema` n'arrive pas toujours de `schema_from_callable` : il peut être
+écrit **par le modèle** (outil dynamique via `create_python_tool`) ou fourni par un
+serveur MCP tiers. Gemini rédige les types en MAJUSCULES (`OBJECT`, `INTEGER`),
+ce qui est du JSON Schema invalide : `jsonschema` refusait alors de valider les
+arguments (donc **tout** appel à l'outil créé échouait avec `Unknown type
+'OBJECT'`) et le même schéma était rejeté par OpenAI/Anthropic. `ToolSpec`
+normalise désormais à la frontière — validation **et** portabilité réparées d'un
+coup. Conservateur (seuls les sept types, récursivement) et idempotent.
+`normalize_schema_types` est exporté.
+
+---
+
+## 25. Recall hybride, oubli en langue naturelle, OTel GenAI, fiabilité pass^k
+
+*(0.18.0)*
+
+### 25.1 `recall_mode` — recall hybride BM25 + RRF ⚠️ *changement de comportement*
+
+Avant, `FactMemory.recall()` était un **OU exclusif** : cosinus pur si `embed_fn`,
+sinon un repli qui n'était pas un algorithme de retrieval mais une intersection
+d'ensembles de mots sur `.split()` — ni IDF, ni normalisation de longueur, ni
+tokenisation (« crêpes, » ne matchait pas « crêpes »), et un seuil à 3 caractères
+qui jetait « n° », « TVA », « ok ».
+
+Les deux signaux échouent sur des requêtes **opposées** : le cosinus perd les
+correspondances exactes (n° de contrat, SIREN, plaque, identifiant), le lexical
+perd les synonymes.
+
+```python
+memoire = FactMemory(provider, path="faits.json")            # hybride par défaut
+memoire = FactMemory(provider, recall_mode="lexical")        # BM25 seul
+memoire = FactMemory(provider, recall_mode="semantic", embed_fn=embed)  # cosinus seul
+```
+
+* **BM25** (Okapi, `k1=1.5`, `b=0.75`) : de l'arithmétique pure, zéro dépendance,
+  zéro réseau. Apporte l'IDF (un terme rare pèse plus qu'un mot passe-partout) et
+  la saturation/normalisation de longueur (un fait court et ciblé n'est plus noyé
+  par un fait bavard).
+* **RRF** (`1/(60+rang)`) : on fusionne des **rangs**, pas des scores — un cosinus
+  (0→1) et un BM25 (non borné) ne sont pas comparables, leurs positions le sont.
+  Propriété utile : être 1er dans un classement et 3e dans l'autre **bat** être 2e
+  partout (convexité) → un signal très confiant est récompensé sans pouvoir
+  balayer l'autre.
+
+**Ce qui change pour un déploiement existant** : l'ORDRE des faits remontés
+s'améliore. L'API, la forme de retour et le format `[Fait #id]` sont inchangés.
+Les projets **sans** `embed_fn` gagnent la qualité BM25 gratuitement. Pour figer
+l'ancien comportement : `recall_mode="lexical"` (ou `"semantic"`).
+
+### 25.2 `forget_matching()` — oublier en langue naturelle
+
+```python
+supprimes = memoire.forget_matching("oublie tout ce qui concerne mon ancien employeur")
+apercu    = memoire.forget_matching("oublie le dossier 12", dry_run=True)  # ne touche à rien
+agent.register_forget_tool()                    # dry run par défaut (confirm=True)
+agent.register_forget_tool(confirm=False)       # supprime vraiment
+```
+
+Jusqu'ici la seule décision confiée au LLM était l'**écriture** (extraction dans
+`compact`), et l'oubli côté hôte se limitait à `forget(fact_id)` — un entier. Or
+les architectures « décision à l'écriture seule » échouent sur la suppression
+**intentionnelle** : collision de préfixe (« Paul Martin » ≠ « Paul Martineau »,
+« dossier 12 » ≠ « dossier 120 »), faits **composés** (n'oublier que l'employeur
+dans « travaille chez X et aime le thé »), variantes d'identifiants, formulation
+dans une autre langue. Déplacer la décision au moment de la **mutation** récupère
+ces cas ; le chemin de LECTURE n'est pas ralenti, ce coût n'est payé qu'ici.
+
+Garanties :
+
+* **Fail-CLOSED** (contrairement à la compaction, best-effort par contrat) : LLM en
+  panne, JSON non conforme, id hors du lot soumis, `true` déguisé en id → **rien
+  n'est supprimé**.
+* Retourne les faits **complets** supprimés — preuve d'effacement pour la trace et
+  pour une demande RGPD.
+* Pré-filtre BM25 au-delà de `max_consolidation_facts` : le prompt reste borné même
+  sur une grosse base.
+* Les embeddings des faits supprimés sont **purgés** du sidecar.
+* L'outil exposé est un **dry run par défaut** : supprimer les données d'un
+  utilisateur sur la seule décision d'un modèle n'est pas un défaut acceptable
+  pour une bibliothèque — l'hôte câble la confirmation.
+
+### 25.3 `OTelTraceExporter(semconv="gen_ai")`
+
+L'exporteur aplatissait tout sous `autoagent.*` et nommait ses spans `agent.run` /
+`llm` / `tool.<nom>`. Conséquence concrète : les traces n'étaient **pas reconnues**
+par Langfuse, Phoenix, Grafana — spans anonymes, ni modèle ni coût en jetons.
+
+```python
+exporteur = OTelTraceExporter(semconv="gen_ai")   # défaut : "autoagent" (inchangé)
+```
+
+Spans `invoke_agent` / `chat` / `execute_tool <nom>`, attributs
+`gen_ai.request.model`, `gen_ai.usage.input_tokens` / `output_tokens`,
+`gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.operation.name`. **Purement
+additif** : les attributs `autoagent.*` que consomment tes tableaux de bord
+existants sont toujours émis. Volontairement limité aux attributs du span
+*client*, stabilisés en premier — les spans « agent » sont encore expérimentaux en
+amont.
+
+### 25.4 `autoagent.eval.run_k()` — fiabilité `pass^k`
+
+```python
+from autoagent.eval import run_k
+
+rapport = run_k(lambda: construire_agent(), "Combien de lignes ERROR ?", k=8,
+                check=lambda res: "42" in res.output)   # prédicat DÉTERMINISTE
+print(rapport.summary())
+```
+
+`pass@1` ne dit presque rien à un exploitant : comme `pass^k ≈ p^k`, **90 % de
+pass@1 devient 57 % à k=8**. Le rapport donne `pass@1`, le `pass^k` **observé**,
+l'estimation `p^k` (l'effondrement que `pass@1` masque), la dispersion des étapes
+et toutes les erreurs.
+
+Deux choix délibérés : le juge est **déterministe et fourni par l'hôte** (pas de
+LLM-as-judge — sur les échecs d'agent ils plafonnent sous 55 % de justesse, accord
+au niveau du hasard en évaluation par sous-chaîne) ; et **aucune parallélisation**
+(un agent a des effets de bord, l'ordre doit rester reproductible). Un run qui
+plante **est** un échec de fiabilité ; un juge qui plante est rapporté, jamais
+avalé. Combiné à `ReplaySession`, ça donne une non-régression de fiabilité
+hors-ligne et gratuite.
+
+---
+
+## 26. Mémoire bi-temporelle et politique d'outils déclarative
+
+*(0.18.0)*
+
+### 26.1 Superséder au lieu d'écraser ⚠️ *changement de comportement*
+
+Avant, l'opération `update` de `FactMemory` **remplaçait le texte du fait en
+place**. Trois conséquences, documentées comme le mode d'échec dominant des
+mémoires d'agent :
+
+* une extraction LLM ratée **détruisait silencieusement** une donnée juste ;
+* « depuis quand ? » était sans réponse ;
+* aucun moyen d'arbitrer entre une **déclaration de l'utilisateur** et une
+  **inférence de l'agent** — il n'y avait pas de provenance.
+
+Un fait porte désormais quatre champs de plus :
+
+| Champ | Sens |
+|---|---|
+| `source` | `"user"` (déclaré), `"agent"` (inféré), `"host"` (posé par le code) |
+| `valid_from` | depuis quand c'est vrai **dans le monde** |
+| `invalid_at` | quand ça a cessé de l'être ; `None` = **courant** |
+| `superseded_by` | id du fait qui l'a remplacé |
+
+Une contradiction **ferme la fenêtre** de l'ancien fait et en crée un nouveau :
+
+```python
+m.remember("Le rendez-vous est fixé au mardi.")
+# ... l'extraction repère la contradiction ...
+m.facts()                       # -> [{'fact': 'Le rendez-vous est fixé au jeudi.', ...}]
+m.facts(include_invalid=True)   # -> le mardi est là, invalid_at renseigné
+m.history(1)                    # -> [mardi (périmé), jeudi (courant)]
+```
+
+**Invariant** : on ne sert JAMAIS un fait périmé comme courant. `recall()`, le
+bloc de contexte injecté, le prompt d'extraction et `forget_matching()` ne lisent
+que les faits valides. L'éviction (`max_facts`) écarte les **périmés d'abord** —
+sans cette priorité, la bi-temporalité aurait chassé des faits courants pour
+garder des morts.
+
+**Rétrocompatibilité** — le point d'attention de cette version :
+
+* `facts()` rend toujours **uniquement les faits courants**, c'est-à-dire
+  exactement ce que voyaient les consommateurs avant (puisque `update` écrasait) ;
+* les fichiers écrits par 0.12→0.17 — **il en existe en production** — sont migrés
+  **à la lecture**, sans destruction : les champs absents prennent des valeurs qui
+  reproduisent l'ancien comportement (aucun fait périmé, provenance `agent`,
+  `valid_from` dérivé de `updated`). Le fichier est réécrit au format complet à la
+  première sauvegarde suivante ;
+* `forget()` et `forget_matching()` continuent de supprimer **DUREMENT** : le droit
+  à l'effacement n'est pas une supersession. `history()` tolère donc un maillon
+  manquant.
+
+> Vérifié en réel (extraction Gemini sur deux appels, « rappelez-moi le soir »
+> puis « le matin ») : le courant dit « matin », le « soir » est conservé et marqué
+> périmé, et `history()` rend la chaîne datée.
+
+### 26.2 `ToolPolicySpec` — la politique en DONNÉES
+
+`tool_policy` est une fonction Python : puissante, mais elle ne se versionne pas en
+revue, ne se relit pas en diff, ne se transporte pas dans un snapshot, ne se
+génère pas. `ToolPolicySpec` dit la même chose en JSON, et `compile()` rend un
+callable de la signature **existante** — le code de production ne bouge pas.
+
+```python
+from autoagent import Agent, ToolPolicySpec
+
+spec = ToolPolicySpec.from_dict({
+    "default": "allow",
+    "rules": [
+        {"tool": "write_file", "action": "allow",
+         "when": {"args": {"path": {"starts_with": "rapports/"}}}},
+        {"tool": "write_file", "action": "deny",
+         "reason": "écriture limitée à rapports/"},
+        {"tool": "*", "action": "deny",
+         "when": {"tainted": True, "egress": True},
+         "reason": "sortie interdite après lecture de contenu non fiable"},
+        {"tool": "supprimer_compte", "action": "approve"},
+    ],
+})
+agent = Agent(provider, tool_policy=spec.compile())
+```
+
+Conditions disponibles : `args` (par argument), `tainted`, `egress`, `step`,
+`permissions`. Opérateurs : `eq`, `ne`, `in`, `not_in`, `starts_with`,
+`ends_with`, `contains`, `matches` (regex), `lt`, `le`, `gt`, `ge`, `max_length`,
+`max_items`, `exists`. Une valeur brute vaut égalité.
+
+Trois propriétés voulues :
+
+1. **Précédence par ACTION, pas par ordre** — parmi les règles qui matchent,
+   `deny` gagne, puis `approve`, puis `allow`, sinon `default`. Une politique n'a
+   donc aucun comportement caché dépendant de l'ordre des lignes : un refus ne
+   peut jamais être masqué par une autorisation placée plus haut.
+2. **Fail-CLOSED, et tôt** — une structure invalide est refusée dès `from_dict`
+   (une faute de frappe dans une politique de sécurité explose au démarrage, elle
+   ne rend pas silencieusement une règle inopérante) ; et si l'évaluation lève
+   malgré tout, l'appel est refusé.
+3. **Confinement monotone** — `narrow()` n'accepte que des règles qui
+   restreignent (`deny`/`approve`) et s'applique librement ; tout ce qui pourrait
+   élargir passe par `expand()`, qui lève `ApprovalRequired` sans `approved=True`.
+   Le solveur SMT de l'état de l'art est hors périmètre d'une lib zéro-dépendance :
+   on classe par le **type d'action**, ce qui est conservateur — dans le doute, on
+   demande.
+
+`spec.decide(ctx)` rend `(action, motif)` sans effet de bord : pratique pour
+tester une politique à sec, ou l'auditer.
+
+### 26.3 Réparation d'un JSON d'extraction tronqué (correctif)
+
+Constaté en réel (Gemini 3.5, août 2026) : la réponse d'extraction de faits arrive
+amputée de son accolade finale — `{"operations": [ {...} ]` — de façon
+reproductible et **sans lien avec `max_tokens`** (48 jetons de sortie sur un
+plafond de 800 ; sortie identique à 2048). `json.loads` échouait, **toutes** les
+opérations du tour étaient abandonnées, donc la contradiction était perdue et la
+mémoire continuait de servir le fait périmé comme courant.
+
+`_parse_operations` referme désormais les délimiteurs **restés ouverts** (en
+suivant l'état chaîne/échappement ; un document incohérent n'est pas touché) et
+**écarte le dernier élément** si la coupe est tombée en pleine chaîne — un fait au
+texte amputé serait pire que pas de fait.
+
+Asymétrie assumée : le chemin d'**oubli n'est PAS réparé**. `[123]` tronqué en
+`[12]` donnerait un id valide mais faux, donc la suppression d'un fait innocent.
+Perdre une opération d'extraction se rattrape au tour suivant ; détruire la donnée
+d'un client, non.
 
 ---
 

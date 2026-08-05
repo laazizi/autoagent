@@ -7,6 +7,194 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-08-05
+
+### Added — five code-level bounds, all opt-in (research-informed, Aug 2026)
+
+Every item below defaults to the historical behaviour: an already-deployed agent
+that does not pass the new keyword is byte-for-byte unchanged on the wire.
+
+- **`Agent(max_tool_result_chars=N)` — bound ONE tool result.** Until now nothing
+  capped what a tool injected into the transcript: a single unbounded tool (an
+  HTTP fetch, a wide `SELECT`, a file read) could blow the context window, burn
+  the whole `token_budget`, and drown the model's attention. An oversized result
+  is now truncated MIDDLE-OUT — head kept for the shape of the payload, tail kept
+  for the totals/error trailer/next-page cursor — with an explicit marker that
+  tells the model to narrow its query. The marker counts against the budget (a
+  bound that can be exceeded is not a bound), and the untrusted framing markers
+  are never cut.
+- **`Agent(max_repeated_tool_calls=N)` — loop guard.** An agent re-issuing the
+  same `(tool, arguments)` call burned `max_steps` and the full budget at full
+  price, re-ran the side effect every time, and ended on a mute `max_steps`. The
+  (N+1)-th identical call is now refused by CODE with a deterministic
+  `RepeatedCall` tool error on the same channel a policy denial uses — the
+  re-planning path that already works. Counted from the transcript, so it
+  survives checkpoint/resume with no new `RunState` field. Trace:
+  `loop_guard_block`.
+- **`@agent.tool(egress=True)` + `Agent(trifecta_guard=...)` — the third leg of
+  the lethal trifecta.** The library already instrumented untrusted input
+  (`untrusted=True`) and network-less sandboxing, but an agent could not tell a
+  `send_email` from a harmless tool: `ctx.tainted` was information every host had
+  to turn into a rule, and a host that forgot was exfiltrable. Marking a tool
+  `egress=True` makes the rule enforceable: once untrusted content has entered
+  the run, an egress call is blocked (`"deny"`, default), paused for a human
+  (`"approve"` → `ApprovalRequired`), or allowed (`"off"`). `Agent.audit_trifecta()`
+  is a boot-time configuration lint. `ToolPolicyContext.egress` exposes the flag
+  to host policies. Trace: `trifecta_block`, `trifecta_approval_required`.
+  Backward compatible by construction: no existing code sets `egress=True`.
+- **`Agent.enable_tool_search(...)` — progressive disclosure of tool schemas.**
+  Full schemas of every registered tool were re-sent at every step of every run;
+  mount two MCP servers and that prefix dominates the request, and a model shown
+  100 tools also picks worse than one shown 6. Above `threshold` tools, a run now
+  advertises only a `find_tools` meta-tool plus the schemas already revealed (and
+  `always=(...)`); `find_tools(query)` returns a cheap name+description catalogue
+  and reveals matches for the rest of the run. Deliberately lexical (stdlib, no
+  embeddings). A query matching nothing returns the bare catalogue, so the model
+  is never cornered. Revealed tools are re-derived from the transcript, so
+  `resume` after an approval pause keeps what the model had loaded. Governance
+  invariant: `tool_policy`, taint and execution always see the FULL registry —
+  visibility bounds what is OFFERED, never what the host can govern.
+
+### Added — bi-temporal memory, declarative tool policy
+
+- **⚠️ BEHAVIOUR CHANGE — a contradiction now SUPERSEDES instead of overwriting.**
+  `FactMemory`'s `update` used to replace a fact's text in place. Three
+  consequences, all documented as the dominant failure mode of agent memories: a
+  botched LLM extraction silently DESTROYED a correct value; « since when? » was
+  unanswerable; and there was no way to arbitrate between a user's statement and
+  the agent's inference. Facts now carry `source` (`user`/`agent`/`host`),
+  `valid_from`, `invalid_at` and `superseded_by`: a contradiction CLOSES the old
+  fact's validity window and creates a new one. Nothing is destroyed, and the
+  library never serves a stale fact as current — `recall`, the injected context
+  block, the extraction prompt and `forget_matching` all read valid facts only.
+  New: `facts(include_invalid=True)` and `history(fact_id)` (the supersession
+  chain, tolerant of a link hard-deleted by `forget`). Eviction drops STALE facts
+  first, so bi-temporality can never push out a current fact.
+  **Backward compatibility:** `facts()` still returns only current facts — exactly
+  what consumers saw before, since `update` overwrote. Files written by 0.12→0.17
+  (they exist in production) are migrated ON READ, non-destructively: missing
+  fields take values that reproduce the old behaviour, and the file is rewritten
+  in full format on the next save. `forget()` / `forget_matching()` keep HARD
+  deleting — the right to erasure is not a supersession.
+- **`ToolPolicySpec` — the tool policy as DATA (`autoagent/policy.py`).**
+  `tool_policy` is a Python function: powerful, but it cannot be versioned in
+  review, read as a diff, carried in a snapshot, or generated. `ToolPolicySpec`
+  expresses the same thing in JSON and `compile()` returns a callable with the
+  EXISTING `tool_policy` signature — production code does not change one line.
+  Rules match on the tool name (or `*`) with optional conditions on arguments
+  (`starts_with`, `matches`, `in`, `le`, `max_length`, `exists`…), on `tainted`,
+  `egress`, `step` and the spec's `permissions`. Three deliberate properties:
+  precedence is by ACTION (`deny` > `approve` > `allow`, then `default`) so a
+  policy has no hidden order-dependent behaviour; validation is STRICT and early
+  (a typo in a security policy fails at boot, it does not silently make a rule
+  never match) and evaluation is fail-CLOSED; and containment is monotonic —
+  `narrow()` only accepts restricting rules and applies freely, while anything
+  that could GRANT more goes through `expand()`, which raises `ApprovalRequired`
+  without `approved=True`. The SMT solver of the reference work is out of scope
+  for a zero-dependency library, so containment is classified by action type:
+  conservative by construction.
+
+### Fixed
+- **Truncated extraction JSON no longer silently discards a contradiction.**
+  Found in real conditions (Gemini 3.5, Aug 2026): the fact-extraction response
+  arrives missing its closing brace — `{"operations": [ {...} ]` — reproducibly
+  and unrelated to `max_tokens` (48 output tokens against a 800 cap, identical
+  output at 2048). `json.loads` failed, ALL of the turn's operations were dropped,
+  so the contradiction was lost and memory kept serving the stale fact as current.
+  `_parse_operations` now repairs a truncated TAIL by closing only the delimiters
+  left open (tracking string/escape state; an incoherent document is left alone),
+  and DROPS the last element when the cut fell mid-string — a fact with an
+  amputated text would be worse than no fact. Deliberately asymmetric: the forget
+  path is NOT repaired, because `[123]` truncated to `[12]` yields a valid but
+  wrong id, i.e. the deletion of an innocent fact.
+
+### Added — memory, observability, reliability measurement
+
+- **⚠️ BEHAVIOUR CHANGE — `FactMemory.recall()` is now HYBRID by default.**
+  `recall` used to be an exclusive OR: cosine similarity when `embed_fn` was set,
+  otherwise a fallback that was not a retrieval algorithm at all but a word-set
+  intersection over `.split()` — no IDF, no length normalisation, no tokenisation
+  (`"crêpes,"` did not match `"crêpes"`) and a 3-character floor that discarded
+  `"n°"`, `"TVA"`, `"ok"`. The two signals fail on OPPOSITE queries: cosine loses
+  exact matches (contract numbers, SIREN, licence plates, identifiers), lexical
+  loses synonyms. `recall_mode="hybrid"` (new default) now ranks with **BM25**
+  (Okapi, IDF + length saturation, pure arithmetic — no dependency, no network)
+  and, when `embed_fn` is present, fuses the two rankings with **RRF**
+  (`1/(60+rank)` — ranks are comparable, raw cosine and BM25 scores are not).
+  Projects WITHOUT `embed_fn` gain the BM25 quality for free. What changes for an
+  existing deployment: the ORDER of recalled facts improves — the API, the return
+  shape and the `[Fait #id]` format are untouched. Set
+  `recall_mode="lexical"` or `"semantic"` to pin the old single-signal behaviour.
+- **`FactMemory.forget_matching(instruction)` + `Agent.register_forget_tool()` —
+  forgetting in plain language.** « oublie tout ce qui concerne mon ancien
+  employeur ». Until now the only LLM decision was on WRITE (extraction in
+  `compact`) and host-side forgetting was `forget(fact_id)` — an integer. Write-time-only
+  architectures fail on INTENTIONAL deletion: prefix collisions (« Paul Martin »
+  vs « Paul Martineau »), compound facts (forget the employer, keep the tea
+  preference), identifier variants, another language. Moving the decision to
+  MUTATION time recovers those cases. Returns the full deleted facts (erasure
+  proof for the trace / a GDPR request), pre-filters big stores through BM25 so
+  the prompt stays bounded, and is **fail-CLOSED**: an LLM error, non-conforming
+  JSON, an id outside the submitted batch, or a `true` disguised as an id deletes
+  NOTHING. `dry_run=True` previews. The exposed tool defaults to `confirm=True`
+  (a dry run): erasing a user's data on a model's decision alone is not an
+  acceptable library default — the host wires the confirmation step.
+- **`OTelTraceExporter(semconv="gen_ai")` — OpenTelemetry GenAI semantic
+  conventions.** The exporter flattened everything under `autoagent.*` and named
+  spans `agent.run` / `llm` / `tool.<name>`, so exported traces were **not
+  recognised** by Langfuse, Phoenix, Grafana or any GenAI backend: anonymous
+  spans, no model, no token cost. Opt in and spans become `invoke_agent` / `chat`
+  / `execute_tool <name>` carrying `gen_ai.request.model`,
+  `gen_ai.usage.input_tokens` / `output_tokens`, `gen_ai.tool.name`,
+  `gen_ai.tool.call.id`, `gen_ai.operation.name`. Purely ADDITIVE — the
+  `autoagent.*` attributes existing dashboards consume are still emitted. Limited
+  on purpose to the client-span attributes that stabilised first; the upstream
+  *agent* spans are still experimental.
+- **`autoagent.eval.run_k()` — `pass^k` reliability measurement.** `pass@1` tells
+  an operator almost nothing: since `pass^k ≈ p^k`, 90 % of `pass@1` becomes
+  **57 % at k=8**. `run_k` runs the same task k times, asks a HOST-supplied
+  DETERMINISTIC predicate whether each result is good, and reports `pass@1`,
+  observed `pass^k`, the estimated `p^k` collapse, step dispersion and every
+  error. Deliberately no LLM-as-judge: on agent failures, LLM judges cap under
+  55 % accuracy (chance-level agreement for substring evaluation) — a *sound*
+  verifier (a schema, a file diff, a command that passes) is worth more than a
+  probabilistic opinion. A crashing run counts as a reliability failure, and a
+  crashing judge is reported instead of silently swallowed. Combine with
+  `ReplaySession` for a free offline reliability regression test.
+
+### Fixed
+- **JSON-Schema `type` keywords are normalised at the `ToolSpec` boundary.**
+  Found in real use: when a Gemini orchestrator writes the `input_schema` of a
+  dynamic tool it uses its own dialect (`OBJECT`, `INTEGER`), which is invalid
+  standard JSON Schema. Consequences were silent and severe — `jsonschema`
+  refused to validate the tool's arguments (every call to the model's own tool
+  failed with `Unknown type 'OBJECT'`), and the same schema was rejected outright
+  by OpenAI/Anthropic, killing provider portability. Schemas do not always come
+  from `schema_from_callable`: they can be written BY THE MODEL or handed over by
+  a third-party MCP server, so normalising once at the boundary fixes validation
+  AND portability. Conservative (only the seven JSON-Schema types, recursively)
+  and idempotent. `normalize_schema_types` is exported for hosts that need it.
+- **Gemini provider: tool results now ride under role `user`, grouped.**
+  Function responses were serialized with `role: "tool"`, which older Gemini
+  models tolerated but **Gemini 3.6+ rejects** with `400 "Role 'tool' is not
+  supported"`. They now use `role: "user"` (the role Gemini documents for
+  `functionResponse`), and **consecutive** tool responses from one turn
+  (`parallel_tool_calls`) are merged into a SINGLE `user` content with multiple
+  `functionResponse` parts — a naive rename would have produced consecutive
+  `user` contents and broken the user/model turn alternation. Verified on
+  gemini-3.5-flash and gemini-3.6-flash, single and parallel tool calls.
+- **Memory token accounting no longer fails a compaction.** A provider (or a test
+  double) returning a response object without `usage` made the fact-extraction
+  path raise. Token accounting is a BONUS, not a requirement: compaction is
+  best-effort by contract, so a missing `usage` is now tolerated.
+
+### Added — provider escape hatch
+- **`ModelConfig(extra_body={...})` — model-specific settings, deep-merged.** Any
+  knob a provider exposes but the library does not model (a thinking budget, a
+  safety threshold, a vendor-specific sampler) can now be passed through: the
+  dict is deep-merged into the freshly built payload, uniformly across OpenAI,
+  Anthropic and Gemini, and costs nothing when empty.
+
 ### Tooling — visual builder (`constructeur_autoagent.html`)
 - **Smarter drag-and-drop insertion.** During a drag, the canvas now shows a
   live drop *slot* (in the dragged module's category color, labelled with its
@@ -663,5 +851,12 @@ underscored or imported from a submodule path is internal and may change.
 - CI invariants: `ruff check`, `ruff format --check`, `mypy autoagent/`,
   and `pytest` are all green.
 
-[Unreleased]: https://github.com/anomalyco/alyce_autoagent/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/anomalyco/alyce_autoagent/releases/tag/v0.1.0
+[Unreleased]: https://github.com/laazizi/autoagent/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/laazizi/autoagent/releases/tag/v0.18.0
+[0.17.0]: https://github.com/laazizi/autoagent/releases/tag/v0.17.0
+[0.16.0]: https://github.com/laazizi/autoagent/releases/tag/v0.16.0
+[0.15.0]: https://github.com/laazizi/autoagent/releases/tag/v0.15.0
+[0.14.0]: https://github.com/laazizi/autoagent/releases/tag/v0.14.0
+[0.13.0]: https://github.com/laazizi/autoagent/releases/tag/v0.13.0
+[0.12.0]: https://github.com/laazizi/autoagent/releases/tag/v0.12.0
+[0.11.0]: https://github.com/laazizi/autoagent/releases/tag/v0.11.0

@@ -183,6 +183,7 @@ class ToolRegistry:
         input_schema: JsonDict | None = None,
         permissions: list[str] | None = None,
         untrusted: bool = False,
+        egress: bool = False,
     ):
         def decorator(handler: ToolHandler) -> ToolHandler:
             spec = ToolSpec(
@@ -191,6 +192,7 @@ class ToolRegistry:
                 input_schema=input_schema or schema_from_callable(handler),
                 permissions=permissions or [],
                 untrusted=untrusted,
+                egress=egress,
             )
             self.add(spec, handler)
             return handler
@@ -245,6 +247,7 @@ def tool(
     input_schema: JsonDict | None = None,
     permissions: list[str] | None = None,
     untrusted: bool = False,
+    egress: bool = False,
 ):
     def decorator(handler: ToolHandler) -> ToolHandler:
         spec = ToolSpec(
@@ -253,6 +256,7 @@ def tool(
             input_schema=input_schema or schema_from_callable(handler),
             permissions=permissions or [],
             untrusted=untrusted,
+            egress=egress,
         )
         handler.__autoagent_tool_spec__ = spec  # type: ignore[attr-defined]
         return handler

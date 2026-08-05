@@ -69,6 +69,24 @@ _OPENERS = {
     "llm_request": "llm",
     "tool_call_start": "tool",
 }
+# Noms de spans de la convention sémantique GenAI d'OpenTelemetry (0.18.0).
+# Les backends GenAI (Langfuse, Phoenix, Grafana, Tempo) reconnaissent CES noms ;
+# `agent.run`/`llm`/`tool` leur étaient opaques.
+_OPENERS_GENAI = {
+    "run_start": "invoke_agent",
+    "llm_request": "chat",
+    "tool_call_start": "execute_tool",
+}
+# Payload autoagent -> attribut `gen_ai.*`. On n'expose que les attributs du span
+# CLIENT, stabilisés en premier ; les attributs de span « agent » sont encore
+# expérimentaux en amont, donc volontairement laissés de côté.
+_GENAI_ATTRS = {
+    "model": "gen_ai.request.model",
+    "input_tokens": "gen_ai.usage.input_tokens",
+    "output_tokens": "gen_ai.usage.output_tokens",
+    "name": "gen_ai.tool.name",
+    "call_id": "gen_ai.tool.call.id",
+}
 # Events that CLOSE the span their parent_id points at.
 _CLOSERS = {"run_end", "llm_response", "tool_call_end"}
 # Payload values that mean the span ended badly.
@@ -125,10 +143,14 @@ class OTelTraceExporter:
         tracer: Any | None = None,
         *,
         tracer_name: str = "autoagent",
+        semconv: str = "autoagent",
         _api: Any | None = None,
     ) -> None:
+        if semconv not in ("autoagent", "gen_ai"):
+            raise ValueError("semconv doit valoir 'autoagent' ou 'gen_ai'")
         self._api = _api if _api is not None else _OTelAPI()
         self._tracer = tracer if tracer is not None else self._api.get_tracer(tracer_name)
+        self._semconv = semconv
         self._open: dict[str, Any] = {}
         self._lock = threading.Lock()
 
@@ -140,6 +162,13 @@ class OTelTraceExporter:
             # never break the agent loop.
             _log.exception("otel export failed for event %r", event.type)
 
+    def _span_attributes(self, event: TraceEvent) -> dict[str, Any]:
+        """`autoagent.*` toujours ; `gen_ai.*` en PLUS quand semconv='gen_ai'."""
+        attributes = _attributes(event)
+        if self._semconv == "gen_ai":
+            attributes.update(_genai_attributes(event))
+        return attributes
+
     def _handle(self, event: TraceEvent) -> None:
         ts_ns = int(event.ts * 1_000_000_000)
         with self._lock:
@@ -147,16 +176,21 @@ class OTelTraceExporter:
                 if len(self._open) >= _MAX_OPEN_SPANS:
                     _log.warning("otel: too many open spans; dropping %r", event.type)
                     return
-                name = _OPENERS[event.type]
-                if event.type == "tool_call_start" and event.payload.get("name"):
-                    name = f"tool.{event.payload['name']}"
+                if self._semconv == "gen_ai":
+                    name = _OPENERS_GENAI[event.type]
+                    if event.type == "tool_call_start" and event.payload.get("name"):
+                        name = f"execute_tool {event.payload['name']}"
+                else:
+                    name = _OPENERS[event.type]
+                    if event.type == "tool_call_start" and event.payload.get("name"):
+                        name = f"tool.{event.payload['name']}"
                 parent = self._open.get(event.parent_id) if event.parent_id else None
                 context = self._api.set_span_in_context(parent) if parent is not None else None
                 span = self._tracer.start_span(
                     name,
                     context=context,
                     start_time=ts_ns,
-                    attributes=_attributes(event),
+                    attributes=self._span_attributes(event),
                 )
                 self._open[event.span_id] = span
                 return
@@ -166,7 +200,7 @@ class OTelTraceExporter:
                 if span is None:
                     _log.debug("otel: closer %r without open span", event.type)
                     return
-                for key, value in _attributes(event).items():
+                for key, value in self._span_attributes(event).items():
                     span.set_attribute(key, value)
                 status = event.payload.get("status")
                 if status in _ERROR_STATUSES:
@@ -179,7 +213,8 @@ class OTelTraceExporter:
             # Point-in-time event: attach to the nearest open span.
             target = self._open.get(event.parent_id) if event.parent_id else None
             if target is not None:
-                target.add_event(event.type, attributes=_attributes(event), timestamp=ts_ns)
+                target.add_event(event.type, attributes=self._span_attributes(event),
+                                 timestamp=ts_ns)
             else:
                 _log.debug("otel: event %r has no open span; dropped", event.type)
 
@@ -200,6 +235,25 @@ class OTelTraceExporter:
 
     def __exit__(self, *exc_info: Any) -> None:
         self.close()
+
+
+def _genai_attributes(event: TraceEvent) -> dict[str, Any]:
+    """Attributs `gen_ai.*` dérivés du payload — ajoutés, jamais substitués.
+
+    Sans eux, les traces exportées arrivaient en spans anonymes chez Langfuse /
+    Phoenix / Grafana : ni le modèle, ni le coût en jetons n'étaient lisibles,
+    parce que tout vivait sous un préfixe `autoagent.*` que ces backends ignorent.
+    """
+    out: dict[str, Any] = {}
+    for key, value in (event.payload or {}).items():
+        target = _GENAI_ATTRS.get(key)
+        if target is not None and isinstance(value, (str, bool, int, float)):
+            out[target] = value
+    if event.type in ("llm_request", "llm_response"):
+        out.setdefault("gen_ai.operation.name", "chat")
+    elif event.type in ("tool_call_start", "tool_call_end"):
+        out.setdefault("gen_ai.operation.name", "execute_tool")
+    return out
 
 
 def _attributes(event: TraceEvent) -> dict[str, Any]:

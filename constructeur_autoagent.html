@@ -412,6 +412,8 @@ const DEFS = {
       {k:"temp",  l:"temperature", kind:"number", def:"0.0", w:"third"},
       {k:"steps", l:"max_steps", kind:"number", def:"8", w:"third"},
       {k:"budget",l:"token_budget", kind:"number", def:"", w:"third", hint:"vide = illimité"},
+      {k:"cap_res",l:"max_tool_result_chars", kind:"number", def:"", w:"third", hint:"borne UN résultat d'outil (vide = pas de borne)"},
+      {k:"cap_rep",l:"max_repeated_tool_calls", kind:"number", def:"", w:"third", hint:"refuse le N+1e appel identique (vide = off)"},
       {k:"parallel", l:"parallel_tool_calls (outils I/O en parallèle)", kind:"check", def:false},
       {k:"baseurl", l:"base_url (provider avancé)", kind:"text", def:"", w:"half", hint:"ex. api.moonshot.ai/v1 (Kimi), localhost:11434/v1 (Ollama)"},
       {k:"keyenv",  l:"api_key_env (nom de var d'env)", kind:"text", def:"", w:"half", hint:"vide = auto"},
@@ -836,6 +838,8 @@ function generate(){
     kwTail.push(`temperature=${(a.temp===""||a.temp==null)?"0.0":num(a.temp,0)}`);
     kwTail.push(`max_steps=${num(a.steps,8)}`);
     if(a.budget!=="" && a.budget!=null) kwTail.push(`token_budget=${num(a.budget,0)}`);
+    if(a.cap_res!=="" && a.cap_res!=null) kwTail.push(`max_tool_result_chars=${num(a.cap_res,0)}`);
+    if(a.cap_rep!=="" && a.cap_rep!=null) kwTail.push(`max_repeated_tool_calls=${num(a.cap_rep,0)}`);
     if(a.parallel) kwTail.push(`parallel_tool_calls=True`);
     if(dyn) kwTail.push(`max_dynamic_tools_per_run=${num(dyn.f.maxrun,3)}`);
     if(hasTrace) kwTail.push(`trace=trace`);

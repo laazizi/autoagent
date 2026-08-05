@@ -52,6 +52,8 @@ gates, durable runs, fact memory, MCP client, OpenTelemetry export.
 | `autoagent/registry.py` / `schema.py` | tool registry + JSON-schema generation; wire types |
 | `autoagent/workspace.py` / `sandbox.py` / `approval.py` | bounded writes; Docker/AST sandbox; hash-manifest promotion |
 | `autoagent/orchestrator.py` | host-driven deterministic flows |
+| `autoagent/policy.py` | `ToolPolicySpec` — tool policy as versionable JSON; `compile()` → the existing `tool_policy` signature; monotonic containment (`narrow`/`expand`) |
+| `autoagent/eval.py` | `run_k` — `pass^k` reliability measurement with a host-supplied DETERMINISTIC judge (never an LLM judge) |
 | `autoagent/providers/` | OpenAI, Anthropic, DeepSeek, Gemini (raw wire) + `RoutingProvider` |
 | `examples_autoagent/` | 18 runnable demos (French), one facet each — `_common.py` picks the provider from `.env` |
 | `examples/` | the 55-line vs 164-line before/after argument |

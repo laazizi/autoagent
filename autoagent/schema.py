@@ -86,6 +86,53 @@ class ModelConfig:
         )
 
 
+_JSON_SCHEMA_TYPES = frozenset(
+    {"object", "array", "string", "number", "integer", "boolean", "null"}
+)
+
+
+def normalize_schema_types(node: Any) -> Any:
+    """Lowercase the JSON-Schema ``type`` keywords of a schema (0.18.0).
+
+    Gemini's function-calling dialect spells types in UPPER CASE (``OBJECT``,
+    ``STRING``, ``INTEGER``…). That is fine on Gemini's own wire, but a schema
+    written that way is INVALID standard JSON Schema, so two things break the
+    moment such a schema enters the library:
+
+      * `jsonschema` refuses to validate tool arguments against it (the agent
+        then rejects every call to that tool — ``Unknown type 'OBJECT'``);
+      * sending it to another provider (OpenAI/Anthropic) is rejected outright,
+        which silently kills provider portability.
+
+    This matters because a schema does not always come from
+    ``schema_from_callable``: it can be written BY THE MODEL (a dynamic tool
+    created through ``create_python_tool``) or handed over by a third-party MCP
+    server. Normalising at the ``ToolSpec`` boundary fixes validation AND
+    portability in one place.
+
+    Conservative on purpose: only values that case-insensitively match one of
+    the seven JSON-Schema types are touched, recursively, everything else is
+    returned untouched (an unknown ``type`` is left for the validator to
+    report). Idempotent — already-lowercase schemas come back unchanged.
+    """
+    if isinstance(node, dict):
+        out: JsonDict = {}
+        for key, value in node.items():
+            if key == "type" and isinstance(value, str) and value.lower() in _JSON_SCHEMA_TYPES:
+                out[key] = value.lower()
+            elif key == "type" and isinstance(value, list):
+                out[key] = [
+                    v.lower() if isinstance(v, str) and v.lower() in _JSON_SCHEMA_TYPES else v
+                    for v in value
+                ]
+            else:
+                out[key] = normalize_schema_types(value)
+        return out
+    if isinstance(node, list):
+        return [normalize_schema_types(item) for item in node]
+    return node
+
+
 @dataclass
 class ToolSpec:
     name: str
@@ -99,6 +146,22 @@ class ToolSpec:
     # `tool_policy` via `ToolPolicyContext.tainted` (0.15.0). Opt-in : False
     # par défaut, comportement historique inchangé.
     untrusted: bool = False
+    # `egress=True` déclare que cet outil peut FAIRE SORTIR de l'information du
+    # système (envoi d'e-mail, requête HTTP sortante, webhook, écriture dans un
+    # canal public…). C'est la troisième jambe de la « lethal trifecta » :
+    # données privées + contenu non fiable + capacité de sortie = exfiltration
+    # par injection indirecte, sans aucune faille logicielle. La lib
+    # instrumentait déjà les deux premières (`untrusted`, sandbox sans réseau) ;
+    # ce drapeau rend la troisième gouvernable PAR DU CODE au lieu de laisser
+    # chaque hôte réinventer la règle (0.18.0). Opt-in : False par défaut.
+    egress: bool = False
+
+    def __post_init__(self) -> None:
+        # Frontière d'entrée des schémas : un schéma peut venir du MODÈLE (outil
+        # dynamique) ou d'un serveur MCP tiers, pas seulement de
+        # `schema_from_callable`. On normalise ici une fois pour toutes (0.18.0).
+        if self.input_schema:
+            self.input_schema = normalize_schema_types(self.input_schema)
 
     def as_openai_tool(self) -> JsonDict:
         return {

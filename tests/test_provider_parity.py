@@ -107,6 +107,41 @@ class TestGeminiToolResultNaming:
         fr = contents[-1]["parts"][0]["functionResponse"]
         assert fr["name"] == "lookup"
 
+    def test_function_response_uses_user_role_not_tool(self) -> None:
+        # Gemini 3.6+ rejects role "tool" (400 "Role 'tool' is not supported").
+        # functionResponse must ride under role "user".
+        contents = _gemini()._messages_to_contents(
+            [
+                Message(role="user", content="go"),
+                Message(role="assistant", content="",
+                        tool_calls=[ToolCall(id="c1", name="lookup", arguments={})]),
+                Message(role="tool", tool_call_id="c1", content='{"ok": true}'),
+            ]
+        )
+        assert all(c["role"] != "tool" for c in contents)
+        assert contents[-1]["role"] == "user"
+        assert "functionResponse" in contents[-1]["parts"][0]
+
+    def test_parallel_tool_responses_merged_into_one_user_content(self) -> None:
+        # Several responses in the same turn must be ONE "user" content with
+        # multiple parts — consecutive "user" contents break turn alternation.
+        contents = _gemini()._messages_to_contents(
+            [
+                Message(role="user", content="go"),
+                Message(role="assistant", content="", tool_calls=[
+                    ToolCall(id="c1", name="a", arguments={}),
+                    ToolCall(id="c2", name="b", arguments={}),
+                ]),
+                Message(role="tool", tool_call_id="c1", content="1"),
+                Message(role="tool", tool_call_id="c2", content="2"),
+            ]
+        )
+        tool_contents = [c for c in contents if any("functionResponse" in p for p in c["parts"])]
+        assert len(tool_contents) == 1                      # grouped, not two contents
+        assert tool_contents[0]["role"] == "user"
+        names = [p["functionResponse"]["name"] for p in tool_contents[0]["parts"]]
+        assert names == ["a", "b"]                          # order preserved
+
 
 class TestUsageExtraction:
     def test_openai_usage(self) -> None:

@@ -13,7 +13,7 @@ calls are stateless and can be issued concurrently.
 
 from __future__ import annotations
 
-__version__ = "0.17.0"
+__version__ = "0.18.0"
 
 from .agent import (
     Agent,
@@ -30,27 +30,18 @@ from .errors import (
     AgentCancelled,
     ApprovalRequired,
     AutoAgentError,
-    MCPError,
     MaxStepsExceeded,
-    TokenBudgetExceeded,
+    MCPError,
     ProviderError,
     ReplayMismatch,
+    TokenBudgetExceeded,
     ToolError,
     ToolValidationError,
-)
-from .replay import (
-    RecordSession,
-    RecordingProvider,
-    RecordingRegistry,
-    ReplayProvider,
-    ReplayRegistry,
-    ReplaySession,
 )
 from .evolution import EVOLUTION_CAPABILITIES, EvolutionRuntime, enable_software_evolution
 from .logging import get_logger
 from .mcp import MCPClient
 from .memory import BufferMemory, FactMemory, Memory, SummarizingMemory
-from .otel import OTelTraceExporter
 from .orchestrator import (
     InterpretOutcome,
     Orchestrator,
@@ -58,7 +49,9 @@ from .orchestrator import (
     Step,
     TurnEvent,
 )
+from .otel import OTelTraceExporter
 from .pipeline import PipelineManager
+from .policy import ToolPolicySpec
 from .providers import (
     AnthropicProvider,
     DeepSeekProvider,
@@ -69,6 +62,14 @@ from .providers import (
     create_provider,
 )
 from .registry import ToolRegistry, tool
+from .replay import (
+    RecordingProvider,
+    RecordingRegistry,
+    RecordSession,
+    ReplayProvider,
+    ReplayRegistry,
+    ReplaySession,
+)
 from .schema import (
     ImageAttachment,
     LLMRequest,
@@ -80,6 +81,7 @@ from .schema import (
     TokenUsage,
     ToolCall,
     ToolSpec,
+    normalize_schema_types,
 )
 from .trace import OnEvent, TraceEmitter, TraceEvent
 from .workspace import ProjectWorkspace
@@ -140,6 +142,7 @@ __all__ = [
     "ToolError",
     "ToolPolicy",
     "ToolPolicyContext",
+    "ToolPolicySpec",
     "ToolRegistry",
     "ToolSpec",
     "ToolValidationError",
@@ -149,6 +152,7 @@ __all__ = [
     "__version__",
     "create_provider",
     "enable_software_evolution",
+    "normalize_schema_types",
     "get_logger",
     "tool",
 ]
