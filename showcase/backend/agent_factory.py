@@ -1,17 +1,17 @@
-"""L'essaim qui fait vivre l'app : Orchestrateur + Agent Données + Agent HTML.
+"""L'agent unique qui fait vivre l'app — il gagne des capacités au fil du temps.
 
-Architecture demandée (pattern multi-agent autoagent, `as_tool`) :
+Il y avait trois agents (orchestrateur + Données + HTML reliés par `as_tool`). Le
+contrat entre l'orchestrateur et l'agent HTML n'existait QUE dans des prompts, et
+c'est de là que venait presque tout ce qui a dysfonctionné. Un seul agent
+maintenant, et publier une page est un OUTIL : la signature EST le contrat.
 
-    orchestrateur ──► obtenir_donnees   (Agent Données : vraies API/outils)
-          │      └──► construire_ecran  (Agent HTML : génère du VRAI HTML,
-          │                              l'écrit dans un workspace borné et
-          │                              l'affiche dans l'écran de droite)
-          └── le CHAT ne sert qu'à de courtes phrases ; TOUT affichage
-              (tableau, carte, fiche, formulaire, graphe) devient du HTML.
+Trois niveaux de capacité, l'humain fait monter d'un niveau :
+  1. l'agent écrit un outil    -> BAC À SABLE (jetable, sans réseau)
+  2. tu valides son empreinte  -> NATIF (dans le process, accès au contexte hôte)
+  3. (plus tard) EvolutionRuntime -> il écrit le code source d'un vrai service
 
-Bounding is code : le HTML généré est (1) écrit dans un ProjectWorkspace
-restreint aux .html (audit + réversible) et (2) rendu côté navigateur dans un
-iframe SANDBOXÉ (isolé du reste de la page).
+Ce qui est PARTAGÉ entre conversations (donc ce qui s'accumule) : les outils
+qu'il s'est écrits, les pages qu'il a publiées, et sa mémoire factuelle.
 
 Provider : Gemini si GEMINI_API_KEY (chargée depuis .env), sinon factice hors-ligne.
 """
@@ -33,7 +33,7 @@ from pathlib import Path
 RACINE = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(RACINE))
 
-from .paths import dossier_session  # noqa: E402
+from .paths import MANIFESTE, MEMOIRE, OUTILS, PAGES, dossier_session  # noqa: E402
 from .paths import slug as _slug  # noqa: E402
 
 
@@ -60,6 +60,7 @@ from autoagent import (  # noqa: E402
     Agent,
     ApprovalRequired,
     DynamicToolBuilder,
+    FactMemory,
     LLMRequest,
     LLMResponse,
     ProjectWorkspace,
@@ -67,6 +68,8 @@ from autoagent import (  # noqa: E402
     ToolBuildRequest,
     TraceEmitter,
 )
+from autoagent.approval import ToolManifest, load_tools  # noqa: E402
+from autoagent.logging import get_logger  # noqa: E402
 from autoagent.providers.base import LLMProvider  # noqa: E402
 from autoagent.sandbox import SubprocessSandbox, load_generated_tool  # noqa: E402
 from autoagent.schema import ModelConfig  # noqa: E402
@@ -111,6 +114,8 @@ class _BuilderTolerant(DynamicToolBuilder):
 # create_python_tool = le méta-outil qui fait ÉCRIRE un nouvel outil à l'agent.
 OUTILS_A_APPROUVER = {"create_python_tool"}
 
+_log = get_logger("showcase")
+
 
 # ── Provider factice (offline) ───────────────────────────────────────────────
 class _FakeProvider(LLMProvider):
@@ -128,10 +133,10 @@ class _FakeProvider(LLMProvider):
     def _reponse(request: LLMRequest) -> str:
         dernier = next((m.content for m in reversed(request.messages) if m.role == "user"), "")
         return (f"(mode démo hors-ligne) Reçu : « {dernier.strip()[:100]} ». "
-                "Pose GEMINI_API_KEY dans .env pour activer l'essaim (données + HTML généré).")
+                "Pose GEMINI_API_KEY dans .env pour activer l'agent (mémoire, outils, pages).")
 
 
-# Le modèle réel utilisé par tout l'essaim (surchargeable par la variable
+# Le modèle réel utilisé par l'agent (surchargeable par la variable
 # d'env AUTOAGENT_MODEL, ex. gemini-2.5-flash, gemini-3-pro…).
 PROVIDER_LLM = "gemini"
 MODELE_LLM = os.getenv("AUTOAGENT_MODEL", "gemini-3.6-flash")
@@ -256,38 +261,33 @@ def meteo(ville: str, jours: int = 7) -> dict:
 
 # ── Prompts système ──────────────────────────────────────────────────────────
 SYSTEME_ORCH = (
-    "Tu es l'ORCHESTRATEUR d'une application web vivante. Règle d'or : le CHAT "
-    "(tes réponses en texte) ne sert QU'À de courtes phrases conversationnelles "
-    "(1 à 2 phrases). Tu ne mets JAMAIS de tableau, de longue liste, de carte ou "
-    "de mise en page dans le chat.\n"
-    "Pour TOUT affichage riche (tableau, carte, fiche, formulaire, graphe, "
-    "dashboard…), procède ainsi :\n"
-    "  1. si des données réelles sont nécessaires, appelle obtenir_donnees ;\n"
-    "  2. puis appelle construire_ecran en décrivant précisément l'écran voulu "
-    "ET en lui passant les données (JSON) à afficher.\n"
-    "construire_ecran rend du VRAI HTML dans l'écran de droite. Après ça, réponds "
-    "juste une phrase courte, p.ex. « Voilà, c'est affiché à droite. » N'invente "
-    "jamais de données : celles qui s'affichent viennent d'obtenir_donnees.\n"
-    "Si AUCUN outil existant ne permet de traiter une demande (un calcul précis, "
-    "une transformation de texte, une conversion…), tu peux FABRIQUER un petit "
-    "outil Python via create_python_tool, PUIS l'appeler. Une validation humaine "
-    "sera demandée avant toute création — c'est normal. Fais-le avec parcimonie, "
-    "seulement quand c'est vraiment nécessaire.\n"
-    "CAS SPÉCIAL — une API qui ALIMENTE le front (vue vivante / rechargeable / "
-    "tableau de bord qui s'actualise) : ne fige PAS les données dans la page. "
-    "Demande à construire_ecran une page qui appelle en JavaScript "
-    "`window.appelerAPI('<outil>', {<arguments>})` — ça renvoie du JSON FRAIS du "
-    "serveur — au chargement ET sur un bouton « Actualiser ».\n"
-    "  IMPORTANT : dans appelerAPI, le <outil> doit être le nom CONCRET d'un outil "
-    "de DONNÉES appelable en direct. Ceux-ci sont : « meteo » (arguments : ville, "
-    "jours) et TOUT outil que TU crées via create_python_tool. N'utilise JAMAIS "
-    "« obtenir_donnees » ni « construire_ecran » dans appelerAPI : ce sont tes "
-    "délégations internes, PAS des API. Si la donnée voulue n'a pas d'outil concret, "
-    "crée-le d'abord (create_python_tool), puis passe SON nom à la page.\n"
-    "  CONTRAT DE SORTIE : quand tu wires un outil au front, DÉCRIS à construire_ecran "
-    "la FORME EXACTE de ce que l'outil renvoie (un mini-exemple JSON), et les "
-    "arguments attendus — sinon la page ne saura pas parser la réponse. Pour un "
-    "outil que tu crées, impose-lui une sortie JSON simple et documente-la à la page.")
+    "Tu es un assistant personnel qui GAGNE DES CAPACITÉS au fil du temps. Tu "
+    "parles à une seule personne, toujours la même, et tu te souviens d'elle "
+    "d'une conversation à l'autre.\n"
+    "\n"
+    "TES MOYENS, dans l'ordre où il faut y penser :\n"
+    "1. Tes outils DÉJÀ acquis. Regarde d'abord ce que tu sais faire — beaucoup "
+    "d'outils viennent de conversations passées.\n"
+    "2. Ta mémoire : `recall` pour retrouver un fait, `remember` pour noter "
+    "durablement ce qui compte (une préférence, une décision, un identifiant), "
+    "`forget` si on te demande d'oublier.\n"
+    "3. `publier_page(titre, html)` dès qu'un tableau, une fiche, un graphique ou "
+    "un formulaire serait plus lisible qu'un paragraphe. La page s'affiche à "
+    "l'écran. Écris une page COMPLÈTE et AUTONOME : tout le CSS dans une balise "
+    "<style>, le JS en ligne, AUCUN CDN ni librairie distante.\n"
+    "4. Si aucun outil ne permet de faire ce qu'on te demande, ÉCRIS-EN UN avec "
+    "`create_python_tool`. Une validation humaine est demandée avant chaque "
+    "création — c'est normal, attends-la. L'outil créé est CONSERVÉ : il servira "
+    "aux prochaines conversations.\n"
+    "\n"
+    "RÈGLES :\n"
+    "- Ne fabrique un outil que si c'est vraiment nécessaire. Réutiliser vaut "
+    "toujours mieux que recréer, et un outil de plus est un outil à maintenir.\n"
+    "- N'invente JAMAIS une donnée. Ce que tu affiches vient d'un outil.\n"
+    "- Réponses courtes dans le chat. Le détail va dans une page publiée.\n"
+    "- Si une création d'outil est refusée, termine avec les moyens existants "
+    "sans la retenter."
+)
 
 
 def _politique_approbation(ctx) -> str | None:
@@ -306,81 +306,133 @@ def _politique_approbation(ctx) -> str | None:
         raise ApprovalRequired(f"création de l'outil « {cible} » soumise à validation humaine")
     return None
 
-_SYS_DONNEES = (
-    "Tu es l'agent DONNÉES. Tu réponds uniquement avec des données vérifiées par "
-    "tes outils (jamais inventées). Renvoie les données brutes, structurées et "
-    "complètes, prêtes à être affichées. Pas de mise en forme HTML ici.")
-
-_SYS_HTML = (
-    "Tu es l'agent HTML/UI. Tu génères une page HTML COMPLÈTE et AUTONOME, design "
-    "moderne, sombre, épuré, responsive, agréable. RÈGLE STRICTE : ZÉRO dépendance "
-    "externe — INTERDIT d'utiliser <script src=...> ou <link href=...> vers un CDN "
-    "(pas de Tailwind CDN, pas de Google Fonts, pas de librairie distante). Écris "
-    "TOUT le CSS toi-même dans une balise <style> et le JS dans <script> inline. "
-    "Les images/cartes distantes sont tolérées mais prévois un repli si elles ne "
-    "chargent pas. Tu n'écris PAS le HTML en texte de réponse : tu appelles "
-    "afficher_ecran(titre, html) avec le HTML final. Utilise fidèlement les données "
-    "fournies, sans en inventer.\n"
-    "API VIVANTE : un pont JS est TOUJOURS disponible — `const r = await "
-    "window.appelerAPI(nom_outil, args)`. CONTRAT : il renvoie DIRECTEMENT le "
-    "résultat de l'outil (l'objet/typé que l'outil produit, PAS enveloppé) ; en cas "
-    "d'erreur serveur il LÈVE une exception dont le message est la vraie cause — "
-    "entoure donc l'appel de try/catch et affiche `e.message`. Ne suppose PAS de clé "
-    "'result'/'resultat' : utilise directement ce que renvoie appelerAPI, selon la "
-    "forme que l'orchestrateur t'aura décrite. Quand on te demande une vue vivante, "
-    "n'écris PAS les données en dur : appelle appelerAPI au chargement ET sur le "
-    "bouton « Actualiser », avec un état « chargement… » et un message d'erreur clair. "
-    "Ne mets pas de <form> qui se soumet (pas de navigation) : gère tout en JS "
-    "(addEventListener), preventDefault si tu utilises un formulaire.")
+# ── Ressources PARTAGÉES entre toutes les conversations ──────────────────────
+# C'est le cœur du « de plus en plus puissant » : avant, les outils générés
+# vivaient dans le dossier de la SESSION, donc rien ne s'accumulait — chaque
+# conversation repartait de zéro. Ici les outils et la mémoire sont communs, et
+# un outil forgé aujourd'hui sert la conversation de demain.
+# (les chemins vivent dans paths.py — source de vérité unique)
+OUTILS_PARTAGES = OUTILS
+PAGES_PARTAGEES = PAGES
+MEMOIRE_FAITS = MEMOIRE
 
 
-def construire_orchestrateur(session_id: str, canvas: CanvasSink,
-                             trace_sink: "TraceSink | None" = None) -> Agent:
-    """Assemble l'essaim pour UNE requête et renvoie l'orchestrateur (point d'entrée).
+def construire_agent(session_id: str, canvas: CanvasSink,
+                     trace_sink: "TraceSink | None" = None) -> Agent:
+    """UN agent, qui gagne des capacités au fil du temps.
 
-    La MÊME TraceEmitter est passée aux 3 agents → tout l'arbre de l'essaim
-    (orchestrateur → sous-agents → outils) dans une seule trace, relayée en direct
-    à l'UI via ``trace_sink`` et archivée en JSONL (audit)."""
+    Changement d'architecture (août 2026) : il y avait trois agents — un
+    orchestrateur, un agent DONNÉES et un agent HTML reliés par `as_tool`. Le
+    contrat entre l'orchestrateur et l'agent HTML n'existait QUE dans des prompts
+    (« mets le tableau dans l'écran, pas dans le chat », « appelle appelerAPI avec
+    le nom CONCRET de l'outil »), et c'est de là que venait presque tout ce qui a
+    dysfonctionné. Or la thèse de la lib est : le bornement est du CODE, pas du
+    prompt.
+
+    Ici, publier une page est un OUTIL — `publier_page(titre, html)`. La signature
+    EST le contrat : il n'y a plus rien à espérer d'une consigne.
+
+    Trois niveaux de capacité, et c'est toi qui fais monter d'un niveau :
+      1. l'agent écrit un outil     → il tourne en BAC À SABLE (jetable, sans réseau)
+      2. tu valides son empreinte   → le MÊME outil tourne en NATIF, dans le process
+      3. (plus tard) EvolutionRuntime → il écrit le code source d'un vrai service
+    """
     prov = _provider()
+    OUTILS_PARTAGES.mkdir(parents=True, exist_ok=True)
+    PAGES_PARTAGEES.mkdir(parents=True, exist_ok=True)
+    MEMOIRE_FAITS.parent.mkdir(parents=True, exist_ok=True)
+
+    # Le dossier de la conversation était créé par effet de bord du
+    # ProjectWorkspace, qui pointe désormais sur les pages PARTAGÉES : il faut donc
+    # le créer explicitement, sinon TraceEmitter ne peut pas ouvrir son fichier.
     dossier = dossier_session(session_id)
-    ws = ProjectWorkspace(dossier, allowed_write_extensions={".html"})
+    dossier.mkdir(parents=True, exist_ok=True)
     trace = TraceEmitter(
         file=str(dossier / "trace.jsonl"),
         on_event=(lambda ev: trace_sink.push(ev.to_dict())) if trace_sink else None)
 
-    # Agent DONNÉES — ses propres outils (as_tool ne partage pas ceux du parent).
-    agent_donnees = Agent(prov, system_prompt=_SYS_DONNEES, temperature=0.0, max_steps=6, trace=trace)
-    agent_donnees.tool(meteo)
+    # Les pages sont écrites sous garde : allowlist .html, anti-traversée, journal
+    # réversible. C'est l'hôte qui possède la frontière, pas l'agent.
+    pages = ProjectWorkspace(PAGES_PARTAGEES, allowed_write_extensions={".html"})
 
-    # Agent HTML — l'outil d'affichage borné (workspace + canvas).
-    agent_html = Agent(prov, system_prompt=_SYS_HTML, temperature=0.4, max_steps=4, trace=trace)
+    # Mémoire factuelle PERSISTANTE : un seul utilisateur, donc une seule identité.
+    # Elle survit aux conversations — c'est ce qui fait qu'il te reconnaît.
+    memoire = FactMemory(prov, path=str(MEMOIRE_FAITS), max_messages=30, keep_recent=10)
 
-    @agent_html.tool
-    def afficher_ecran(titre: str, html: str) -> dict:
-        """Affiche une page HTML dans l'écran de droite (et l'archive, sous garde)."""
-        nom = f"{_slug(titre) or 'ecran'}.html"
-        res = ws.write_file(nom, html, reason=f"écran généré : {titre}")
-        canvas.push(titre, html, nom)   # le HTML part en SSE, le NOM sert à la persistance
-        return {"affiche": True, "fichier": res.get("path", nom), "octets": len(html)}
+    agent = Agent(
+        prov,
+        system_prompt=SYSTEME_ORCH,
+        temperature=0.3,
+        max_steps=14,
+        memory=memoire,
+        trace=trace,
+        tool_policy=_politique_approbation,
+        max_dynamic_tools_per_run=3,
+        # ── INVARIANTS (des invariants, pas des réglages) ────────────────────
+        trifecta_guard="deny",         # rien ne sort si du contenu non fiable est entré
+        max_tool_result_chars=6000,    # un outil ne peut pas noyer le contexte
+        max_repeated_tool_calls=3,     # il ne peut pas boucler indéfiniment
+    )
 
-    # ORCHESTRATEUR — délègue via as_tool + peut forger ses propres outils (sous
-    # validation humaine grâce à tool_policy). max_steps large : création d'outil
-    # + appel + affichage tiennent dans un seul run.
-    orch = Agent(prov, system_prompt=SYSTEME_ORCH, temperature=0.3, max_steps=14,
-                 tool_policy=_politique_approbation, max_dynamic_tools_per_run=3, trace=trace)
-    orch.add_tool(agent_donnees.as_tool(
-        name="obtenir_donnees",
-        description="Récupère des données RÉELLES (ex. météo d'une ville) via des outils.",
-        request_description="Décris les données voulues en langage naturel (ville, période…)."))
-    orch.add_tool(agent_html.as_tool(
-        name="construire_ecran",
-        description="Génère et AFFICHE du vrai HTML dans l'écran de droite.",
-        request_description="Décris précisément l'écran à construire ET fournis les données (JSON) à afficher."))
-    # Outils dynamiques : l'agent ÉCRIT un outil (LLM → validation AST → sandbox).
-    # Chaque appel de l'outil généré s'exécute DANS le sandbox (isolé).
-    orch.enable_dynamic_tools(_BuilderTolerant(
-        prov, tools_dir=str(dossier / "tools"), timeout=12))
-    return orch
+    # Mémoire : lire, écrire, oublier. L'oubli reste en DRY RUN — effacer les
+    # données de quelqu'un sur la seule décision d'un modèle, non.
+    agent.register_recall_tool()
+    agent.register_remember_tool()
+    agent.register_forget_tool()
+
+    # Données réelles. `untrusted=True` : ça vient d'internet, donc c'est traité
+    # comme des DONNÉES, jamais comme des instructions — et le run devient teinté.
+    agent.tool(meteo, untrusted=True)
+
+    @agent.tool
+    def publier_page(titre: str, html: str) -> dict:
+        """Publie une page HTML autonome et l'affiche à l'écran.
+
+        Écris une page COMPLÈTE (<style> inline, aucun CDN, aucune librairie
+        distante). Utilise-la dès qu'un tableau, une fiche, un graphique ou un
+        formulaire serait plus lisible qu'un paragraphe."""
+        nom = f"{_slug(titre) or 'page'}.html"
+        res = pages.write_file(nom, html, reason=f"page publiée : {titre}")
+        canvas.push(titre, html, nom)
+        return {"publie": True, "fichier": res.get("path", nom), "octets": len(html)}
+
+    # ── Niveau 1 → 2 : les outils déjà écrits sont rechargés à chaque run.
+    # `load_tools` choisit le mode PAR OUTIL selon le manifeste : empreinte
+    # validée par toi → NATIF (dans le process, accès au contexte hôte) ; sinon
+    # → BAC À SABLE. C'est l'échelle de capacité, appliquée par du code.
+    modes = charger_outils_acquis(agent)
+
+    # L'agent peut écrire de NOUVEAUX outils (LLM → validation AST → sandbox),
+    # sous validation humaine via tool_policy. Ils atterrissent dans le dossier
+    # PARTAGÉ, donc ils survivent à la conversation.
+    agent.enable_dynamic_tools(_BuilderTolerant(
+        prov, tools_dir=str(OUTILS_PARTAGES), timeout=12))
+
+    # Quand la bibliothèque grossit, on n'envoie plus tous les schémas : l'agent
+    # cherche ses outils. Sans ça, 40 outils acquis = un préfixe énorme à chaque tour.
+    if len(agent.registry.specs()) > 12:
+        agent.enable_tool_search(threshold=12)
+
+    agent.derniers_modes = modes  # exposé pour l'UI (qui est natif, qui est en bac à sable)
+    return agent
+
+
+def charger_outils_acquis(agent: Agent) -> list[tuple[str, str]]:
+    """Recharge les outils que l'agent s'est écrits lors des conversations passées.
+
+    Renvoie [(nom, mode)] où mode vaut "native" (empreinte validée par l'humain),
+    "sandbox" (pas encore validé) ou "invalid" (ne passe plus la validation :
+    ignoré, jamais enregistré).
+    """
+    if not OUTILS_PARTAGES.is_dir():
+        return []
+    try:
+        manifeste = ToolManifest.load(MANIFESTE)
+        return load_tools(agent, OUTILS_PARTAGES, manifeste,
+                          sandbox=SubprocessSandbox(timeout=12))
+    except Exception:  # noqa: BLE001 — un outil cassé ne doit pas tuer le chat
+        _log.exception("chargement des outils acquis impossible")
+        return []
 
 
 # ── API vivante : outils exécutables en direct par le front ──────────────────
@@ -411,7 +463,7 @@ def executer_outil_live(session_id: str, tool: str, args: dict | None = None) ->
     args = args or {}
     if tool == "meteo":
         return meteo(**{k: v for k, v in args.items() if k in ("ville", "jours")})
-    tools_dir = dossier_session(session_id) / "tools"
+    tools_dir = OUTILS_PARTAGES   # outils partagés entre conversations
     f = tools_dir / f"{_slug(tool).replace('-', '_')}.py"
     if not f.is_file() and tools_dir.is_dir():
         for cand in tools_dir.glob("*.py"):          # repli : match par nom de spec

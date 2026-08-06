@@ -24,7 +24,7 @@ from typing import Any
 
 from autoagent import Message
 
-from .paths import SESSIONS, dossier_session, fichier_session, slug
+from .paths import PAGES, SESSIONS, dossier_session, fichier_session, slug
 
 DATA = SESSIONS  # compat : ancien nom du dossier des sessions
 
@@ -87,7 +87,7 @@ def _meta(page: dict, session_id: str) -> dict:
     """
     titre = page.get("titre", "")
     fichier = page.get("fichier") or (f"{slug(titre) or 'ecran'}.html")
-    if (dossier_session(session_id) / Path(fichier).name).is_file():
+    if (PAGES / Path(fichier).name).is_file():
         return {"titre": titre, "fichier": fichier}
     return {k: v for k, v in page.items() if k in ("titre", "fichier", "html")}
 
@@ -109,7 +109,10 @@ def lire_page(session_id: str, fichier: str) -> str | None:
     nom = Path(fichier or "").name
     if not nom.endswith(".html"):
         return None
-    cible = dossier_session(session_id) / nom
+    # Les pages sont PARTAGÉES entre conversations (elles s'accumulent) : on les
+    # lit dans le dossier commun, pas dans celui de la session. `session_id` reste
+    # dans la signature pour l'API, mais ne borne plus la lecture.
+    cible = PAGES / nom
     if not cible.is_file():
         return None
     try:
@@ -147,8 +150,15 @@ def lister() -> list[dict]:
 
 
 def supprimer(session_id: str) -> bool:
-    """Efface TOUTE trace de la session : le JSON (chat + historique + état en
-    attente) ET son workspace (pages HTML, outils dynamiques, trace.jsonl)."""
+    """Efface la CONVERSATION : son JSON (chat + historique + état en attente) et
+    son dossier de travail (la trace).
+
+    Ce qu'elle NE supprime PAS, volontairement : les outils que l'agent s'est
+    écrits, les pages publiées et sa mémoire factuelle. Ils sont PARTAGÉS entre
+    conversations — c'est précisément ce que l'agent a acquis. Supprimer un
+    échange ne doit pas lui faire perdre une capacité. Pour effacer un souvenir,
+    c'est `forget` ; pour retirer un outil, c'est son fichier dans data/outils.
+    """
     supprime = False
     with _LOCK:
         f = fichier_session(session_id)

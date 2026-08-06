@@ -12,8 +12,16 @@ from pathlib import Path
 
 DATA = Path(__file__).resolve().parent.parent / "data"
 SESSIONS = DATA / "sessions"
-WORKSPACE = DATA / "workspace"
+WORKSPACE = DATA / "workspace"          # par conversation : trace.jsonl
 SESSIONS.mkdir(parents=True, exist_ok=True)
+
+# ── Ce qui est PARTAGÉ entre toutes les conversations ────────────────────────
+# C'est ici que se joue la montée en puissance : ces trois dossiers survivent à
+# la suppression d'une conversation. Un outil forgé aujourd'hui sert demain.
+OUTILS = DATA / "outils"                # outils que l'agent s'est écrits
+PAGES = DATA / "pages"                  # pages qu'il a publiées
+MEMOIRE = DATA / "memoire" / "faits.json"   # un utilisateur, une mémoire
+MANIFESTE = OUTILS / "manifest.json"    # outils que l'humain a validés (→ natif)
 
 
 def slug(s: str) -> str:

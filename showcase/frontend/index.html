@@ -33,6 +33,20 @@
   .sess .s-main{flex:1; min-width:0; cursor:pointer}
   .sess .t{display:block; color:inherit; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
   .sess .m{font-size:11px; color:var(--ink-soft)}
+  /* capacités acquises : ce que l'agent sait faire, et à quel niveau */
+  #capacites{padding:0 8px 10px; display:flex; flex-direction:column; gap:5px}
+  #capacites .vide{color:var(--ink-soft); font-size:11.5px; padding:6px 6px 2px; line-height:1.5}
+  .cap{background:var(--panel-2); border:1px solid var(--line); border-radius:9px; padding:7px 9px}
+  .cap .n{display:flex; align-items:center; gap:6px; font-size:12.5px; font-weight:600}
+  .cap .niv{font-size:10px; padding:1px 6px; border-radius:20px; border:1px solid var(--line);
+        color:var(--ink-soft); white-space:nowrap}
+  .cap .niv.natif{color:var(--ok); border-color:color-mix(in srgb, var(--ok) 45%, var(--line))}
+  .cap .niv.invalide{color:#f87171; border-color:color-mix(in srgb, #f87171 45%, var(--line))}
+  .cap .d{font-size:11px; color:var(--ink-soft); margin-top:3px; line-height:1.45}
+  .cap button{margin-top:6px; width:100%; padding:4px; font-size:11px; font-weight:600;
+        border:0; border-radius:7px; cursor:pointer; background:var(--ok); color:#04220f}
+  .cap button.retro{background:var(--panel); color:var(--ink-soft); border:1px solid var(--line)}
+  #mesure{font-size:10.5px; font-weight:600; color:var(--accent); text-transform:none; letter-spacing:0}
   .sess .s-del{flex:none; border:0; background:transparent; color:var(--ink-soft); cursor:pointer;
         font-size:14px; padding:4px 6px; border-radius:7px; opacity:.35; transition:opacity .12s}
   .sess:hover .s-del{opacity:.8}
@@ -103,6 +117,8 @@
 <div class="app">
   <!-- HISTORIQUE -->
   <div class="col" id="histo">
+    <h2>Capacités acquises <span id="mesure" title="Part des demandes résolues sans créer d'outil"></span></h2>
+    <div id="capacites"><div class="vide">Aucun outil acquis pour l'instant.<br>Demande-lui quelque chose qu'il ne sait pas encore faire.</div></div>
     <h2>Conversations</h2>
     <button class="newbtn" id="new">+ Nouvelle conversation</button>
     <div id="liste"></div>
@@ -152,6 +168,55 @@ async function chargerListe(){
     box.appendChild(el);
   }
 }
+// ── Capacités acquises : ce qu'il sait faire, et à quel niveau ──────────────
+// C'est ici que « de plus en plus puissant » devient visible et mesurable.
+async function chargerCapacites(){
+  let d;
+  try{ d = await (await fetch("/api/capacites")).json(); }catch(e){ return; }
+  const m = d.mesure || {};
+  // L'autonomie récente est celle qui compte : si elle dépasse la globale, il progresse.
+  const pct = v => v==null ? "—" : Math.round(v*100)+"%";
+  $("#mesure").textContent = m.demandes
+    ? `${pct(m.autonomie_recente)} sans nouvel outil (${m.demandes} demandes)` : "";
+  $("#mesure").title = m.demandes
+    ? `Part des demandes résolues SANS créer d'outil.\nRécent : ${pct(m.autonomie_recente)} · Global : ${pct(m.autonomie_globale)}\nSi le récent dépasse le global, il progresse vraiment.`
+    : "";
+
+  const box = $("#capacites"); box.innerHTML = "";
+  const outils = d.outils || [];
+  if(!outils.length){
+    box.innerHTML = `<div class="vide">Aucun outil acquis pour l'instant.<br>Demande-lui quelque chose qu'il ne sait pas encore faire.</div>`;
+    return;
+  }
+  for(const o of outils){
+    const el = document.createElement("div"); el.className = "cap";
+    const libelle = o.mode==="natif" ? "natif" : (o.mode==="invalide" ? "invalide" : "bac à sable");
+    el.innerHTML = `<div class="n"><span>${escapeHtml(o.nom)}</span>`
+      + `<span class="niv ${o.mode==='natif'?'natif':(o.mode==='invalide'?'invalide':'')}" `
+      + `title="${o.mode==='natif' ? 'Validé par toi : tourne dans le process' : 'Pas encore validé : tourne isolé, sans réseau'}">${libelle}</span></div>`
+      + (o.description ? `<div class="d">${escapeHtml(o.description)}</div>` : "");
+    if(o.mode !== "invalide"){
+      const b = document.createElement("button");
+      const promouvoir = o.mode !== "natif";
+      b.textContent = promouvoir ? "✓ Valider → natif" : "↩ Remettre en bac à sable";
+      if(!promouvoir) b.className = "retro";
+      b.title = promouvoir
+        ? "Après validation, cet outil tournera dans le process (accès complet). L'empreinte du code est validée : s'il est réécrit, il retombe en bac à sable."
+        : "Le remet en isolation, sans le supprimer.";
+      b.onclick = async () => {
+        if(promouvoir && !confirm(`Valider « ${o.nom} » ?\n\nIl tournera DANS le process, sans isolation. Ne le fais que si tu as lu son code (${o.fichier}).`)) return;
+        b.disabled = true;
+        await fetch(`/api/capacites/${promouvoir?"promouvoir":"retrograder"}`,
+          {method:"POST", headers:{"Content-Type":"application/json"},
+           body: JSON.stringify({fichier: o.fichier})});
+        chargerCapacites();
+      };
+      el.appendChild(b);
+    }
+    box.appendChild(el);
+  }
+}
+
 async function supprimerSession(id, titre){
   if(!confirm(`Supprimer définitivement « ${titre||id} » ?\nChat, écrans générés, outils dynamiques et trace seront effacés (front + back).`)) return;
   try{ await fetch("/api/sessions/"+id, {method:"DELETE"}); }catch(e){}
@@ -281,7 +346,9 @@ async function lireFlux(resp, b){
         rebuildTabs(); activerOnglet(pagesSession.length-1);
         act(`🖥 écran rendu : <b>${escapeHtml(data.titre||"")}</b>`, "done"); }
       else if(type==="approval"){ carteApprobation(data); act(`⏸ validation requise : ${escapeHtml(data.outil||"")}`, "tool"); }
-      else if(type==="done"){ b.innerHTML = escapeHtml(acc || data.output); }
+      else if(type==="done"){ b.innerHTML = escapeHtml(acc || data.output);
+        if(data.outil_cree) act("🔧 nouvel outil acquis", "done");
+        chargerCapacites(); }
       else if(type==="error"){ b.innerHTML = escapeHtml(acc)+`<br><span style="color:#f87171">⚠ ${escapeHtml(data.error)}</span>`; act("✗ "+escapeHtml(data.error), "tool err"); }
     }
   }
@@ -338,7 +405,7 @@ function escapeHtml(s){ return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;"
   const badge = $("#mode"); badge.classList.add(h.reel ? "reel" : "factice");
   badge.title = h.reel ? `Provider ${h.provider} · modèle ${h.modele}` : "Aucune clé — provider factice hors-ligne";
   $("#mode-txt").textContent = h.reel ? `${h.provider} · ${h.modele}` : "démo hors-ligne (factice)";
-  chargerListe();
+  chargerListe(); chargerCapacites();
 })();
 </script>
 </body>

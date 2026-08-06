@@ -28,12 +28,12 @@ from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 
 from autoagent import Message, RunState
 
-from . import sessions
+from . import capacites, sessions
 from .agent_factory import (
     SYSTEME_ORCH,
     CanvasSink,
     TraceSink,
-    construire_orchestrateur,
+    construire_agent,
     executer_outil_live,
     info_approbation_en_attente,
     infos_modele,
@@ -52,6 +52,10 @@ FRONT = Path(__file__).resolve().parent.parent / "frontend"
 class MessageIn(BaseModel):
     session_id: str | None = None
     message: str
+
+
+class OutilIn(BaseModel):
+    fichier: str
 
 
 class ApproveIn(BaseModel):
@@ -85,6 +89,7 @@ async def _relais(session_id: str, gen, canvas: CanvasSink, trace: TraceSink):
     ``run_in_threadpool``).
     """
     ecrans: list[dict] = []          # métadonnées des pages produites par ce run
+    outil_cree = False               # ce run a-t-il coûté un nouvel outil ?
 
     def _rendus() -> str:
         s = ""
@@ -104,6 +109,8 @@ async def _relais(session_id: str, gen, canvas: CanvasSink, trace: TraceSink):
         elif ev.type == "tool_start":
             yield _sse("tool", {"phase": "start", "name": ev.tool_name})
         elif ev.type == "tool_end":
+            if ev.tool_name == "create_python_tool" and ev.tool_status == "ok":
+                outil_cree = True
             yield _sse("tool", {"phase": "end", "name": ev.tool_name, "status": ev.tool_status})
             if (r := _rendus()):
                 yield r
@@ -115,7 +122,13 @@ async def _relais(session_id: str, gen, canvas: CanvasSink, trace: TraceSink):
                                     pages_ajout=ecrans, pending=None)
             if (t := _traces()):
                 yield t
-            yield _sse("done", {"output": ev.output, "steps": ev.steps})
+            # La mesure de montée en puissance : cette demande a-t-elle exigé un
+            # nouvel outil ? Comptée seulement sur un run ABOUTI — un run en
+            # attente d'approbation ou en erreur n'est pas une demande traitée.
+            await run_in_threadpool(capacites.enregistrer_demande, outil_cree=outil_cree)
+            yield _sse("done", {"output": ev.output, "steps": ev.steps,
+                                "outil_cree": outil_cree,
+                                "mesure": await run_in_threadpool(capacites.mesure)})
         elif ev.type == "error":
             if (r := _rendus()):
                 yield r
@@ -158,6 +171,32 @@ async def live(session_id: str, tool: str, args: str = "{}") -> dict:
     if isinstance(res, dict) and set(res.keys()) == {"erreur"}:
         return {"ok": False, "erreur": res["erreur"]}
     return {"ok": True, "resultat": res}
+
+
+@app.get("/api/capacites")
+async def get_capacites() -> dict:
+    """Ce que l'agent a acquis + la preuve chiffrée qu'il monte en puissance."""
+    return {
+        "outils": await run_in_threadpool(capacites.inventaire),
+        "mesure": await run_in_threadpool(capacites.mesure),
+    }
+
+
+@app.post("/api/capacites/promouvoir")
+async def post_promouvoir(entree: OutilIn) -> dict:
+    """Niveau 1 -> 2 : l'outil validé tournera en NATIF (dans le process).
+
+    C'est le seul endroit de l'app où une capacité s'élargit, et il exige ce geste
+    humain explicite. L'empreinte du code est validée telle quelle : si l'agent
+    réécrit l'outil, il retombe en bac à sable tout seul.
+    """
+    return await run_in_threadpool(capacites.promouvoir, entree.fichier)
+
+
+@app.post("/api/capacites/retrograder")
+async def post_retrograder(entree: OutilIn) -> dict:
+    """Niveau 2 -> 1 : l'outil repasse en bac à sable, sans être supprimé."""
+    return await run_in_threadpool(capacites.retrograder, entree.fichier)
 
 
 @app.get("/api/sessions")
@@ -232,7 +271,7 @@ async def chat(entree: MessageIn):
     historique.append(Message(role="user", content=entree.message))
 
     canvas, trace = CanvasSink(), TraceSink()
-    orch = construire_orchestrateur(session_id, canvas, trace)
+    orch = construire_agent(session_id, canvas, trace)
     return _reponse_sse(
         session_id, orch,
         lambda: orch.run_messages_stream(historique, context={"approbations": {}}),
@@ -247,7 +286,7 @@ async def approve(entree: ApproveIn):
         raise HTTPException(404, "aucune approbation en attente pour cette session")
     state = RunState.from_dict(pend)
     canvas, trace = CanvasSink(), TraceSink()
-    orch = construire_orchestrateur(entree.session_id, canvas, trace)
+    orch = construire_agent(entree.session_id, canvas, trace)
     contexte = {"approbations": {entree.call_id: entree.decision}}
     return _reponse_sse(entree.session_id, orch,
                         lambda: orch.resume_stream(state, context=contexte), canvas, trace)
