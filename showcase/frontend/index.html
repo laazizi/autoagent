@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>autoagent — app vivante</title>
+<title>autoagent — assistant qui gagne des capacités</title>
 <style>
   :root{
     --bg:#0f1115; --panel:#161922; --panel-2:#1d212c; --line:#2a2f3c;
@@ -47,6 +47,18 @@
         border:0; border-radius:7px; cursor:pointer; background:var(--ok); color:#04220f}
   .cap button.retro{background:var(--panel); color:var(--ink-soft); border:1px solid var(--line)}
   #mesure{font-size:10.5px; font-weight:600; color:var(--accent); text-transform:none; letter-spacing:0}
+  /* niveau 3 : écrire du code source — la capacité la plus large */
+  #niveau3{margin:2px 8px 12px; padding:8px 10px; border-radius:9px;
+        border:1px dashed var(--line); background:var(--panel-2)}
+  #niveau3.on{border-style:solid; border-color:color-mix(in srgb, var(--warn) 55%, var(--line));
+        background:color-mix(in srgb, var(--warn) 8%, var(--panel-2))}
+  #niveau3 .t{display:flex; align-items:center; justify-content:space-between; gap:8px;
+        font-size:12px; font-weight:600}
+  #niveau3 .e{font-size:10.5px; color:var(--ink-soft); margin-top:4px; line-height:1.5}
+  #niveau3 button{border:0; border-radius:20px; padding:3px 10px; font-size:10.5px;
+        font-weight:700; cursor:pointer; background:var(--panel); color:var(--ink-soft);
+        border:1px solid var(--line); white-space:nowrap}
+  #niveau3.on button{background:var(--warn); color:#2a1a00; border-color:var(--warn)}
   .sess .s-del{flex:none; border:0; background:transparent; color:var(--ink-soft); cursor:pointer;
         font-size:14px; padding:4px 6px; border-radius:7px; opacity:.35; transition:opacity .12s}
   .sess:hover .s-del{opacity:.8}
@@ -102,7 +114,7 @@
         border-radius:9px 9px 0 0; font-size:12px; color:var(--ink-soft); cursor:pointer; background:var(--panel-2)}
   .tab:hover{color:var(--ink)}
   .tab.active{color:var(--ink); background:var(--bg); box-shadow:inset 0 2px 0 var(--accent)}
-  /* trace vivante de l'essaim */
+  /* trace vivante : ce que l'agent fait, en direct */
   #trace{border-top:1px solid var(--line); background:var(--bg); display:flex; flex-direction:column; max-height:200px}
   .tr-h{padding:7px 12px; font-size:11px; letter-spacing:.05em; text-transform:uppercase;
         color:var(--ink-soft); border-bottom:1px solid var(--line)}
@@ -119,6 +131,7 @@
   <div class="col" id="histo">
     <h2>Capacités acquises <span id="mesure" title="Part des demandes résolues sans créer d'outil"></span></h2>
     <div id="capacites"><div class="vide">Aucun outil acquis pour l'instant.<br>Demande-lui quelque chose qu'il ne sait pas encore faire.</div></div>
+    <div id="niveau3"></div>
     <h2>Conversations</h2>
     <button class="newbtn" id="new">+ Nouvelle conversation</button>
     <div id="liste"></div>
@@ -127,7 +140,7 @@
   <!-- CHAT -->
   <div class="col" id="chat">
     <h2>Chat</h2>
-    <div id="msgs"><div class="empty"><b>App vivante</b><br>Un chat où l'agent pilotera bientôt l'écran et fabriquera ses propres outils. Commence par écrire un message.</div></div>
+    <div id="msgs"><div class="empty"><b>App vivante</b><br>Il se souvient de toi, fabrique les outils qui lui manquent, et publie une page quand c'est plus lisible. Commence par écrire un message.</div></div>
     <div class="composer">
       <textarea id="input" rows="1" placeholder="Écris ton message…  (Entrée pour envoyer)"></textarea>
       <button id="send">Envoyer</button>
@@ -144,9 +157,9 @@
     <div id="pages"></div>
     <div class="body">
       <iframe id="frame" sandbox="allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer"></iframe>
-      <div id="placeholder"><div class="in">L'agent HTML affichera ici de <b>vraies pages</b> qu'il génère (tableaux, cartes, fiches, formulaires…). Demande par ex. « la météo de Lyon sur 7 jours » ou « une fiche produit ».</div></div>
+      <div id="placeholder"><div class="in">Les pages qu'il publie s'affichent ici (tableaux, fiches, graphiques…). Demande par ex. « la météo de Lyon sur 7 jours » ou « fais-moi une fiche récap ».</div></div>
     </div>
-    <div id="trace"><div class="tr-h">Trace de l'essaim <span id="tr-hint">— orchestrateur → sous-agents → outils</span></div><div id="tr-lignes"></div></div>
+    <div id="trace"><div class="tr-h">Ce qu'il fait <span id="tr-hint">— appels de modèle et d'outils, en direct</span></div><div id="tr-lignes"></div></div>
   </div>
 </div>
 
@@ -181,6 +194,23 @@ async function chargerCapacites(){
   $("#mesure").title = m.demandes
     ? `Part des demandes résolues SANS créer d'outil.\nRécent : ${pct(m.autonomie_recente)} · Global : ${pct(m.autonomie_globale)}\nSi le récent dépasse le global, il progresse vraiment.`
     : "";
+
+  // Niveau 3 : la capacité la plus large, donc un interrupteur explicite.
+  const n3 = $("#niveau3"), actif = !!m.niveau3;
+  n3.className = actif ? "on" : "";
+  n3.innerHTML = `<div class="t"><span>${actif ? "⚙ Écrit du code source" : "Écrire du code source"}</span>`
+    + `<button>${actif ? "Retirer" : "Accorder"}</button></div>`
+    + `<div class="e">${actif
+        ? `Il peut lire/écrire dans <code>data/projet/</code> et vérifier que ça compile.`
+          + (m.fichiers_projet ? ` <b>${m.fichiers_projet} fichier(s)</b> écrit(s).` : "")
+          + ` Il ne peut pas <b>exécuter</b> ce qu'il écrit : c'est toi qui lances.`
+        : `Niveau 3 : il écrira de vrais fichiers de code dans un dossier borné. Il ne pourra ni sortir de ce dossier, ni exécuter son code.`}</div>`;
+  n3.querySelector("button").onclick = async () => {
+    if(!actif && !confirm("Accorder l'écriture de CODE SOURCE ?\n\nIl écrira de vrais fichiers dans data/projet/ (allowlist d'extensions, aucune sortie possible du dossier, modifications annulables).\n\nIl ne pourra PAS exécuter ce code : lancer un service reste ton geste.")) return;
+    await fetch("/api/capacites/niveau3", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({actif: !actif})});
+    chargerCapacites();
+  };
 
   const box = $("#capacites"); box.innerHTML = "";
   const outils = d.outils || [];
@@ -294,7 +324,7 @@ async function ouvrirPage(i){
 }
 function activerOnglet(i){ [...$("#pages").children].forEach((t, j) => t.classList.toggle("active", j===i)); }
 
-// ── Trace vivante de l'essaim (arbre reconstruit via parent_id) ──────────────
+// ── Trace vivante (arbre reconstruit via parent_id) ─────────────────────────
 let profondeur = {};
 function resetTrace(){ profondeur = {}; $("#tr-lignes").innerHTML = ""; }
 function traceLigne(te){

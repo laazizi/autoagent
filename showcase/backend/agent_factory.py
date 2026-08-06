@@ -8,7 +8,11 @@ maintenant, et publier une page est un OUTIL : la signature EST le contrat.
 Trois niveaux de capacité, l'humain fait monter d'un niveau :
   1. l'agent écrit un outil    -> BAC À SABLE (jetable, sans réseau)
   2. tu valides son empreinte  -> NATIF (dans le process, accès au contexte hôte)
-  3. (plus tard) EvolutionRuntime -> il écrit le code source d'un vrai service
+  3. tu accordes le niveau 3   -> EvolutionRuntime : il écrit le CODE SOURCE d'un
+     projet dans `data/projet/` (allowlist d'extensions, anti-traversée, journal
+     réversible) et lance LA commande de validation de l'hôte. Il ne peut pas
+     EXÉCUTER ce qu'il écrit : lancer du code produit par un modèle reste un geste
+     manuel, hors de cette application.
 
 Ce qui est PARTAGÉ entre conversations (donc ce qui s'accumule) : les outils
 qu'il s'est écrits, les pages qu'il a publiées, et sa mémoire factuelle.
@@ -33,7 +37,8 @@ from pathlib import Path
 RACINE = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(RACINE))
 
-from .paths import MANIFESTE, MEMOIRE, OUTILS, PAGES, dossier_session  # noqa: E402
+from . import capacites  # noqa: E402
+from .paths import MANIFESTE, MEMOIRE, OUTILS, PAGES, PROJET, dossier_session  # noqa: E402
 from .paths import slug as _slug  # noqa: E402
 
 
@@ -60,6 +65,7 @@ from autoagent import (  # noqa: E402
     Agent,
     ApprovalRequired,
     DynamicToolBuilder,
+    EvolutionRuntime,
     FactMemory,
     LLMRequest,
     LLMResponse,
@@ -188,7 +194,7 @@ class CanvasSink:
 
 
 class TraceSink:
-    """Reçoit les TraceEvent de l'essaim (thread agent) pour les relayer en SSE
+    """Reçoit les TraceEvent de l'agent (thread agent) pour les relayer en SSE
     (boucle async). Même mécanique thread-safe que CanvasSink."""
 
     def __init__(self) -> None:
@@ -287,6 +293,23 @@ SYSTEME_ORCH = (
     "- Réponses courtes dans le chat. Le détail va dans une page publiée.\n"
     "- Si une création d'outil est refusée, termine avec les moyens existants "
     "sans la retenter."
+)
+
+
+SYSTEME_NIVEAU3 = (
+    "CAPACITÉ ACCORDÉE — ÉCRIRE DU CODE SOURCE.\n"
+    "Tu peux lire et écrire les fichiers d'un projet dans un dossier dédié : "
+    "`list_project_files`, `read_project_file`, `write_project_file`, "
+    "`replace_project_text`. Tu peux annuler tes propres modifications "
+    "(`rollback_last_change`, `list_changes`) — sers-t'en si tu casses quelque "
+    "chose.\n"
+    "Après avoir écrit du Python, appelle TOUJOURS `run_validation` : elle compile "
+    "le projet et te renvoie les erreurs de syntaxe. Corrige jusqu'à ce que ça "
+    "passe. Tu ne choisis pas la commande — c'est l'hôte qui la fixe.\n"
+    "Tu ne peux PAS exécuter ce que tu écris, et c'est voulu. Quand un service est "
+    "prêt, dis à l'utilisateur quel fichier lancer et comment ; c'est lui qui le "
+    "démarrera. Écris donc du code autonome, avec un point d'entrée clair et les "
+    "instructions de lancement dans un README du projet."
 )
 
 
@@ -408,6 +431,13 @@ def construire_agent(session_id: str, canvas: CanvasSink,
     agent.enable_dynamic_tools(_BuilderTolerant(
         prov, tools_dir=str(OUTILS_PARTAGES), timeout=12))
 
+    # ── NIVEAU 3 : écrire du CODE SOURCE, si l'humain a accordé la capacité ──
+    if capacites.niveau3_actif():
+        brancher_niveau3(agent)
+        # On ne décrit cette capacité au modèle QUE si elle lui est accordée :
+        # sinon il proposerait d'écrire du code qu'il ne peut pas écrire.
+        agent.system_prompt = f"{SYSTEME_ORCH}\n\n{SYSTEME_NIVEAU3}"
+
     # Quand la bibliothèque grossit, on n'envoie plus tous les schémas : l'agent
     # cherche ses outils. Sans ça, 40 outils acquis = un préfixe énorme à chaque tour.
     if len(agent.registry.specs()) > 12:
@@ -415,6 +445,37 @@ def construire_agent(session_id: str, canvas: CanvasSink,
 
     agent.derniers_modes = modes  # exposé pour l'UI (qui est natif, qui est en bac à sable)
     return agent
+
+
+def brancher_niveau3(agent: Agent) -> None:
+    """NIVEAU 3 — l'agent écrit le CODE SOURCE d'un projet, sous garde.
+
+    Ce que ça lui ouvre :
+      * lire / écrire / remplacer des fichiers dans UN dossier (`data/projet/`),
+        avec allowlist d'extensions, anti-traversée et journal réversible ;
+      * annuler ses propres modifications (`rollback_last_change`) ;
+      * lancer LA commande de validation — pas une commande de son choix.
+
+    Ce que ça ne lui ouvre PAS, volontairement :
+      * `host_call` (le pont vers des fonctions de l'hôte) : surface inutile ici ;
+      * EXÉCUTER le service qu'il écrit. `allow_custom_validation_command` reste
+        False, donc `run_validation` ne peut lancer que `compileall` — qui COMPILE
+        sans exécuter le code. Démarrer un service écrit par un modèle reste un
+        geste manuel, hors de cette application. C'est le seul endroit où j'ai
+        refusé d'automatiser quelque chose.
+    """
+    PROJET.mkdir(parents=True, exist_ok=True)
+    runtime = EvolutionRuntime(
+        PROJET,
+        # La commande est FIXÉE par l'hôte. `compileall` prouve que le code parse
+        # (et compile) sans jamais l'exécuter — l'agent a donc une boucle de
+        # retour pour corriger ses erreurs de syntaxe, sans pouvoir rien lancer.
+        validation_command=[sys.executable, "-m", "compileall", "-q", str(PROJET)],
+        allow_custom_validation_command=False,
+        allowed_write_extensions={".py", ".html", ".css", ".js", ".json", ".md",
+                                  ".txt", ".toml", ".cfg", ".ini"},
+    )
+    runtime.register_tools(agent, capabilities={"read", "write", "validate"})
 
 
 def charger_outils_acquis(agent: Agent) -> list[tuple[str, str]]:

@@ -22,6 +22,7 @@ OUTILS = DATA / "outils"                # outils que l'agent s'est écrits
 PAGES = DATA / "pages"                  # pages qu'il a publiées
 MEMOIRE = DATA / "memoire" / "faits.json"   # un utilisateur, une mémoire
 MANIFESTE = OUTILS / "manifest.json"    # outils que l'humain a validés (→ natif)
+PROJET = DATA / "projet"                # NIVEAU 3 : le code source qu'il écrit
 
 
 def slug(s: str) -> str:

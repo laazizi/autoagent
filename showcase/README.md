@@ -32,11 +32,35 @@ C'est le cœur du produit, et **c'est toi qui fais monter d'un niveau** :
 |---|---|---|
 | **1. Bac à sable** | L'agent écrit un outil. Il tourne isolé (processus jetable, sans réseau, FS en lecture seule avec Docker) | l'agent propose, tu **autorises la création** |
 | **2. Natif** | Le **même** outil tourne dans le process, avec accès au contexte hôte. Il peut faire tout ce que ton Python peut faire | **toi**, bouton « Valider → natif » |
-| **3. Service** | `EvolutionRuntime` : l'agent écrit le code source d'une vraie application, sous garde et réversible | pas encore branché ici |
+| **3. Code source** | `EvolutionRuntime` : l'agent lit/écrit de vrais fichiers de code dans `data/projet/` et vérifie que ça compile | **toi**, bouton « Accorder » |
 
 La validation porte sur l'**empreinte du code**, pas sur le nom : si l'agent
 réécrit l'outil, il **retombe** en bac à sable tout seul. Et l'échelle descend —
 « Remettre en bac à sable » retire la confiance sans supprimer l'outil.
+
+### Le niveau 3 en détail
+
+Ce qu'il ouvre : `list_project_files`, `read_project_file`, `write_project_file`,
+`replace_project_text`, `list_changes`, `rollback_last_change`, `run_validation`.
+
+Ce qui le borne, **par du code** :
+
+* un seul dossier (`data/projet/`), **allowlist d'extensions**, anti-traversée,
+  et un journal de modifications qu'il peut annuler lui-même ;
+* `allow_custom_validation_command=False` : il **ne choisit pas** la commande de
+  validation. Elle est fixée par l'hôte à `compileall`, qui **compile sans
+  exécuter**. Il a donc une boucle de retour pour corriger ses erreurs de syntaxe,
+  sans pouvoir rien lancer ;
+* `host_call` (le pont vers des fonctions de l'hôte) n'est **pas** accordé.
+
+Ce qu'il n'ouvre PAS, volontairement : **exécuter le service qu'il écrit**. Quand
+c'est prêt, il te dit quel fichier lancer ; c'est toi qui le démarres. C'est le
+seul endroit de l'app où j'ai refusé d'automatiser quelque chose.
+
+*Limite connue du journal :* `list_changes` / `rollback_last_change` vivent en
+mémoire, par instance de workspace. L'annulation fonctionne **pendant** une
+conversation, pas après un redémarrage du serveur. Pour un historique durable,
+mets `data/projet/` sous git.
 
 ## Ce qui s'accumule (et ce qui ne s'accumule pas)
 
@@ -45,6 +69,7 @@ réécrit l'outil, il **retombe** en bac à sable tout seul. Et l'échelle desce
 | `data/outils/` | les outils qu'il s'est écrits + le manifeste de validation | **oui** |
 | `data/pages/` | les pages qu'il a publiées | **oui** |
 | `data/memoire/faits.json` | sa mémoire factuelle (un seul utilisateur) | **oui** |
+| `data/projet/` | le code source qu'il écrit (niveau 3) | **oui** |
 | `data/sessions/`, `data/workspace/` | l'historique de chat et la trace, par conversation | non |
 
 Supprimer un échange ne doit pas lui faire perdre une capacité. Pour effacer un

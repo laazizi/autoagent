@@ -128,6 +128,32 @@ def enregistrer_demande(*, outil_cree: bool) -> None:
         COMPTEURS.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
+# ── Niveau 3 : l'agent écrit du CODE SOURCE ──────────────────────────────────
+# Un interrupteur, pas un réglage de code : c'est un élargissement de capacité,
+# donc il exige un geste humain explicite, et il est persistant (comme le
+# manifeste des outils promus).
+
+def niveau3_actif() -> bool:
+    return bool(_lire().get("niveau3", False))
+
+
+def activer_niveau3(actif: bool) -> dict[str, Any]:
+    """Accorde (ou retire) à l'agent le droit d'écrire du code de projet.
+
+    Ce que ça ouvre : lire/écrire des fichiers dans UN dossier borné
+    (`data/projet/`), et lancer LA commande de validation configurée par l'hôte —
+    pas une commande de son choix. Ce que ça n'ouvre PAS : exécuter le service
+    qu'il écrit. Lancer du code écrit par un modèle reste un geste manuel, hors
+    de cette application.
+    """
+    with _LOCK:
+        d = _lire()
+        d["niveau3"] = bool(actif)
+        COMPTEURS.parent.mkdir(parents=True, exist_ok=True)
+        COMPTEURS.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+    return {"niveau3": bool(actif)}
+
+
 def mesure() -> dict[str, Any]:
     """Le chiffre : part des demandes résolues SANS créer d'outil.
 
@@ -146,4 +172,15 @@ def mesure() -> dict[str, Any]:
         "autonomie_globale": round(1 - creations / total, 3) if total else None,
         "autonomie_recente": round(1 - sum(recent) / len(recent), 3) if recent else None,
         "outils_acquis": len(list(OUTILS.glob("*.py"))) if OUTILS.is_dir() else 0,
+        "niveau3": niveau3_actif(),
+        "fichiers_projet": _compter_projet(),
     }
+
+
+def _compter_projet() -> int:
+    from .paths import PROJET
+    if not PROJET.is_dir():
+        return 0
+    exclus = {".autoagent", "__pycache__"}
+    return sum(1 for p in PROJET.rglob("*")
+               if p.is_file() and not exclus & set(p.parts))

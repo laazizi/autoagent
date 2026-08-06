@@ -58,6 +58,10 @@ class OutilIn(BaseModel):
     fichier: str
 
 
+class Niveau3In(BaseModel):
+    actif: bool
+
+
 class ApproveIn(BaseModel):
     session_id: str
     call_id: str
@@ -81,7 +85,7 @@ def _fermer_trace(orch) -> None:
 
 async def _relais(session_id: str, gen, canvas: CanvasSink, trace: TraceSink):
     """Relaie un flux de StreamEvent (run OU resume) en SSE, gère l'écran, la
-    trace vivante de l'essaim, la galerie de pages et la persistance ; transforme
+    trace vivante, la galerie de pages et la persistance ; transforme
     un ApprovalRequired en événement ``approval`` (le point de pause du gate).
 
     Les écrans générés sont accumulés en mémoire et persistés en UNE écriture à la
@@ -102,7 +106,7 @@ async def _relais(session_id: str, gen, canvas: CanvasSink, trace: TraceSink):
         return "".join(_sse("trace", te) for te in trace.drain())
 
     async for ev in iterate_in_threadpool(gen):
-        if (t := _traces()):          # trace de l'essaim accumulée depuis le dernier event
+        if (t := _traces()):          # trace accumulée depuis le dernier event
             yield t
         if ev.type == "text":
             yield _sse("text", {"delta": ev.text})
@@ -197,6 +201,18 @@ async def post_promouvoir(entree: OutilIn) -> dict:
 async def post_retrograder(entree: OutilIn) -> dict:
     """Niveau 2 -> 1 : l'outil repasse en bac à sable, sans être supprimé."""
     return await run_in_threadpool(capacites.retrograder, entree.fichier)
+
+
+@app.post("/api/capacites/niveau3")
+async def post_niveau3(entree: Niveau3In) -> dict:
+    """Niveau 3 : accorde (ou retire) le droit d'écrire du CODE SOURCE.
+
+    Ouvre lire/écrire dans `data/projet/` (allowlist d'extensions, anti-traversée,
+    journal réversible) et LA commande de validation de l'hôte — jamais une
+    commande choisie par l'agent. N'ouvre PAS l'exécution du service écrit :
+    lancer du code produit par un modèle reste un geste manuel, hors de l'app.
+    """
+    return await run_in_threadpool(capacites.activer_niveau3, entree.actif)
 
 
 @app.get("/api/sessions")
