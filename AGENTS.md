@@ -29,7 +29,7 @@ gates, durable runs, fact memory, MCP client, OpenTelemetry export.
    | Observability (trace, checkpoint, OTel, memory compaction) | **fail-open**: log and continue, never break the run |
    | Security (`tool_policy`, workspace, sandbox, approval manifest) | **fail-closed**: a crashing policy DENIES |
    | Tool handlers | exceptions become tool errors the model sees — never a crash |
-5. **Run the tests**: `pytest tests -q` (791 tests, <30 s). Docker
+5. **Run the tests**: `pytest tests -q` (818 tests, <30 s). Docker
    sandbox tests skip themselves when no daemon. `tests/conftest.py`
    provides `FakeLLMProvider` (records requests in `.calls`).
 6. **Sync the docs with any change** — the recurring failure mode of this
@@ -55,7 +55,7 @@ gates, durable runs, fact memory, MCP client, OpenTelemetry export.
 | `autoagent/policy.py` | `ToolPolicySpec` — tool policy as versionable JSON; `compile()` → the existing `tool_policy` signature; monotonic containment (`narrow`/`expand`) |
 | `autoagent/eval.py` | `run_k` — `pass^k` reliability measurement with a host-supplied DETERMINISTIC judge (never an LLM judge) |
 | `autoagent/providers/` | OpenAI, Anthropic, DeepSeek, Gemini (raw wire) + `RoutingProvider` |
-| `examples_autoagent/` | 28 runnable demos (French), one facet each — `_common.py` picks the provider from `.env` |
+| `examples_autoagent/` | 30 runnable demos (French), one facet each — `_common.py` picks the provider from `.env` |
 | `examples/` | the 55-line vs 164-line before/after argument |
 | `constructeur_autoagent.html` | offline visual builder → generates Python; presets must compile (see harness note in git history) |
 | `autoagent-dev-doc.md` | the full reference (§1–26) |

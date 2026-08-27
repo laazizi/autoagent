@@ -5,6 +5,91 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] - 2026-08-27
+
+### Added — `shadow_guards`, measure a bound before you live under it
+
+- **`Agent(shadow_guards=True)` — the guard photographs instead of fining.**
+  Each built-in guard still computes its verdict and TRACES it — as
+  `loop_guard_would_block` / `trifecta_would_block` — but the call goes through,
+  and `run_end` carries `would_block`. Turning a bound on was otherwise a bet:
+  you cannot know whether `max_repeated_tool_calls=2` will refuse something
+  legitimate until it does, in production, so the common outcome is that it is
+  never enabled — or enabled once, it breaks something, and it is off forever.
+  Run a week in shadow, read "this bound would have refused 4 calls, here they
+  are", then enable it knowing. Demo 30, same scenario: 6 tool executions and
+  `would_block=4` in shadow, 2 executions once the bound is live.
+- **It pairs with replay.** Runs recorded with `RecordSession` can be replayed
+  under a DIFFERENT guard configuration, so "what would this bound have changed
+  last month?" is answered on real data, offline, at zero API cost. The brick
+  already existed; this is the first thing that uses it that way.
+- **`tool_policy` is never shadowed, by design.** The host's policy is the
+  host's boundary: a library flag must not be able to switch off code someone
+  wrote to say no. A host wanting the same can return `None` and log. There is a
+  regression test for exactly this.
+- **⚠️ Shadow mode does not protect the run.** During observation the loop
+  really loops: it spends tokens and repeats side effects. It is a measurement
+  mode, never a safe default — `False` stays the default.
+- The `would_block` / `shadow_guards` keys are ABSENT from `run_end` outside
+  shadow mode rather than zero: "no guard would have fired" and "the mode was
+  off" are different facts (same rule as `cached_tokens`).
+
+### Added — `delegate_to()`, several specialists at once
+
+- **One tool, several requests, run concurrently.** `as_tool()` exposes ONE
+  specialist, so a supervisor consulting three waits for the sum of their
+  latencies. `delegate_to({"comptage": a, "juridique": b})` registers a single
+  tool the model calls with a list of requests; those aimed at DIFFERENT
+  specialists run together. Measured on demo 29 against a real provider:
+  **14.3 s -> 8.8 s, 39 % less wall clock**, one tool call instead of three, for
+  the same work (1 576 vs 1 462 tokens).
+- **It parallelises; it does NOT go asynchronous — and that is the point.** The
+  call returns only once EVERY specialist has finished. `token_budget` is checked
+  before each LLM call against spend already known: with sub-agents still in
+  flight, the cap would bound only what has landed, not what is committed, and
+  the missing figure would not exist yet for any accounting to catch up with.
+  Same for taint, which assumes an order. Time is gained, the bound is not lost.
+- **Two details that are bugs if missed.** An `Agent` serves one caller at a
+  time, so two requests aimed at the SAME specialist are serialised while
+  different specialists run in parallel; and responses come back in REQUEST
+  order, never completion order, so the transcript stays deterministic and
+  replayable.
+- **Delegation cannot launder taint.** A specialist whose run saw untrusted
+  content returns its output inside the UNTRUSTED framing, so the parent run is
+  tainted and the trifecta guard stays armed.
+- Failure is per-request: an unknown name or a crashing specialist yields an
+  `error` on that entry and the others still run. The `specialiste` field is
+  deliberately NOT a schema `enum` — validation would reject the whole batch on
+  one typo, cancelling delegations that were valid.
+
+### Fixed — ⚠️ a delegating run was under-counted, so `token_budget` could be walked past
+
+- **A sub-agent's spend now reaches the parent's accounting.** `Agent.as_tool()`
+  turns an agent into another agent's tool, but a sub-agent is not a Python
+  function: it runs a full loop of its own, with its own LLM calls and its own
+  tokens. That cost was written into the tool result read by the MODEL
+  (`payload["tokens"]`) and then dropped — the parent's loop only summed its own
+  responses. Consequences: `result.usage` under-stated the run, and
+  `token_budget` never saw the delegated spend, so a supervisor capped at 5 000
+  tokens could burn ten times that through its specialists without the cap
+  firing. Measured on the regression test: 1 735 tokens really spent, 235
+  reported.
+  The same reflex already existed one screen away — memory compaction calls its
+  own LLM and has been counted since 0.17 (`memory.last_usage`). This was the
+  same omission, in the same place, for the other kind of sub-call.
+- **Where it is absorbed matters.** Collection happens inside the tool phase
+  (including in worker threads under `parallel_tool_calls`), but the ADDITION is
+  done in the ordered loop, right after the phase and BEFORE the next step's
+  budget check — summing from several threads would lose tokens, and absorbing
+  later would let one more LLM call through. Nested delegation needs no special
+  case: a child already absorbs its own children, so the root receives a
+  complete total.
+- **⚠️ Behaviour change to expect:** `result.usage` on a delegating run now
+  reports MORE than before — the true figure. Hosts charging from it will see
+  their numbers rise. The per-call `tokens` field in the tool result is
+  unchanged, so nothing the model reads has moved. `ToolRegistry.handler_for()`
+  is new (the return path used by the loop).
+
 ## [0.19.0] - 2026-08-27
 
 ### Added — `prune_tool_results_after`, a bound on how LONG a result lives
@@ -921,7 +1006,8 @@ underscored or imported from a submodule path is internal and may change.
 - CI invariants: `ruff check`, `ruff format --check`, `mypy autoagent/`,
   and `pytest` are all green.
 
-[Unreleased]: https://github.com/laazizi/autoagent/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/laazizi/autoagent/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/laazizi/autoagent/releases/tag/v0.20.0
 [0.19.0]: https://github.com/laazizi/autoagent/releases/tag/v0.19.0
 [0.18.0]: https://github.com/laazizi/autoagent/releases/tag/v0.18.0
 [0.17.0]: https://github.com/laazizi/autoagent/releases/tag/v0.17.0

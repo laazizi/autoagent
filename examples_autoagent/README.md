@@ -1,6 +1,6 @@
-# examples_autoagent — le potentiel d'autoagent en 28 démos
+# examples_autoagent — le potentiel d'autoagent en 30 démos
 
-Vingt-huit scripts courts, **exécutables tels quels**, montrant chacun UNE facette
+Trente scripts courts, **exécutables tels quels**, montrant chacun UNE facette
 de la lib (la n°13 les combine). Rangés du plus simple au plus avancé.
 
 ## Installation
@@ -46,6 +46,8 @@ présente. Pour forcer : `--provider gemini --model gemini-2.5-flash`.
 | 26 | `26_resultat_trop_gros.py` | **La première butée, mesurée** : le même outil et le même prompt, deux runs — seul `max_tool_result_chars=4000` change. 41 597 caractères injectés puis 4 000, 17 993 jetons puis 2 453 (−86 %), et la réponse reste juste : la coupe est au MILIEU, donc le bilan de la dernière ligne survit. La marque compte dans le budget (`len() <= 4000` vérifié dans la démo) | oui |
 | 27 | `27_cache_de_prompt.py` | **Le cache de prompt, mesuré** : la même question trois fois, un préfixe système stable de ~6 800 jetons. Run 1 : le cache s'écrit, rien n'est rapporté (« inconnu », pas « zéro »). Runs 2 et 3 (relevé du 26/08/2026) : **4 073 jetons sur 6 847 servis par le cache, 59 %** — et l'entrée totale ne bouge pas, le cache est un sous-ensemble. ⚠️ Non reproductible à volonté : le cache implicite est décidé par le fournisseur, la même démo peut n'afficher aucun cache (cf. l'en-tête de la 22). Montre aussi `cache_prompt=True`, le marqueur qu'Anthropic seul exige — le seul cache déterministe | oui |
 | 28 | `28_elagage_contexte.py` | **La butée de DURÉE** (la 26 borne la largeur, celle-ci la durée de vie) : quatre journaux lus l'un après l'autre, seul `prune_tool_results_after=1` change. **16 360 jetons d'entrée puis 7 592 (−54 %)**, réponse identique — parce qu'un vieux résultat repart à CHAQUE étape et n'est jamais dans le préfixe caché. Le marqueur dit que le résultat était *valide* (sinon le modèle replanifie autour d'un échec imaginaire), la teinte untrusted est reconduite, et le transcript rendu garde tout : on élague ce qu'on ENVOIE, pas ce qu'on GARDE | oui |
+| 29 | `29_delegation_parallele.py` | **Plusieurs spécialistes en même temps** : `delegate_to({...})` — un seul outil, plusieurs demandes, exécutées ensemble. Mesuré en réel sur trois questions : **14,3 s puis 8,8 s (−39 %)**, 1 appel d'outil au lieu de 3, pour le même travail. L'appel ne rend la main que quand TOUS ont fini : c'est ce qui garde `token_budget` exact (paralléliser ≠ passer en asynchrone). Un même spécialiste est sérialisé, l'ordre des réponses suit l'ordre des demandes, et déléguer ne lave pas la teinte | oui |
+| 30 | `30_mode_temoin.py` | **Le radar qui photographie sans verbaliser** : `shadow_guards=True` — la garde calcule son verdict, le TRACE (`loop_guard_would_block`), et laisse passer. Sur le même scénario : **6 exécutions et « aurait refusé 4 appels » en témoin, 2 exécutions une fois la borne active**. Répond à « est-ce que cette limite casserait quelque chose chez moi ? » AVANT de la subir en production — et avec le rejeu (21), sur le mois dernier, hors ligne. Ne protège PAS, et ne touche jamais à `tool_policy` : la frontière de l'hôte n'est pas débrayable par la lib | **NON** |
 
 ## Par où commencer
 

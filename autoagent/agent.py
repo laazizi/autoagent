@@ -511,6 +511,28 @@ class Agent:
             model long after the condition that produced them is gone.
             The untrusted framing is preserved on a pruned result, so
             pruning can never un-taint a run.
+        shadow_guards: OBSERVE the built-in guards instead of enforcing
+            them (0.20.0). ``False`` (default) keeps the historical
+            behaviour: a guard that fires refuses the call. Set it and
+            the verdict is still computed and TRACED — as
+            ``loop_guard_would_block`` / ``trifecta_would_block`` — but
+            the call goes through, and ``run_end`` carries
+            ``would_block`` (how many were observed). The radar
+            photographs without fining.
+            Why it exists: turning a bound on is otherwise a leap of
+            faith — you cannot know whether it will refuse something
+            legitimate until it does, in production. Run a week in
+            shadow, read "this bound would have refused 3 calls out of
+            41 000, here they are", then enable it knowing. Combined
+            with ``ReplaySession``, the same question is answered on
+            LAST month's recorded runs, offline, for free.
+            Scope, deliberately: this covers the LIBRARY's guards only.
+            ``tool_policy`` is the host's own boundary and is never
+            shadowed — a library flag must not be able to switch off
+            code the host wrote to say no. A host that wants the same
+            can return ``None`` and log.
+            ⚠️ Shadow mode does NOT protect the run. It is a
+            measurement mode, not a safe default.
         max_repeated_tool_calls: Optional loop guard (0.18.0). ``None``
             (default) keeps the historical behaviour. Set to N and the
             (N+1)-th IDENTICAL call — same tool, same arguments — is not
@@ -543,6 +565,7 @@ class Agent:
         tool_policy: ToolPolicy | None = None,
         max_tool_result_chars: int | None = None,
         prune_tool_results_after: int | None = None,
+        shadow_guards: bool = False,
         max_repeated_tool_calls: int | None = None,
         trifecta_guard: str = "deny",
     ) -> None:
@@ -562,6 +585,7 @@ class Agent:
         self.tool_policy = tool_policy
         self.max_tool_result_chars = max_tool_result_chars
         self.prune_tool_results_after = prune_tool_results_after
+        self.shadow_guards = shadow_guards
         self.max_repeated_tool_calls = max_repeated_tool_calls
         self.trifecta_guard = trifecta_guard
         self.dynamic_builder: DynamicToolBuilder | None = None
@@ -985,12 +1009,23 @@ class Agent:
         agent_self = self
 
         def handler(request: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
+            # La dépense du sous-agent est REMISE À ZÉRO avant le run : ce qui
+            # reste ici après un run raté ne doit pas être facturé au parent au
+            # tour suivant.
+            handler.__autoagent_usage__ = None  # type: ignore[attr-defined]
             result = agent_self.run(request, context=context)
             payload: dict[str, Any] = {"output": result.output, "steps": result.steps}
             if result.usage is not None:
                 payload["tokens"] = result.usage.total_tokens
+            # Canal de retour vers la comptabilité du PARENT (0.19.0). Le chiffre
+            # dans `payload` est pour le MODÈLE (il le lit dans le transcript) ;
+            # celui-ci est pour le CODE. Sans lui, un superviseur qui délègue
+            # dépensait sans que `token_budget` ne voie rien passer — un plafond
+            # qu'il suffisait de contourner en déléguant.
+            handler.__autoagent_usage__ = result.usage  # type: ignore[attr-defined]
             return payload
 
+        handler.__autoagent_usage__ = None  # type: ignore[attr-defined]
         handler.__name__ = name
         handler.__autoagent_tool_spec__ = ToolSpec(  # type: ignore[attr-defined]
             name=name,
@@ -1317,6 +1352,42 @@ class Agent:
         # entre — et le reste. Robuste à la compaction (≠ scan seul).
         taint = [resume_from.tainted if resume_from else is_tainted(working_messages)]
 
+        # Dépense des SOUS-AGENTS (`Agent.as_tool`). Cellule mutable, comme la
+        # teinte : la collecte se fait dans `_run_turn_tools`, une fonction
+        # imbriquée qui ne peut pas réaffecter `spent_in`. Le drainage a lieu
+        # après chaque tour d'outils, donc AVANT la vérification de budget de
+        # l'étape suivante — sinon `token_budget` se contournerait en déléguant
+        # (le trou : un superviseur plafonné à 5 000 jetons pouvait en brûler
+        # dix fois plus via ses spécialistes sans que rien ne s'en aperçoive).
+        # Compteur du MODE TÉMOIN : combien de refus ont été observés sans
+        # être appliqués. Remonté dans `run_end` — c'est le rapport de fin de
+        # semaine (« cette borne aurait refusé N appels »).
+        temoin = [0]
+
+        def _avec_temoin(payload: dict[str, Any]) -> dict[str, Any]:
+            """Ajoute le bilan du mode témoin au `run_end`, et seulement alors.
+
+            Une clé absente en mode normal, plutôt qu'un zéro : « aucune garde
+            n'aurait bloqué » et « le mode n'était pas actif » ne veulent pas
+            dire la même chose — c'est la même règle que pour `cached_tokens`.
+            """
+            if self.shadow_guards:
+                payload["shadow_guards"] = True
+                payload["would_block"] = temoin[0]
+            return payload
+        delegations: list[TokenUsage] = []
+
+        def _absorber_delegations() -> None:
+            nonlocal spent_in, spent_out, spent_cached, saw_cached, have_usage
+            while delegations:
+                usage = delegations.pop(0)
+                spent_in += usage.input_tokens or 0
+                spent_out += usage.output_tokens or 0
+                if usage.cached_tokens is not None:
+                    spent_cached += usage.cached_tokens
+                    saw_cached = True
+                have_usage = True
+
         def _snapshot(completed_step: int) -> RunState:
             return RunState(
                 messages=list(working_messages),
@@ -1437,7 +1508,8 @@ class Agent:
                     ),
                 )
                 self._emit(
-                    "loop_guard_block",
+                    "loop_guard_would_block" if self.shadow_guards
+                    else "loop_guard_block",
                     {"step": step, "name": call.name, "call_id": call.id, "repeats": seen},
                     parent_id=req_span,
                 )
@@ -1489,7 +1561,8 @@ class Agent:
                     ),
                 )
                 self._emit(
-                    "trifecta_block",
+                    "trifecta_would_block" if self.shadow_guards
+                    else "trifecta_block",
                     {"step": step, "name": call.name, "call_id": call.id},
                     parent_id=req_span,
                 )
@@ -1499,21 +1572,44 @@ class Agent:
             calls: list[ToolCall], step: int, req_span: str | None
         ) -> Iterator[StreamEvent]:
             """Execute one turn's tool calls (policy-checked), append results."""
-            overrides = _loop_guard_overrides(calls, step, req_span)
-            overrides.update(_trifecta_overrides(calls, step, req_span))
+            integres = _loop_guard_overrides(calls, step, req_span)
+            integres.update(_trifecta_overrides(calls, step, req_span))
+            if self.shadow_guards and integres:
+                # MODE TÉMOIN : le verdict a été calculé et TRACÉ
+                # (`*_would_block`), mais on ne l'applique pas. C'est le radar
+                # qui photographie sans verbaliser : on apprend ce qu'une borne
+                # refuserait AVANT de la subir en production.
+                temoin[0] += len(integres)
+                integres = {}
+            overrides = integres
             # La politique de l'hôte passe en DERNIER : elle ne peut qu'AJOUTER des
             # refus (retourner None n'efface rien), donc elle ne peut jamais
             # dé-bloquer une garde intégrée — l'hôte reste souverain sans pouvoir
             # affaiblir la frontière par inadvertance.
             overrides.update(_policy_overrides(calls, step, req_span))
 
-            def _timed(call: ToolCall) -> tuple[Any, int]:
+            def _timed(call: ToolCall) -> tuple[Any, int, Any]:
+                """Exécute UN appel et rend (résultat, durée, dépense déléguée).
+
+                Le troisième membre n'est renseigné que pour un outil qui est en
+                fait un AGENT (`Agent.as_tool()`). On le RELÈVE ici mais on ne
+                l'additionne pas : en mode parallèle cette fonction tourne dans
+                un thread, et cumuler depuis plusieurs threads ferait perdre des
+                jetons. L'addition a lieu dans la boucle ordonnée, en aval.
+                """
                 denied = overrides.get(call.id)
                 if denied is not None:
-                    return denied, 0
+                    return denied, 0, None
                 started_at = time.monotonic()
                 result = self.registry.execute(call, context=context)
-                return result, int((time.monotonic() - started_at) * 1000)
+                duration_ms = int((time.monotonic() - started_at) * 1000)
+                handler = self.registry.handler_for(call.name)
+                delegue = getattr(handler, "__autoagent_usage__", None)
+                if delegue is not None:
+                    # Consommé : un deuxième appel du même outil ne doit pas
+                    # refacturer la dépense du premier.
+                    handler.__autoagent_usage__ = None
+                return result, duration_ms, delegue
 
             if self.parallel_tool_calls and len(calls) > 1:
                 # Concurrent execution (opt-in). Starts are announced in
@@ -1530,7 +1626,10 @@ class Agent:
                     thread_name_prefix="autoagent-tool",
                 ) as pool:
                     outcomes = list(pool.map(_timed, calls))
-                for call, tool_span, (tool_result, duration_ms) in zip(calls, spans, outcomes):
+                for call, tool_span, (tool_result, duration_ms, delegue) in zip(
+                        calls, spans, outcomes, strict=True):
+                    if delegue is not None:
+                        delegations.append(delegue)
                     self._emit_tool_end(call, tool_span, tool_result, duration_ms)
                     yield StreamEvent(
                         type="tool_end",
@@ -1548,7 +1647,9 @@ class Agent:
                 for call in calls:
                     tool_span = self._emit_tool_start(call, req_span)
                     yield StreamEvent(type="tool_start", tool_name=call.name)
-                    tool_result, duration_ms = _timed(call)
+                    tool_result, duration_ms, delegue = _timed(call)
+                    if delegue is not None:
+                        delegations.append(delegue)
                     self._emit_tool_end(call, tool_span, tool_result, duration_ms)
                     yield StreamEvent(
                         type="tool_end",
@@ -1589,6 +1690,7 @@ class Agent:
                 yield from _run_turn_tools(
                     list(working_messages[-1].tool_calls), resume_from.step, run_span
                 )
+                _absorber_delegations()
                 _checkpoint(resume_from.step)
 
             for step in range(start_step, self.max_steps + 1):
@@ -1615,7 +1717,7 @@ class Agent:
                     )
                     self._emit(
                         "run_end",
-                        {"status": "token_budget", "steps": step - 1},
+                        _avec_temoin({"status": "token_budget", "steps": step - 1}),
                         parent_id=run_span,
                     )
                     exhausted = TokenBudgetExceeded(
@@ -1720,11 +1822,11 @@ class Agent:
                         continue
                     self._emit(
                         "run_end",
-                        {
+                        _avec_temoin({
                             "status": "ok",
                             "steps": step,
                             "output_preview": truncate_preview(response.content),
-                        },
+                        }),
                         parent_id=run_span,
                     )
                     yield StreamEvent(
@@ -1743,6 +1845,7 @@ class Agent:
                     return
 
                 yield from _run_turn_tools(list(response.tool_calls), step, req_span)
+                _absorber_delegations()
 
                 # Step boundary: every tool result of this step is in the
                 # transcript — the run is resumable from exactly here.
@@ -1751,7 +1854,7 @@ class Agent:
             self._emit("max_steps_exceeded", {"max_steps": self.max_steps}, parent_id=run_span)
             self._emit(
                 "run_end",
-                {"status": "max_steps", "steps": self.max_steps},
+                _avec_temoin({"status": "max_steps", "steps": self.max_steps}),
                 parent_id=run_span,
             )
             exceeded = MaxStepsExceeded(f"Agent exceeded max_steps={self.max_steps}")
@@ -1933,3 +2036,173 @@ def _create_python_tool_spec():
         },
         permissions=[],
     )
+
+
+def delegate_to(
+    specialistes: dict[str, Agent],
+    *,
+    name: str = "deleguer",
+    description: str | None = None,
+    max_parallel: int = 4,
+) -> Callable[..., Any]:
+    """Un outil qui interroge PLUSIEURS sous-agents EN MÊME TEMPS (0.20.0).
+
+    ``Agent.as_tool()`` expose un spécialiste ; un superviseur qui en consulte
+    trois les fait passer l'un après l'autre, et attend la somme des durées.
+    Ici le modèle envoie plusieurs demandes en un seul appel, elles partent
+    ensemble, et il récupère tout d'un coup ::
+
+        superviseur.add_tool(delegate_to({
+            "comptage":  expert_comptage,
+            "juridique": expert_juridique,
+        }))
+
+    LE CONTRAT QUI REND ÇA SÛR : l'appel **ne rend la main que lorsque TOUS les
+    spécialistes ont fini**. C'est la différence entre paralléliser et rendre le
+    système asynchrone, et elle n'est pas cosmétique. ``token_budget`` est
+    vérifié avant chaque appel LLM, sur la dépense déjà connue : avec des
+    sous-agents encore en vol, le plafond ne bornerait plus que ce qui a atterri,
+    pas ce qui est engagé — et le chiffre manquant n'existerait pas encore, donc
+    aucune comptabilité ne le rattraperait. On gagne le temps, on ne perd pas la
+    borne. Idem pour la teinte, qui suppose un ordre.
+
+    Deux détails qui sont des bugs si on les oublie :
+
+    * **Un ``Agent`` ne sert qu'un appelant à la fois.** Deux demandes adressées
+      au MÊME spécialiste sont donc exécutées l'une après l'autre ; seuls des
+      spécialistes DIFFÉRENTS tournent en parallèle.
+    * **L'ordre des réponses suit l'ordre des demandes**, jamais l'ordre
+      d'arrivée : le transcript reste déterministe, donc rejouable.
+
+    L'échec d'un spécialiste n'annule pas les autres : sa réponse porte
+    ``error``, les autres passent. Et si le run d'un spécialiste a vu du contenu
+    externe non fiable, sa sortie est rendue ENCADRÉE — sans quoi déléguer
+    laverait la teinte.
+    """
+    if not specialistes:
+        raise ValueError("delegate_to attend au moins un spécialiste")
+
+    noms = sorted(specialistes)
+    described = description or (
+        "Pose une ou plusieurs questions à des spécialistes. Les demandes "
+        "adressées à des spécialistes différents sont traitées EN PARALLÈLE : "
+        "regroupe-les en un seul appel plutôt que d'appeler l'outil plusieurs "
+        f"fois. Spécialistes disponibles : {', '.join(noms)}."
+    )
+
+    def _une(cible: str, demande: str,
+             context: dict[str, Any] | None) -> tuple[dict[str, Any], Any]:
+        agent = specialistes[cible]
+        try:
+            resultat = agent.run(demande, context=context)
+        except Exception as exc:                       # remonte au LLM, pas au parent
+            return {"specialiste": cible, "error": f"{type(exc).__name__}: {exc}"}, None
+        sortie = resultat.output
+        if is_tainted(resultat.messages):
+            # Le spécialiste a lu du contenu externe : sa sortie peut le citer.
+            # Sans ce cadre, déléguer LAVERAIT la teinte — le run parent
+            # redeviendrait « propre » et la garde trifecta se désarmerait.
+            sortie = "\n".join([UNTRUSTED_OPEN, sortie, UNTRUSTED_CLOSE])
+        reponse: dict[str, Any] = {
+            "specialiste": cible,
+            "output": sortie,
+            "steps": resultat.steps,
+        }
+        if resultat.usage is not None:
+            reponse["tokens"] = resultat.usage.total_tokens
+        return reponse, resultat.usage
+
+    def handler(demandes: list[dict[str, Any]],
+                context: dict[str, Any] | None = None) -> dict[str, Any]:
+        handler.__autoagent_usage__ = None             # type: ignore[attr-defined]
+        if not isinstance(demandes, list) or not demandes:
+            return {"reponses": [], "error": "`demandes` doit être une liste non vide."}
+
+        # Regroupement par spécialiste : un Agent ne sert qu'un appelant à la
+        # fois, donc deux demandes pour la même cible ne peuvent PAS partir
+        # ensemble. On parallélise ENTRE cibles, on sérialise À L'INTÉRIEUR.
+        groupes: dict[str, list[int]] = {}
+        reponses: list[Any] = [None] * len(demandes)
+        usages: list[Any] = [None] * len(demandes)
+        for index, item in enumerate(demandes):
+            cible = (item or {}).get("specialiste") if isinstance(item, dict) else None
+            if cible not in specialistes:
+                reponses[index] = {
+                    "specialiste": cible,
+                    "error": f"Spécialiste inconnu. Disponibles : {', '.join(noms)}.",
+                }
+                continue
+            groupes.setdefault(cible, []).append(index)
+
+        def _groupe(cible: str) -> None:
+            # Chaque index n'est écrit que par UN thread : pas de verrou requis.
+            for index in groupes[cible]:
+                demande = str((demandes[index] or {}).get("demande", ""))
+                reponses[index], usages[index] = _une(cible, demande, context)
+
+        if len(groupes) > 1:
+            with ThreadPoolExecutor(
+                max_workers=min(len(groupes), max_parallel),
+                thread_name_prefix="autoagent-delegate",
+            ) as pool:
+                list(pool.map(_groupe, list(groupes)))   # `list` = on ATTEND tout
+        else:
+            for cible in groupes:
+                _groupe(cible)
+
+        # Comptabilité : la dépense de TOUS les spécialistes remonte au parent par
+        # le même canal que `as_tool`, donc elle entre dans `token_budget`. Tout
+        # est terminé ici — c'est ce qui rend le plafond exact.
+        entree = sortie = cache = 0
+        vu = vu_cache = False
+        for usage in usages:
+            if usage is None:
+                continue
+            vu = True
+            entree += usage.input_tokens or 0
+            sortie += usage.output_tokens or 0
+            if usage.cached_tokens is not None:
+                cache += usage.cached_tokens
+                vu_cache = True
+        if vu:
+            handler.__autoagent_usage__ = TokenUsage(   # type: ignore[attr-defined]
+                input_tokens=entree, output_tokens=sortie,
+                cached_tokens=cache if vu_cache else None)
+        return {"reponses": reponses, "tokens": entree + sortie if vu else None}
+
+    handler.__autoagent_usage__ = None                 # type: ignore[attr-defined]
+    handler.__name__ = name
+    handler.__autoagent_tool_spec__ = ToolSpec(        # type: ignore[attr-defined]
+        name=name,
+        description=described,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "demandes": {
+                    "type": "array",
+                    "description": "Les demandes à traiter, en parallèle quand "
+                                   "elles visent des spécialistes différents.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            # Volontairement PAS un `enum` : la validation de
+                            # schéma rejette la requête ENTIÈRE au premier nom
+                            # inconnu, donc une coquille annulerait les autres
+                            # délégations, déjà valides. Le nom est vérifié
+                            # entrée par entrée : la faute coûte UNE réponse,
+                            # pas le lot. Les noms valides sont dans la
+                            # description et rappelés dans le message d'erreur.
+                            "specialiste": {"type": "string",
+                                            "description": f"Un de : {', '.join(noms)}."},
+                            "demande": {"type": "string"},
+                        },
+                        "required": ["specialiste", "demande"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["demandes"],
+            "additionalProperties": False,
+        },
+    )
+    return handler

@@ -13,7 +13,7 @@ calls are stateless and can be issued concurrently.
 
 from __future__ import annotations
 
-__version__ = "0.19.0"
+__version__ = "0.20.0"
 
 from .agent import (
     Agent,
@@ -24,6 +24,7 @@ from .agent import (
     RunState,
     ToolPolicy,
     ToolPolicyContext,
+    delegate_to,
 )
 from .dynamic import DynamicToolBuilder, ToolBuildRequest
 from .errors import (
@@ -97,6 +98,7 @@ __all__ = [
     "AutoAgentError",
     "BufferMemory",
     "CheckpointHook",
+    "delegate_to",
     "RunState",
     "SummarizingMemory",
     "DeepSeekProvider",

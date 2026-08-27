@@ -3,7 +3,7 @@
 > Référence technique complète pour intégrer, étendre et tester `autoagent` dans un projet Python.
 > **Public visé** : devs qui vont écrire des tools, brancher l'agent sur leur app, ou éventuellement contribuer à la lib.
 
-**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-08-27 · **Couvre autoagent** : 0.19.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
+**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-08-27 · **Couvre autoagent** : 0.20.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
 
 ---
 
@@ -47,6 +47,8 @@
 26. [Mémoire bi-temporelle et politique d'outils déclarative](#26-mémoire-bi-temporelle-et-politique-doutils-déclarative) *(0.18.0)*
 27. [Cache de prompt — mesurer avant d'activer](#27-cache-de-prompt--mesurer-avant-dactiver) *(0.19.0)*
 28. [`prune_tool_results_after` — borner la DURÉE de vie d'un résultat](#28-prune_tool_results_after--borner-la-durée-de-vie-dun-résultat) *(0.19.0)*
+29. [`delegate_to` — plusieurs spécialistes en même temps](#29-delegate_to--plusieurs-spécialistes-en-même-temps) *(0.20.0)*
+30. [`shadow_guards` — mesurer une borne avant de la subir](#30-shadow_guards--mesurer-une-borne-avant-de-la-subir) *(0.20.0)*
 
 ---
 
@@ -2327,7 +2329,33 @@ lignes, sans framework de « crew ». Sémantique précise :
 - un échec du sous-agent (`MaxStepsExceeded`, `ProviderError`…) remonte comme **tool error**
   au LLM parent — qui peut réagir — jamais comme crash du run parent ;
 - le retour porte `output`, `steps` et `tokens` → le parent (et ton transcript) voient le
-  **coût de la délégation**.
+  **coût de la délégation** ;
+- **la dépense du sous-agent entre dans la comptabilité du parent** *(corrigé après la
+  0.19.0)* : elle s'ajoute à `result.usage` et **compte dans `token_budget`**.
+
+> ⚠️ **Trou corrigé, à connaître si tu tournes en 0.19.0 ou avant.** Le chiffre
+> `tokens` du retour est écrit pour le MODÈLE ; jusqu'ici il était ensuite **jeté**,
+> et la boucle du parent n'additionnait que ses propres réponses. Donc `result.usage`
+> sous-évaluait le run, et surtout `token_budget` ne voyait **rien** passer : un
+> superviseur plafonné à 5 000 jetons pouvait en brûler dix fois plus via ses
+> spécialistes sans que le plafond se déclenche. Mesuré sur le test de
+> non-régression : **1 735 jetons dépensés, 235 rapportés**.
+>
+> Le réflexe existait pourtant à côté — la compaction mémoire appelle son propre LLM
+> et son coût est compté depuis la 0.17 (`memory.last_usage`). C'était le même oubli,
+> au même endroit, pour l'autre sous-appel.
+>
+> Détail d'implémentation qui compte : la collecte se fait pendant la phase d'outils
+> (y compris dans les threads, sous `parallel_tool_calls`), mais **l'addition a lieu
+> dans la boucle ordonnée**, juste après la phase et **avant** la vérification de
+> budget de l'étape suivante. Cumuler depuis plusieurs threads perdrait des jetons ;
+> absorber plus tard laisserait passer un appel LLM de trop. La délégation imbriquée
+> ne demande aucun cas particulier : un enfant absorbe déjà les siens, donc la racine
+> reçoit un total complet.
+>
+> ⚠️ **Changement de comportement** : sur un run qui délègue, `result.usage` rapporte
+> désormais PLUS qu'avant — le vrai chiffre. Un hôte qui facture dessus verra ses
+> montants monter.
 
 ⚠️ **Thread-safety** : un `Agent` sert UN appelant à la fois. Avec
 `parallel_tool_calls=True` côté parent, donne à chaque outil de délégation son PROPRE
@@ -3375,6 +3403,151 @@ tâche.
 La démo 28 affiche les deux réponses côte à côte pour cette raison : si elles
 divergent, le seuil est trop agressif. C'est un réglage qui se **mesure**, comme
 le reste.
+
+## 29. `delegate_to` — plusieurs spécialistes en même temps
+
+*(0.20.0)*
+
+`as_tool` (§16.3) expose UN spécialiste. Un superviseur qui en consulte trois les
+fait passer l'un après l'autre : il attend la **somme** des latences.
+
+```python
+from autoagent import delegate_to
+
+superviseur.add_tool(delegate_to({
+    "comptage":  expert_comptage,
+    "juridique": expert_juridique,
+    "capteur":   expert_capteur,
+}))
+```
+
+Un seul outil. Le modèle l'appelle avec une **liste** de demandes ; celles qui
+visent des spécialistes différents partent ensemble.
+
+Mesuré par `examples_autoagent/29_delegation_parallele.py`, trois questions
+réelles contre un vrai fournisseur : **14,3 s puis 8,8 s (−39 %)**, un appel
+d'outil au lieu de trois, pour un travail équivalent (1 576 puis 1 462 jetons).
+Le gain vient des latences qui se **recouvrent**, pas d'un travail économisé.
+
+### 29.1 Ça parallélise, ça ne passe PAS en asynchrone
+
+C'est la décision de conception, et elle n'est pas cosmétique : **l'appel ne rend
+la main que lorsque TOUS les spécialistes ont fini.**
+
+`token_budget` est vérifié avant chaque appel LLM, sur la dépense **déjà connue**
+(§16.4). Avec des sous-agents encore en vol, le plafond ne bornerait plus que ce
+qui a atterri, jamais ce qui est engagé — et le chiffre manquant n'existerait pas
+encore, donc **aucune comptabilité ne pourrait le rattraper**. Ce n'est pas un
+défaut d'implémentation qu'on corrigerait plus tard : c'est structurel.
+
+La teinte pose le même problème : elle suppose un ordre. Un résultat non fiable
+qui arriverait d'un sous-agent en tâche de fond **après** que le parent a lancé un
+outil sensible arriverait trop tard pour l'en empêcher.
+
+D'où la ligne de partage assumée : on prend le gain de temps, on refuse
+l'asynchrone. Les files de messages entre agents, les sessions qui survivent à un
+redémarrage, la reprise sous la même identité — c'est un **serveur à faire
+tourner**, pas une bibliothèque qu'on lit en entier.
+
+### 29.2 Deux détails qui sont des bugs si on les oublie
+
+**Un même spécialiste est sérialisé.** Un `Agent` ne sert qu'un appelant à la
+fois (§16.3). Deux demandes visant la MÊME cible s'exécutent donc l'une après
+l'autre ; seules des cibles différentes partent ensemble. Le test
+`test_le_meme_specialiste_est_serialise` mesure le recouvrement observé, il ne le
+suppose pas.
+
+**L'ordre des réponses suit l'ordre des DEMANDES**, jamais l'ordre d'arrivée.
+Sinon le transcript dépendrait de la latence du réseau, et le rejeu (§23)
+cesserait d'être déterministe.
+
+### 29.3 Ce qui remonte au parent
+
+* **La dépense des trois** entre dans `result.usage` et dans `token_budget`, par
+  le même canal que `as_tool` (cf. l'encadré du §16.3).
+* **La teinte.** Un spécialiste dont le run a vu du contenu externe rend sa sortie
+  ENCADRÉE (`UNTRUSTED_OPEN` / `UNTRUSTED_CLOSE`). Sans ça, déléguer laverait la
+  teinte : le run parent redeviendrait « propre » et la garde trifecta se
+  désarmerait — le trou de la 0.15 par un troisième chemin.
+* **L'échec, entrée par entrée.** Un nom inconnu ou un spécialiste qui plante
+  produit un `error` sur SA réponse ; les autres aboutissent.
+
+### 29.4 Pourquoi `specialiste` n'est pas un `enum`
+
+Le champ pourrait porter un `enum` des noms valides. Il ne le fait pas : la
+validation de schéma rejette la **requête entière** au premier nom inconnu, donc
+une coquille annulerait des délégations par ailleurs valides — exactement ce que
+l'outil cherche à éviter. Le nom est donc vérifié entrée par entrée, et les noms
+valides sont rappelés dans la description de l'outil ET dans le message d'erreur.
+
+## 30. `shadow_guards` — mesurer une borne avant de la subir
+
+*(0.20.0)*
+
+Un radar qui verbalise dès la première seconde, on ne l'installe pas : on ignore
+s'il est bien réglé, et on l'apprend quand les plaintes arrivent.
+
+C'est le problème de **toutes** les bornes de cette bibliothèque. Poser
+`max_repeated_tool_calls=2` en production est un pari : et si un agent légitime
+avait besoin d'insister trois fois ? Le dénouement habituel : soit on n'active
+jamais, soit on active une fois, ça casse, et c'est éteint pour toujours.
+
+```python
+agent = Agent(provider, max_repeated_tool_calls=2, shadow_guards=True)
+```
+
+La garde calcule son verdict, le **trace** (`loop_guard_would_block`,
+`trifecta_would_block`), et **laisse passer**. `run_end` porte le compte :
+
+```json
+{"status": "ok", "steps": 6, "shadow_guards": true, "would_block": 4}
+```
+
+Mesuré par `examples_autoagent/30_mode_temoin.py`, même scénario :
+
+| | outil exécuté | événement | bilan |
+|---|---|---|---|
+| `shadow_guards=True` | **6 fois** | `loop_guard_would_block` | `would_block: 4` |
+| borne active | **2 fois** | `loop_guard_block` | *(clé absente)* |
+
+Le rapport n'est pas un chiffre isolé : chaque cas observé porte le nom de
+l'outil, le rang de la répétition et l'étape. On regarde, on tranche, **puis**
+on active.
+
+### 30.1 Ce que ça débloque avec le rejeu
+
+Les runs enregistrés (§23) peuvent être **rejoués sous une configuration de
+gardes différente**. La question
+
+> « si j'avais eu cette borne le mois dernier, qu'est-ce que ça aurait changé ? »
+
+se répond donc sur des données réelles, **hors ligne et sans un centime d'API**.
+La brique du rejeu existait ; c'est le premier usage qui l'exploite dans ce sens.
+
+C'est aussi ce qui rend la thèse démontrable devant quelqu'un : on ne dit plus
+« les limites doivent être du code », on montre ce que cette limite **aurait
+refusé chez l'interlocuteur, la semaine dernière**.
+
+### 30.2 Portée : `tool_policy` n'est JAMAIS observée
+
+Le mode ne couvre que les gardes **intégrées** — anti-boucle et trifecta.
+
+`tool_policy` est la frontière de l'**hôte**. Un drapeau de bibliothèque ne doit
+pas pouvoir éteindre le code que quelqu'un a écrit pour dire non : ce serait une
+porte dérobée dans une frontière de sécurité, exactement ce que le contrat
+fail-closed (§20) interdit. Un hôte qui veut la même chose l'écrit lui-même —
+renvoyer `None` et journaliser. Un test de non-régression garde cette ligne.
+
+### 30.3 Deux avertissements
+
+**Le mode témoin ne protège pas.** Pendant l'observation, la boucle boucle
+vraiment : elle consomme des jetons et rejoue ses effets de bord. C'est un mode
+de **mesure**, jamais un défaut sûr — d'où `False` par défaut.
+
+**`would_block` est ABSENT hors mode témoin**, pas à zéro. « Aucune garde
+n'aurait bloqué » et « le mode n'était pas actif » ne sont pas le même fait —
+même règle que pour `cached_tokens` (§27.1). Un zéro inventé ferait croire à une
+mesure qui n'a pas eu lieu.
 
 ---
 

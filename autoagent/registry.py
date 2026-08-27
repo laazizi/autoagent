@@ -234,6 +234,18 @@ class ToolRegistry:
             return ToolResult(ok=False, error=f"Unknown tool: {call.name}")
         return tool.execute(call.arguments, context=context)
 
+    def handler_for(self, name: str) -> Any | None:
+        """Le callable enregistré sous ``name``, ou ``None``.
+
+        Utilisé par la boucle pour récupérer la dépense d'un SOUS-AGENT après
+        un appel délégué (0.19.0) : un agent exposé via ``Agent.as_tool()``
+        consomme ses propres jetons, et sans ce chemin de retour ils
+        resteraient invisibles pour ``token_budget``.
+        """
+        with self._lock:
+            tool = self._tools.get(name)
+        return tool.handler if tool is not None else None
+
     def __contains__(self, name: str) -> bool:
         with self._lock:
             return name in self._tools
