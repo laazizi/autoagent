@@ -26,7 +26,7 @@ for _stream in (sys.stdout, sys.stderr):
 from autoagent import ModelConfig, create_provider  # noqa: E402
 
 DEFAULTS = {
-    "gemini": "gemini-2.5-flash",
+    "gemini": "gemini-3.7-flash",
     "deepseek": "deepseek-chat",
     "openai": "gpt-4o-mini",
     "anthropic": "claude-sonnet-4-5",

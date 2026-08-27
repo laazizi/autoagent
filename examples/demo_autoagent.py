@@ -21,6 +21,8 @@ Tout est de l'autoagent standard :
 Lancer :  GEMINI_API_KEY=...  python demo_autoagent.py
 """
 
+import os
+import pathlib
 import sys
 from pathlib import Path
 
@@ -28,6 +30,27 @@ ICI = Path(__file__).resolve().parent
 sys.path.insert(0, str(ICI.parent))               # racine du repo → `import autoagent`
 
 from autoagent import Agent, ProjectWorkspace, TraceEmitter
+
+# ── Lecture du .env de la racine (sans dépendance : 6 lignes suffisent). ─────
+def _charger_env() -> None:
+    fichier = pathlib.Path(__file__).resolve().parents[1] / ".env"
+    if not fichier.is_file():
+        return
+    for ligne in fichier.read_text(encoding="utf-8").splitlines():
+        ligne = ligne.strip()
+        if ligne and not ligne.startswith("#") and "=" in ligne:
+            cle, _, valeur = ligne.partition("=")
+            # setdefault : une variable déjà posée dans l'environnement gagne.
+            os.environ.setdefault(cle.strip(), valeur.strip().strip("\"'"))
+
+
+_charger_env()
+
+# ── UNE seule ligne à changer pour passer d'un fournisseur à l'autre. ────────
+FOURNISSEUR, MODELE = "deepseek", "deepseek-chat"
+# FOURNISSEUR, MODELE = "gemini",    "gemini-3.7-flash"
+# FOURNISSEUR, MODELE = "openai",    "gpt-4o-mini"
+# FOURNISSEUR, MODELE = "anthropic", "claude-sonnet-4-5"
 
 trace = TraceEmitter(file=str(ICI / "trace_orchestre.jsonl"))   # un arbre pour tout l'essaim
 
@@ -46,7 +69,7 @@ def compter(texte: str, mot: str) -> int:
 
 
 def creer_analyste(nom: str, mission: str) -> Agent:
-    analyste = Agent.from_model("gemini", "gemini-3.5-flash",
+    analyste = Agent.from_model(FOURNISSEUR, MODELE,
                                 system_prompt=f"Tu es {nom}. {mission} "
                                 "Tu ne rapportes que des chiffres vérifiés par tes outils.",
                                 temperature=0.0, trace=trace)
@@ -61,7 +84,7 @@ analyste_paiements = creer_analyste(
     "analyste_paiements", "Tu analyses payments.log : paiements échoués, raisons, montants.")
 
 orchestrateur = Agent.from_model(
-    "gemini", "gemini-3.5-flash",
+    FOURNISSEUR, MODELE,
     system_prompt=(
         "Tu es l'orchestrateur. Délègue l'analyse de chaque fichier au bon spécialiste. "
         "Puis VALIDE leur travail : chaque erreur serveur « payment gateway returned 502 » "

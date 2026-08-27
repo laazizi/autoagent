@@ -35,7 +35,7 @@ import urllib.request
 from pathlib import Path
 
 ICI = Path(__file__).resolve().parent
-MODELE = "gemini-3.5-flash"
+MODELE = "gemini-3.7-flash"
 API = "https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={k}"
 
 
