@@ -1,6 +1,6 @@
 """`run_k` — mesure de fiabilité `pass^k` (0.18.0).
 
-`pass@1` ne dit presque rien à un exploitant : 90 % de pass@1 donne **57 % à
+`pass@1` ne dit presque rien à un exploitant : 90 % de pass@1 donne **43 % à
 k=8**, parce que `pass^k ≈ p^k` s'effondre exponentiellement. Ce banc rend cet
 effondrement visible, avec un juge DÉTERMINISTE fourni par l'hôte (jamais un
 LLM-as-judge : ils plafonnent sous 55 % sur les échecs d'agent).

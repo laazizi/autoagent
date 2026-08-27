@@ -3,8 +3,8 @@
 Un agent noté « 90 % » ne dit presque rien à un exploitant : `pass@1` mesure
 *une* tentative. Ce qui compte en production, c'est `pass^k` — la probabilité que
 **k** tentatives réussissent TOUTES. Comme `pass^k ≈ p^k`, la courbe s'effondre :
-90 % de `pass@1` donne **57 % à k=8**. Un agent qui « marche » à la démo peut donc
-échouer une fois sur deux sur une journée de huit tâches.
+90 % de `pass@1` donne **43 % à k=8** (0,9^8). Un agent qui « marche » à la démo
+échoue donc PLUS d'une fois sur deux sur une journée de huit tâches.
 
 Ce module ne fait pas de magie : il exécute la même tâche k fois, demande à un
 prédicat de l'HÔTE si le résultat est bon, et rapporte la dispersion. Deux choix

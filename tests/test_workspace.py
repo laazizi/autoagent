@@ -149,3 +149,83 @@ class TestReadTruncation:
         result = ws.read_file("long.txt")
         assert result["truncated"] is True
         assert len(result["content"]) <= 5
+
+
+# ---------------------------------------------------------------------------
+# COMPOSABILITÉ TEMPORELLE — la propriété globale, pas les cas un par un.
+#
+# Formulation empruntée à « A Programming Paradigm for Spatiotemporal
+# Composability » (Shi, Zhang, Cui — PKU / DeepSeek-AI, 2026), qui formalise
+# l'effet réversible : « every context transformation carries an inverse that
+# the runtime tracks ». `ProjectWorkspace` implémente exactement ça avec son
+# change history. Les tests existants vérifient des annulations INDIVIDUELLES ;
+# ceux-ci vérifient le théorème : annuler TOUT ramène à l'état initial, à
+# l'octet près — et par deux chemins différents (en bloc, ou un par un), ce qui
+# est la saveur « confluence » de leur métathéorie.
+# ---------------------------------------------------------------------------
+
+
+def _empreinte(racine: Path) -> dict[str, str]:
+    """L'état observable de l'arbre : chemin relatif → contenu."""
+    return {
+        str(p.relative_to(racine)).replace("\\", "/"): p.read_text(encoding="utf-8")
+        for p in sorted(racine.rglob("*"))
+        if p.is_file()
+    }
+
+
+def _sequence(ws: ProjectWorkspace) -> None:
+    """Une suite d'écritures représentative : créations, écrasements, sous-dossiers."""
+    ws.write_file("a.txt", "a1", reason="creation")
+    ws.write_file("dossier/b.txt", "b1", reason="creation en sous-dossier")
+    ws.write_file("a.txt", "a2", reason="ecrasement")
+    ws.write_file("c.txt", "c1", reason="creation")
+    ws.write_file("dossier/b.txt", "b2", reason="ecrasement")
+    ws.write_file("a.txt", "a3", reason="ecrasement")
+
+
+class TestComposabiliteTemporelle:
+    def test_tout_annuler_en_bloc_restaure_l_etat_initial(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="autoagent_test_"))
+        ws = ProjectWorkspace(root=tmp)
+        ws.write_file("prealable.txt", "je préexiste", reason="etat initial")
+        ws._changes.clear()                     # cet écrit fait partie de l'état de départ
+        avant = _empreinte(tmp)
+
+        _sequence(ws)
+        assert _empreinte(tmp) != avant, "la séquence n'a rien modifié : test vide"
+
+        premier = ws.list_changes()["changes"][0]["id"]
+        ws.rollback_change(premier)             # annule celui-ci ET tous les suivants
+
+        assert _empreinte(tmp) == avant, "l'annulation en bloc ne restaure pas l'état initial"
+        assert ws.list_changes()["changes"] == [], "le journal n'est pas vidé"
+
+    def test_annuler_un_par_un_donne_le_meme_etat(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="autoagent_test_"))
+        ws = ProjectWorkspace(root=tmp)
+        ws.write_file("prealable.txt", "je préexiste", reason="etat initial")
+        ws._changes.clear()
+        avant = _empreinte(tmp)
+
+        _sequence(ws)
+        for _ in range(len(ws.list_changes()["changes"])):
+            ws.rollback_last_change()
+
+        assert _empreinte(tmp) == avant, "l'annulation pas à pas divergeait de l'état initial"
+        assert ws.list_changes()["changes"] == []
+
+    def test_un_fichier_cree_puis_annule_ne_laisse_pas_de_dossier_fantome(self) -> None:
+        """Le contenu revient, mais le dossier créé au passage, lui, reste.
+
+        Ce n'est PAS un bug : c'est la limite exacte de la réversibilité ici, et
+        elle mérite d'être écrite noir sur blanc plutôt que découverte un jour.
+        """
+        tmp = Path(tempfile.mkdtemp(prefix="autoagent_test_"))
+        ws = ProjectWorkspace(root=tmp)
+        ws.write_file("neuf/fichier.txt", "x", reason="creation")
+        ws.rollback_last_change()
+
+        assert not (tmp / "neuf" / "fichier.txt").exists(), "le fichier n'a pas été retiré"
+        assert (tmp / "neuf").is_dir(), (
+            "si ce dossier disparaît un jour, tant mieux — mets à jour ce test")
