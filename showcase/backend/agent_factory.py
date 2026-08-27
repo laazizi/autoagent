@@ -145,7 +145,7 @@ class _FakeProvider(LLMProvider):
 # Le modèle réel utilisé par l'agent (surchargeable par la variable
 # d'env AUTOAGENT_MODEL, ex. gemini-2.5-flash, gemini-3-pro…).
 PROVIDER_LLM = "gemini"
-MODELE_LLM = os.getenv("AUTOAGENT_MODEL", "gemini-3.6-flash")
+MODELE_LLM = os.getenv("AUTOAGENT_MODEL", "gemini-3.7-flash")
 
 
 def mode_provider() -> str:
@@ -298,6 +298,13 @@ SYSTEME_ORCH = (
 
 SYSTEME_NIVEAU3 = (
     "CAPACITÉ ACCORDÉE — ÉCRIRE DU CODE SOURCE.\n"
+    # Le prompt système est reconstruit à CHAQUE run depuis l'état courant ; le
+    # transcript, lui, garde les refus d'avant. Il faut donc dire explicitement
+    # que l'historique est périmé, sinon le modèle continue d'obéir à un refus
+    # qui n'a plus cours (constaté en direct : il refusait sans appeler l'outil).
+    "Si un message PLUS ANCIEN de cette conversation dit que cette capacité "
+    "n'est pas accordée, il est PÉRIMÉ : elle l'est maintenant. Ne t'y fie pas, "
+    "appelle les outils.\n"
     "Tu peux lire et écrire les fichiers d'un projet dans un dossier dédié : "
     "`list_project_files`, `read_project_file`, `write_project_file`, "
     "`replace_project_text`. Tu peux annuler tes propres modifications "
@@ -437,6 +444,8 @@ def construire_agent(session_id: str, canvas: CanvasSink,
         # On ne décrit cette capacité au modèle QUE si elle lui est accordée :
         # sinon il proposerait d'écrire du code qu'il ne peut pas écrire.
         agent.system_prompt = f"{SYSTEME_ORCH}\n\n{SYSTEME_NIVEAU3}"
+    else:
+        brancher_refus_niveau3(agent)
 
     # Quand la bibliothèque grossit, on n'envoie plus tous les schémas : l'agent
     # cherche ses outils. Sans ça, 40 outils acquis = un préfixe énorme à chaque tour.
@@ -445,6 +454,38 @@ def construire_agent(session_id: str, canvas: CanvasSink,
 
     agent.derniers_modes = modes  # exposé pour l'UI (qui est natif, qui est en bac à sable)
     return agent
+
+
+class CapaciteNonAccordee(PermissionError):
+    """Une capacité EXISTE mais n'a pas été accordée. Ce n'est pas une panne."""
+
+
+def brancher_refus_niveau3(agent: Agent) -> None:
+    """NIVEAU 3 ÉTEINT — on déclare quand même l'outil, pour qu'il REFUSE.
+
+    Sans ça, l'agent n'a aucun outil d'écriture : il improvise une explication en
+    prose, et rien ne distingue « je n'ai pas le droit » de « je ne veux pas ».
+    Le refus doit passer par le canal des OUTILS — daté dans la trace, avec un
+    motif, et sur le canal que le modèle sait déjà lire. C'est la thèse de la
+    lib appliquée à une capacité absente : un refus est du code, pas de la prose.
+
+    ATTENTION, leçon apprise à la dure : ce message reste dans le transcript. Une
+    première version disait « propose-lui d'accorder le niveau 3 » et « n'essaie
+    pas de contourner » — des ORDRES. Une fois la capacité accordée, le modèle
+    relisait son propre passé, y retrouvait la consigne, et continuait de refuser
+    SANS MÊME APPELER l'outil réel. Un message d'outil doit donc énoncer un FAIT
+    daté, jamais une règle de conduite durable.
+    """
+    @agent.tool(name="write_project_file",
+                description="Écrit un fichier de code source dans le projet "
+                            "(nécessite la capacité « écrire du code source »).")
+    def _refus_ecriture(path: str, content: str = "", reason: str = "") -> dict:
+        raise CapaciteNonAccordee(
+            f"À CET INSTANT, la capacité « écrire du code source » n'est pas "
+            f"accordée : « {path} » n'a pas été écrit. Cet état peut changer — si "
+            f"l'utilisateur l'accorde, cet outil fonctionnera et tu devras "
+            f"RÉESSAYER au lieu de te fier à ce message, qui ne vaut que pour "
+            f"l'appel qui vient d'échouer.")
 
 
 def brancher_niveau3(agent: Agent) -> None:

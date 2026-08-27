@@ -135,6 +135,66 @@ def charger_pending(session_id: str) -> dict | None:
     return _lire(session_id).get("pending")
 
 
+def remise_a_zero() -> dict[str, int]:
+    """Efface TOUT ce que l'agent a produit : projet vierge.
+
+    Aucun paramètre : les cibles viennent de `paths.py`, jamais du client — un
+    chemin fourni de l'extérieur est une traversée qui attend son heure. Chaque
+    cible est en plus revérifiée comme étant SOUS `DATA` avant d'être touchée
+    (ceinture et bretelles : si quelqu'un modifie paths.py un jour, la garde
+    tient toujours).
+
+    Renvoie le compte de ce qui a été supprimé, par catégorie.
+    """
+    from .capacites import COMPTEURS          # source de vérité du compteur
+    from .paths import DATA, MANIFESTE, MEMOIRE, OUTILS, PAGES, PROJET, WORKSPACE
+
+    racine = DATA.resolve()
+
+    def sous_data(chemin: Path) -> bool:
+        try:
+            return racine in chemin.resolve().parents or chemin.resolve() == racine
+        except OSError:
+            return False
+
+    compte = {"conversations": 0, "outils": 0, "pages": 0, "projet": 0,
+              "workspaces": 0, "memoire": 0, "compteurs": 0}
+
+    with _LOCK:
+        # 1. les conversations et leur workspace (trace.jsonl inclus)
+        for f in SESSIONS.glob("*.json"):
+            if sous_data(f):
+                f.unlink(missing_ok=True)
+                compte["conversations"] += 1
+        if WORKSPACE.is_dir():
+            for d in WORKSPACE.iterdir():
+                if d.is_dir() and sous_data(d):
+                    shutil.rmtree(d, ignore_errors=True)
+                    compte["workspaces"] += 1
+
+        # 2. ce qui est PARTAGÉ : outils acquis, manifeste, pages, code source
+        for dossier, cle in ((OUTILS, "outils"), (PAGES, "pages"), (PROJET, "projet")):
+            if not dossier.is_dir():
+                continue
+            for f in dossier.iterdir():
+                if sous_data(f):
+                    if f.is_dir():
+                        shutil.rmtree(f, ignore_errors=True)
+                    else:
+                        f.unlink(missing_ok=True)
+                    compte[cle] += 1
+
+        # 3. la mémoire factuelle et les compteurs de montée en puissance
+        for cible, cle in ((MEMOIRE, "memoire"), (COMPTEURS, "compteurs")):
+            if cible.is_file() and sous_data(cible):
+                cible.unlink(missing_ok=True)
+                compte[cle] += 1
+
+    # Le manifeste vit DANS outils/ : il est donc déjà parti avec le dossier.
+    assert not MANIFESTE.is_file(), "le manifeste a survécu à la remise à zéro"
+    return compte
+
+
 def lister() -> list[dict]:
     """Métadonnées de toutes les sessions, plus récentes d'abord (pour la sidebar)."""
     out = []

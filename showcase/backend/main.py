@@ -46,6 +46,21 @@ app = FastAPI(title="autoagent — app vivante", version="0.1.0")
 # Démo locale ; l'API vivante est read-only et bornée aux outils de la session.
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+
+@app.middleware("http")
+async def sans_cache(request, call_next):
+    """Aucune reponse d'API ne doit etre mise en cache.
+
+    Sans en-tete, un `fetch()` peut servir une reponse perimee alors qu'un F5
+    revalide : le panneau des capacites restait donc vide jusqu'au rechargement,
+    alors que l'outil venait d'etre cree. Le SSE a ses propres en-tetes, on n'y
+    touche pas.
+    """
+    reponse = await call_next(request)
+    if request.url.path.startswith("/api/") and "text/event-stream" not in             reponse.headers.get("content-type", ""):
+        reponse.headers["Cache-Control"] = "no-store, must-revalidate"
+    return reponse
+
 FRONT = Path(__file__).resolve().parent.parent / "frontend"
 
 
@@ -230,7 +245,16 @@ async def get_session(session_id: str) -> dict:
     # On n'expose pas le message system (bruit pour l'UI).
     visibles = [{"role": m.role, "content": m.content}
                 for m in msgs if m.role in ("user", "assistant") and m.content]
-    return {"id": session_id, "messages": visibles,
+    # Une pause d'approbation DOIT survivre à un rechargement : sans ça, la carte
+    # Autoriser/Refuser disparaît alors que le run, lui, attend toujours — et la
+    # conversation est bloquée sans que rien ne le dise.
+    pending = None
+    if (brut := await run_in_threadpool(sessions.charger_pending, session_id)):
+        try:
+            pending = info_approbation_en_attente(RunState.from_dict(brut))
+        except Exception:  # noqa: BLE001 — un état illisible ne doit pas casser l'ouverture
+            pending = None
+    return {"id": session_id, "messages": visibles, "pending": pending,
             "pages": await run_in_threadpool(sessions.charger_pages, session_id)}
 
 
@@ -241,6 +265,16 @@ async def get_page(session_id: str, fichier: str) -> dict:
     if html is None:
         raise HTTPException(404, "page introuvable")
     return {"fichier": fichier, "html": html}
+
+
+@app.post("/api/reset")
+async def reset() -> dict:
+    """Repart d'un projet VIERGE : efface tout ce que l'agent a produit.
+
+    Aucun paramètre — les cibles viennent de `paths.py`. Un client ne peut donc
+    pas orienter la suppression, et il n'y a rien à valider côté entrée.
+    """
+    return {"supprime": await run_in_threadpool(sessions.remise_a_zero)}
 
 
 @app.delete("/api/sessions/{session_id}")
@@ -311,7 +345,11 @@ async def approve(entree: ApproveIn):
 # ── Front statique (une page autonome) ───────────────────────────────────────
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(FRONT / "index.html")
+    # no-store : en démo on retouche le front en direct ; un cache navigateur
+    # qui garde l'ancienne version fait perdre un quart d'heure à chercher un
+    # bug déjà corrigé.
+    return FileResponse(FRONT / "index.html",
+                        headers={"Cache-Control": "no-store, must-revalidate"})
 
 
 if (FRONT / "assets").is_dir():
