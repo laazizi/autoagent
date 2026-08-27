@@ -17,6 +17,8 @@ def _usage_from(meta: Any) -> TokenUsage | None:
         input_tokens=meta.get("promptTokenCount"),
         output_tokens=meta.get("candidatesTokenCount"),
         total_tokens=meta.get("totalTokenCount"),
+        # Gemini met en cache implicitement et compte la part servie ainsi.
+        cached_tokens=meta.get("cachedContentTokenCount"),
     )
 
 

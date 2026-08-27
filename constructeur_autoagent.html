@@ -294,6 +294,56 @@
     display:flex; align-items:center; gap:8px; flex-wrap:wrap;
   }
   .run-cmd .k{color:var(--c-safe); font-weight:700}
+  /* Panneau « Sortie » : une exécution RÉELLE du preset, jamais un exemple
+     rédigé. Il disparaît dès qu'on modifie les blocs — on n'a pas exécuté
+     ce code-là, donc on ne montre rien. */
+  .sortie{
+    border-top:1px solid var(--line-soft); background:var(--panel-2);
+    display:flex; flex-direction:column; min-height:0; max-height:38%;
+  }
+  .sortie[hidden]{display:none}
+  .sortie-h{display:flex; align-items:baseline; gap:10px; padding:9px 16px 5px}
+  .sortie-h .lbl{
+    font-size:11px; letter-spacing:.09em; text-transform:uppercase;
+    font-weight:700; color:var(--c-safe);
+  }
+  .sortie-h .meta{font-size:11px; color:var(--ink-faint); margin-left:auto; text-align:right; line-height:1.5}
+  .sortie-h .meta .nuance{font-size:10.5px; opacity:.85}
+  .sortie-h .meta code{font-family:var(--mono); font-size:10px}
+  .sortie pre{
+    margin:0; padding:0 16px 13px; overflow:auto; min-height:0;
+    font-family:var(--mono); font-size:11.5px; line-height:1.55;
+    color:var(--ink); white-space:pre-wrap; word-break:break-word;
+  }
+  .sortie.vide pre{color:var(--ink-faint); font-style:italic}
+  /* « Agrandir » : le code et la sortie sont à l'étroit dans leur colonne.
+     Un bouton par panneau le passe en plein écran, sans rien changer sinon. */
+  .agrandir{
+    flex:none; margin-left:10px; border:1px solid var(--line); border-radius:6px;
+    background:var(--panel-2); color:var(--ink-soft); cursor:pointer;
+    font-size:13px; line-height:1; padding:4px 8px;
+  }
+  .agrandir:hover{color:var(--ink); border-color:var(--ink-faint)}
+  .agrandir:focus-visible{outline:2px solid var(--c-core); outline-offset:2px}
+  .fond-zoom{
+    position:fixed; inset:0; z-index:59; background:rgba(0,0,0,.55);
+    backdrop-filter:blur(2px);
+  }
+  .fond-zoom[hidden]{display:none}
+  .zoome{
+    position:fixed !important; inset:22px; z-index:60; max-height:none !important;
+    border:1px solid var(--line); border-radius:12px; background:var(--panel);
+    box-shadow:0 24px 70px rgba(0,0,0,.5); overflow:hidden;
+    display:flex; flex-direction:column;
+  }
+  .zoome .code-scroll{max-height:none}
+  .zoome pre{max-height:none}
+  .indice-zoom{
+    position:fixed; z-index:61; right:34px; bottom:34px; font-size:11.5px;
+    color:var(--ink-faint); background:var(--panel-2); border:1px solid var(--line);
+    border-radius:20px; padding:5px 12px; pointer-events:none;
+  }
+  .indice-zoom[hidden]{display:none}
   .toast{
     position:fixed; bottom:20px; left:50%; transform:translateX(-50%) translateY(20px);
     background:var(--ink); color:var(--bg); padding:9px 16px; border-radius:8px;
@@ -352,14 +402,20 @@
 
   <!-- Code -->
   <section class="col" aria-label="Code généré">
-    <div class="col-head"><h2>Code Python</h2><span class="hint" id="loc-count"></span></div>
+    <div class="col-head"><h2>Code Python</h2><span class="hint" id="loc-count"></span><button class="agrandir" id="zoom-code" type="button" title="Agrandir le code (Échap pour fermer)" aria-label="Agrandir le code">⤢</button></div>
     <div class="code-wrap">
       <div class="code-scroll"><pre id="code"></pre></div>
       <div class="run-cmd" id="run-cmd"></div>
+      <div class="sortie" id="sortie" hidden>
+        <div class="sortie-h"><span class="lbl">Sortie</span><span class="meta" id="sortie-meta"></span><button class="agrandir" id="zoom-sortie" type="button" title="Agrandir la sortie (Échap pour fermer)" aria-label="Agrandir la sortie">⤢</button></div>
+        <pre id="sortie-txt"></pre>
+      </div>
     </div>
   </section>
 </main>
 
+<div class="fond-zoom" id="fond-zoom" hidden></div>
+<div class="indice-zoom" id="indice-zoom" hidden>Échap pour refermer</div>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -407,20 +463,21 @@ const DEFS = {
     fields:[
       {k:"var",   l:"nom de variable", kind:"text", def:"agent", w:"half"},
       {k:"prov",  l:"provider", kind:"select", opts:["gemini","openai","anthropic","deepseek"], def:"gemini", w:"half"},
-      {k:"model", l:"modèle", kind:"text", def:"gemini-3.5-flash"},
+      {k:"model", l:"modèle", kind:"text", def:"gemini-3.7-flash"},
       {k:"system",l:"system_prompt", kind:"textarea", def:"Tu es un assistant précis. Tu vérifies tes chiffres avec tes outils avant de répondre."},
       {k:"temp",  l:"temperature", kind:"number", def:"0.0", w:"third"},
       {k:"steps", l:"max_steps", kind:"number", def:"8", w:"third"},
       {k:"budget",l:"token_budget", kind:"number", def:"", w:"third", hint:"vide = illimité"},
       {k:"cap_res",l:"max_tool_result_chars", kind:"number", def:"", w:"third", hint:"borne UN résultat d'outil (vide = pas de borne)"},
       {k:"cap_rep",l:"max_repeated_tool_calls", kind:"number", def:"", w:"third", hint:"refuse le N+1e appel identique (vide = off)"},
+      {k:"prune",l:"prune_tool_results_after", kind:"number", def:"", w:"third", hint:"garde les N derniers résultats d'outil, élague les plus vieux (vide = off)"},
       {k:"trifecta",l:"trifecta_guard", kind:"select", opts:["deny","approve","off"], def:"deny", w:"third", hint:"sortie bloquée si le run est teinté"},
       {k:"tsearch",l:"tool_search (divulgation progressive)", kind:"check", def:false},
       {k:"parallel", l:"parallel_tool_calls (outils I/O en parallèle)", kind:"check", def:false},
       {k:"baseurl", l:"base_url (provider avancé)", kind:"text", def:"", w:"half", hint:"ex. api.moonshot.ai/v1 (Kimi), localhost:11434/v1 (Ollama)"},
       {k:"keyenv",  l:"api_key_env (nom de var d'env)", kind:"text", def:"", w:"half", hint:"vide = auto"},
       {k:"routing", l:"routing multi-modèle (image → vision, sinon défaut)", kind:"check", def:false},
-      {k:"vmodel",  l:"modèle vision (si routing)", kind:"text", def:"gemini-2.5-flash", w:"half"},
+      {k:"vmodel",  l:"modèle vision (si routing)", kind:"text", def:"gemini-3.7-flash", w:"half"},
     ],
   },
   tool: {
@@ -482,7 +539,7 @@ const DEFS = {
     fields:[
       {k:"var",  l:"nom de variable", kind:"text", def:"orch", w:"half"},
       {k:"prov", l:"provider", kind:"select", opts:["gemini","openai","anthropic","deepseek"], def:"gemini", w:"half"},
-      {k:"model",l:"modèle", kind:"text", def:"gemini-3.5-flash"},
+      {k:"model",l:"modèle", kind:"text", def:"gemini-3.7-flash"},
       {k:"steps",l:"étapes (une par ligne : id | question)", kind:"textarea",
        def:"nom | Quel est ton nom ?\nage | Quel âge as-tu ?\nville | Dans quelle ville habites-tu ?"},
       {k:"closing", l:"message de fin", kind:"text", def:"Merci, c'était la dernière étape !"},
@@ -495,10 +552,14 @@ const DEFS = {
       {k:"maxm", l:"max_messages", kind:"number", def:"40", w:"half"},
       {k:"keep", l:"keep_recent (Summarizing/Fact)", kind:"number", def:"12", w:"half"},
       {k:"path", l:"fichier de faits (FactMemory)", kind:"text", def:"faits_agent.json", hint:"JSON lisible, 1 par identité"},
+      {k:"amorce", l:"échange antérieur (une ligne : rôle | texte)", kind:"textarea",
+       def:"", hint:"sans historique, la mémoire n'a rien à retrouver"},
       {k:"recall", l:"donner l'outil recall à l'agent", kind:"check", def:true},
       {k:"remember", l:"donner l'outil remember (FactMemory)", kind:"check", def:true},
       {k:"rmode", l:"recall_mode (FactMemory)", kind:"select", opts:["hybrid","lexical","semantic"], def:"hybrid", w:"half", hint:"hybride = BM25 + cosinus fusionnés (RRF)"},
       {k:"forget", l:"donner l'outil forget (FactMemory, dry-run)", kind:"check", def:false},
+      {k:"dump", l:"afficher les faits à la fin, périmés compris (FactMemory)",
+       kind:"check", def:false, hint:"rend visible la supersession"},
     ],
   },
   trace: {
@@ -518,7 +579,7 @@ const DEFS = {
     fields:[
       {k:"var",  l:"nom de variable", kind:"text", def:"specialiste", w:"half"},
       {k:"prov", l:"provider", kind:"select", opts:["gemini","openai","anthropic","deepseek"], def:"gemini", w:"half"},
-      {k:"model",l:"modèle", kind:"text", def:"gemini-3.5-flash"},
+      {k:"model",l:"modèle", kind:"text", def:"gemini-3.7-flash"},
       {k:"tname",l:"nom de l'outil (vu par l'orchestrateur)", kind:"text", def:"interroger_specialiste"},
       {k:"desc", l:"description (quand déléguer)", kind:"text", def:"Délègue une sous-tâche au spécialiste."},
       {k:"system",l:"system_prompt du spécialiste", kind:"textarea", def:"Tu es un spécialiste. Réponds de façon concise et factuelle."},
@@ -528,7 +589,7 @@ const DEFS = {
     name:"Chaîne (pipeline)", cat:"multi", one:true, sub:"étapes séquentielles — chacune reçoit la sortie de la précédente",
     fields:[
       {k:"prov", l:"provider (toutes les étapes)", kind:"select", opts:["gemini","openai","anthropic","deepseek"], def:"gemini", w:"half"},
-      {k:"model",l:"modèle", kind:"text", def:"gemini-3.5-flash", w:"half"},
+      {k:"model",l:"modèle", kind:"text", def:"gemini-3.7-flash", w:"half"},
       {k:"stages", l:"étapes ordonnées (une par ligne : nom | rôle)", kind:"textarea",
        def:"extraction | Extrais les faits et chiffres du texte, sans les interpréter.\nanalyse | À partir des faits extraits, identifie les 3 points les plus importants.\nsynthese | Rédige une conclusion en 2 phrases à partir de l'analyse."},
       {k:"prompt", l:"entrée initiale", kind:"textarea",
@@ -539,7 +600,7 @@ const DEFS = {
     name:"Parallèle + fusion", cat:"multi", one:true, sub:"N agents en parallèle, puis un synthétiseur fusionne",
     fields:[
       {k:"prov", l:"provider", kind:"select", opts:["gemini","openai","anthropic","deepseek"], def:"gemini", w:"half"},
-      {k:"model",l:"modèle", kind:"text", def:"gemini-3.5-flash", w:"half"},
+      {k:"model",l:"modèle", kind:"text", def:"gemini-3.7-flash", w:"half"},
       {k:"stages", l:"experts en parallèle (une par ligne : nom | rôle)", kind:"textarea",
        def:"juridique | Analyse les risques juridiques du contrat.\nfinancier | Analyse les risques financiers du contrat.\ntechnique | Analyse les risques techniques du contrat."},
       {k:"synth", l:"rôle du synthétiseur (fusion finale)", kind:"text",
@@ -594,6 +655,10 @@ const INFO = {
 };
 
 const ENV = {gemini:"GEMINI_API_KEY", openai:"OPENAI_API_KEY", anthropic:"ANTHROPIC_API_KEY", deepseek:"DEEPSEEK_API_KEY"};
+// Modèle par défaut de chaque fournisseur : changer le provider sans
+// changer le modèle produisait `from_model("deepseek","gemini-…")`.
+const MODELE_DEFAUT = {gemini:"gemini-3.7-flash", openai:"gpt-4o-mini",
+  anthropic:"claude-sonnet-4-5", deepseek:"deepseek-chat"};
 
 /* ══════════════════════════════════════════════════════════════════════
    2. ÉTAT
@@ -710,6 +775,9 @@ function generate(){
     else { names.add("SummarizingMemory"); names.add("create_provider"); names.add("ModelConfig"); }
   }
   if(hook) names.add("Message");
+  // L'amorce est une liste de Message posée par l'hôte avant la question.
+  const amorce = mem ? (mem.f.amorce||"").trim() : "";
+  if(amorce) names.add("Message");
   if(dyn){ names.add("DynamicToolBuilder"); names.add("create_provider"); names.add("ModelConfig"); }
   if(adv) names.add("ModelConfig");
   if(routing){ names.add("RoutingProvider"); names.add("create_provider"); names.add("ModelConfig"); }
@@ -852,6 +920,7 @@ function generate(){
     if(a.budget!=="" && a.budget!=null) kwTail.push(`token_budget=${num(a.budget,0)}`);
     if(a.cap_res!=="" && a.cap_res!=null) kwTail.push(`max_tool_result_chars=${num(a.cap_res,0)}`);
     if(a.cap_rep!=="" && a.cap_rep!=null) kwTail.push(`max_repeated_tool_calls=${num(a.cap_rep,0)}`);
+    if(a.prune!=="" && a.prune!=null) kwTail.push(`prune_tool_results_after=${num(a.prune,0)}`);
     if(a.trifecta && a.trifecta!=="deny") kwTail.push(`trifecta_guard=${pyStr(a.trifecta)}`);
     if(a.parallel) kwTail.push(`parallel_tool_calls=True`);
     if(dyn) kwTail.push(`max_dynamic_tools_per_run=${num(dyn.f.maxrun,3)}`);
@@ -982,9 +1051,59 @@ function generate(){
       // rien : build_agent() retournera l'agent (voir l'enveloppe en fin de generate)
     }else if(run){
       const ckArg = ckpt ? `, checkpoint=sauvegarder` : ``;
+      // Échange antérieur : le host possède l'historique, la mémoire le
+      // compacte. Sans lui, une démo de mémoire ne retrouve rien.
+      let cible = pyLines(run.f.prompt, 0), methode = "run";
+      const mv = mem ? (mem.f.var || "memoire") : "memoire";
+      if(amorce){
+        L.push(`# Échange antérieur : c'est l'HÔTE qui possède l'historique ;`);
+        L.push(`# la mémoire ne fait que le compacter. Sans lui, rien à retrouver.`);
+        // Une ligne vide sépare deux conversations : la mémoire les plie
+        // l'une après l'autre. Indispensable pour qu'une contradiction du
+        // second appel tombe dans la partie PLIÉE du premier.
+        const convs = amorce.split(/\n\s*\n/).map(c => c.trim()).filter(Boolean);
+        const noms = [];
+        convs.forEach((conv, i) => {
+          const nom = convs.length > 1 ? `APPEL_${i + 1}` : `HISTORIQUE`;
+          noms.push(nom);
+          L.push(`${nom} = [`);
+          for(const ligne of conv.split("\n")){
+            const t = ligne.trim();
+            if(!t) continue;
+            const sep = t.indexOf("|");
+            const role = sep < 0 ? "user" : t.slice(0, sep).trim();
+            const texte = sep < 0 ? t : t.slice(sep + 1).trim();
+            L.push(`    Message(role=${pyStr(role)}, content=${pyStr(texte)}),`);
+          }
+          L.push(`]`);
+        });
+        L.push(``);
+        if(mem.f.kind === "FactMemory"){
+          // La mémoire factuelle se construit TOUR PAR TOUR : on joue d'abord
+          // l'échange antérieur pour qu'elle en extraie ses faits. Tout envoyer
+          // d'un bloc ferait extraire un seul fait consolidé — et la
+          // supersession, qui est l'intérêt, resterait invisible.
+          // L'échange antérieur est passé À LA MÉMOIRE, pas à l'agent : c'est
+          // `compact()` qui plie les vieux tours et déclenche l'extraction.
+          // Une contradiction y devient un `update` — qui PÉRIME l'ancien fait
+          // au lieu de l'empiler. Un `run` sur un transcript court ne plie rien.
+          L.push(`# L'échange antérieur est donné À LA MÉMOIRE : c'est elle qui`);
+          L.push(`# en extrait des faits (pliage des vieux tours au-delà de`);
+          L.push(`# max_messages). Une contradiction produit alors un « update »,`);
+          L.push(`# qui PÉRIME le fait ancien au lieu de l'empiler à côté.`);
+          for(const nom of noms) L.push(`${mv}.compact(${nom})`);
+          L.push(``);
+          L.push(`# Puis une conversation NEUVE : aucun historique transmis.`);
+          L.push(`# Ce que l'agent sait encore vient uniquement de sa mémoire.`);
+          methode = "run";
+        }else{
+          cible = `${noms.join(" + ")} + [Message(role="user", content=${pyLines(run.f.prompt, 0)})]`;
+          methode = "run_messages";
+        }
+      }
       if(run.f.stream){
         L.push(`# Streaming : on consomme les événements au fil de l'eau.`);
-        L.push(`for ev in ${av}.run_stream(${pyLines(run.f.prompt, 0)}${ckArg}):`);
+        L.push(`for ev in ${av}.${methode === "run_messages" ? "run_messages_stream" : "run_stream"}(${cible}${ckArg}):`);
         L.push(`    if ev.type == "text":`);
         L.push(`        print(ev.text, end="", flush=True)`);
         L.push(`    elif ev.type == "tool_start":`);
@@ -998,14 +1117,32 @@ function generate(){
           L.push(`    _etat = RunState.from_dict(json.loads(_CHECKPOINT.read_text(encoding="utf-8")))`);
           L.push(`    resultat = ${av}.resume(_etat, checkpoint=sauvegarder)`);
           L.push(`else:`);
-          L.push(`    resultat = ${av}.run(${pyLines(run.f.prompt, 4)}, checkpoint=sauvegarder)`);
+          L.push(`    resultat = ${av}.${methode}(${cible}, checkpoint=sauvegarder)`);
         }else{
-          L.push(`resultat = ${av}.run(${pyLines(run.f.prompt, 0)}${ckArg})`);
+          L.push(`resultat = ${av}.${methode}(${cible}${ckArg})`);
         }
         L.push(`print(resultat.output)`);
         L.push(`print(f"\\n({resultat.steps} tours d'agent)")`);
         if(tr) L.push(`print("trace \\u2192", ${pyStr(tr.f.file||"trace.jsonl")})`);
         if(ckpt) L.push(`_CHECKPOINT.unlink(missing_ok=True)   # run terminé : le snapshot n'a plus lieu d'être`);
+        // Sans ça, la supersession reste invisible : on ne voit que la
+        // réponse, pas ce qui est réellement stocké.
+        if(mem && mem.f.kind==="FactMemory" && mem.f.dump){
+          L.push(``);
+          L.push(`# Les faits TELS QU'ILS SONT STOCKÉS. Une information qui change`);
+          L.push(`# ne remplace pas l'ancienne : elle FERME sa fenêtre de validité.`);
+          L.push(`# On ne sert jamais un fait périmé, mais on peut encore dire ce`);
+          L.push(`# qu'on croyait, et depuis quand.`);
+          L.push(`#`);
+          L.push(`# La PROVENANCE distingue deux écritures qui ne se valent pas :`);
+          L.push(`#   agent = déduit de la conversation par le modèle ;`);
+          L.push(`#   host  = déclaré explicitement via remember().`);
+          L.push(`print("\\nfaits stockés :")`);
+          L.push(`for _f in ${(mem.f.var||"memoire")}.facts(include_invalid=True):`);
+          L.push(`    _etat = "périmé" if _f["invalid_at"] else "à jour "`);
+          L.push(`    _suite = f" → remplacé par #{_f['superseded_by']}" if _f["superseded_by"] else ""`);
+          L.push(`    print(f"  [{_etat}] [{_f['source']:<5}] #{_f['id']} {_f['fact']}{_suite}")`);
+        }
       }
       for(const m of mcps) L.push(`${(m.f.var||"mcp").trim()}.close()`);
     }else{
@@ -1266,7 +1403,18 @@ function fieldEl(block, fld){
   wrap.innerHTML = lab;
   wrap.appendChild(ctrl);
   const ev = fld.kind==="select"?"change":"input";
-  ctrl.addEventListener(ev, e=>{ block.f[fld.k]= e.target.value; regen(); });
+  ctrl.addEventListener(ev, e=>{
+    block.f[fld.k] = e.target.value;
+    // Le modèle suit le fournisseur — sauf si l'utilisateur a saisi le sien.
+    if(fld.k === "prov" && MODELE_DEFAUT[e.target.value]){
+      const connus = Object.values(MODELE_DEFAUT);
+      if(!block.f.model || connus.includes(block.f.model)){
+        block.f.model = MODELE_DEFAUT[e.target.value];
+        renderStack();      // le champ modèle doit refléter la bascule
+      }
+    }
+    regen();
+  });
   return wrap;
 }
 
@@ -1330,6 +1478,7 @@ function renderStack(){
 function render(){ renderPalette(); renderStack(); regen(); }
 
 function regen(){
+  cacherSortie();   // le code vient de changer : la sortie ne lui correspond plus
   const {code, env, loc, integ, canInteg} = generate();
   $("#code").innerHTML = highlight(code);
   window.__lastCode = code; window.__lastEnv = env; window.__lastName = "mon_agent.py";
@@ -1418,7 +1567,8 @@ const SHOWCASES = [
   {id: "12", file: "12_pseudonymisation_pii.py", label: "12 · Pseudonymisation PII (code seul)", note: "RGPD : le host masque noms/emails/téléphones en jetons — le LLM ne voit jamais les vraies données.", code: "\"\"\"12 — Pseudonymisation : le LLM ne voit JAMAIS les vraies données (RGPD).\n\nPattern « coffre-fort à la frontière ». Avant qu'un texte n'atteigne le LLM,\nle HOST remplace les données personnelles (nom, e-mail, téléphone) par des\nJETONS opaques ([PERSONNE_1], [EMAIL_1]…) et garde la correspondance CÔTÉ\nHOST. Le modèle raisonne sur les jetons ; sa sortie est « dé-tokenisée »\nlocalement — les vraies valeurs réapparaissent uniquement dans le résultat\nfinal, sans avoir transité par le fournisseur LLM.\n\nLe script PROUVE qu'aucune vraie donnée n'est dans le payload envoyé au LLM.\n\n    python examples_autoagent/12_pseudonymisation_pii.py\n\"\"\"\n\nimport re\n\nfrom _common import make_provider\n\nfrom autoagent import LLMRequest, Message\n\n# --- Dossier client RÉEL (fictif, mais c'est le genre de données à protéger) -\nDOSSIER = {\n    \"nom\": \"Camille Berthier\",\n    \"email\": \"camille.berthier@example.com\",\n    \"tel\": \"06 12 34 56 78\",\n}\nDEMANDE = (\n    f\"Rédige un SMS de relance court et poli pour {DOSSIER['nom']} : son rendez-vous \"\n    f\"d'installation du capteur est demain 9h. Termine par « répondez à {DOSSIER['email']} \"\n    f\"ou au {DOSSIER['tel']} ». Garde les mentions entre crochets EXACTEMENT telles quelles.\"\n)\n\n_EMAIL = re.compile(r\"[\\w.+-]+@[\\w-]+\\.[\\w.-]+\")\n_TEL = re.compile(r\"0[1-9](?:[ .\\-]?\\d{2}){4}\")\n\n\nclass Vault:\n    \"\"\"Remplace les PII par des jetons ; seul le HOST connaît la correspondance.\"\"\"\n\n    def __init__(self) -> None:\n        self._to_real: dict[str, str] = {}\n        self._to_token: dict[str, str] = {}\n        self._n: dict[str, int] = {}\n\n    def _tok(self, kind: str, real: str) -> str:\n        if real not in self._to_token:\n            self._n[kind] = self._n.get(kind, 0) + 1\n            token = f\"[{kind}_{self._n[kind]}]\"\n            self._to_token[real] = token\n            self._to_real[token] = real\n        return self._to_token[real]\n\n    def mask(self, text: str, noms: tuple[str, ...] = ()) -> str:\n        for nom in noms:  # noms connus d'abord (regex ne les attrape pas)\n            text = text.replace(nom, self._tok(\"PERSONNE\", nom))\n        text = _EMAIL.sub(lambda m: self._tok(\"EMAIL\", m.group()), text)\n        text = _TEL.sub(lambda m: self._tok(\"TEL\", m.group()), text)\n        return text\n\n    def unmask(self, text: str) -> str:\n        for token, real in self._to_real.items():\n            text = text.replace(token, real)\n        return text\n\n\ndef main() -> None:\n    provider = make_provider()\n    vault = Vault()\n\n    masque = vault.mask(DEMANDE, noms=(DOSSIER[\"nom\"],))\n    print(\"1) Ce que le LLM reçoit RÉELLEMENT (données masquées) :\\n\")\n    print(\"   \" + masque.replace(\"\\n\", \"\\n   \"), \"\\n\")\n\n    # Garde-fou : AUCUNE vraie PII ne doit être dans le payload sortant.\n    fuites = [v for v in DOSSIER.values() if v in masque]\n    assert not fuites, f\"FUITE de PII vers le LLM : {fuites}\"\n    print(f\"2) Vérification : 0 donnée réelle dans le payload (jetons: \"\n          f\"{list(vault._to_real)}).\\n\")\n\n    response = provider.complete(LLMRequest(\n        messages=[\n            Message(role=\"system\", content=\"Tu rédiges des SMS pros. Garde les [JETONS] intacts.\"),\n            Message(role=\"user\", content=masque),\n        ],\n        temperature=0,\n        max_tokens=300,\n    ))\n    print(\"3) Sortie du LLM (encore masquée) :\\n\")\n    print(\"   \" + response.content.strip().replace(\"\\n\", \"\\n   \"), \"\\n\")\n\n    final = vault.unmask(response.content)\n    print(\"4) Après dé-tokenisation CÔTÉ HOST (vraies valeurs restaurées) :\\n\")\n    print(\"   \" + final.strip().replace(\"\\n\", \"\\n   \"))\n\n\nif __name__ == \"__main__\":\n    main()\n"},
   {id: "13", file: "13_prise_rdv_supervisee.py", label: "13 · Prise de RDV supervisée (code seul)", note: "La démo complète des 3 cerveaux (Orchestrator + superviseur + mémoire par appelant) — le preset ★ en est l'approximation par blocs.", code: "\"\"\"13 — Prise de RDV supervisée : les 3 cerveaux de cati_service, sans la voix.\n\nLe cas le plus riche : un répondeur de prise de rendez-vous. On enlève la couche\nvocale (Gemini Live / Asterisk, qui n'est PAS de l'autoagent) et il reste\nl'architecture à TROIS cerveaux séparés, chacun une brique de la lib :\n\n  1. FLUX DÉTERMINISTE  (Orchestrator)  — le moteur possède la machine à états ;\n     le LLM ne fait qu'interpréter/reformuler. Validation Python par slot :\n     un jour hors planning ou une heure hors fenêtre sont REFUSÉS par le code.\n  2. SUPERVISEUR        (Agent + tools) — un agent autoagent qui a la VUE GLOBALE\n     (état + transcript + mémoire) et TRANCHE via UN outil : valider() ou\n     demander_correction(). post_turn_hook = on le force à trancher.\n  3. MÉMOIRE PAR APPELANT (Memory Protocol) — le numéro = l'identité. Chaque\n     appel est résumé et rangé sur disque ; au rappel, l'agent RETROUVE le passé\n     (register_recall_tool → outil rappeler_memoire).\n\nExécutable tel quel (client simulé) :\n    python examples_autoagent/13_prise_rdv_supervisee.py\n\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nimport re\nimport time\nfrom pathlib import Path\n\nfrom _common import make_provider\n\nfrom autoagent import (Agent, AgentTurnContext, Message, Orchestrator, Step,\n                       TraceEmitter)\n\n# ── Config du RDV (comme config_rdv.json de cati_service) ────────────────────\nJOURS = [\"mardi\", \"mercredi\", \"jeudi\", \"vendredi\", \"samedi\"]\nFENETRES = {\"semaine\": (17, 21), \"samedi\": (10, 15)}   # heures d'ouverture\nDUREE_MIN = 35\nCHAMPS = [\n    (\"nom\",     \"le nom et prénom de la personne\"),\n    (\"jour\",    \"le jour du rendez-vous (du mardi au samedi)\"),\n    (\"heure\",   \"l'heure du rendez-vous\"),\n    (\"tel\",     \"le numéro de rappel (format français)\"),\n    (\"confirm\", \"la confirmation du récapitulatif (oui / non)\"),\n]\nMEM_DIR = Path(__file__).resolve().parent / \"memoire_demo\"\nMEM_DIR.mkdir(exist_ok=True)\nTRACE = Path(__file__).resolve().parent / \"trace_rdv.jsonl\"\n\n\n# ── CERVEAU 3 : mémoire par appelant (Memory Protocol : compact + recall) ────\nclass CallerMemory:\n    \"\"\"Mémoire d'UN numéro. Branchée sur l'agent superviseur (`memory=` +\n    register_recall_tool) : il fouille lui-même les appels passés.\"\"\"\n\n    def __init__(self, numero: str) -> None:\n        self.numero = re.sub(r\"\\D\", \"\", numero) or \"inconnu\"\n\n    def _file(self) -> Path:\n        return MEM_DIR / f\"{self.numero}.json\"\n\n    def compact(self, messages: list[Message]) -> list[Message]:\n        return messages                                   # runs courts → inchangé\n\n    def recall(self, query: str, k: int = 3) -> list[Message]:\n        try:\n            appels = json.loads(self._file().read_text(encoding=\"utf-8\"))[\"appels\"]\n        except Exception:\n            return []\n        mots = [m for m in re.split(r\"\\W+\", (query or \"\").lower()) if len(m) > 2]\n        scored = []\n        for ap in appels:\n            texte = f\"[appel du {ap['date']}] {ap['resume']} — RDV={json.dumps(ap['reponses'], ensure_ascii=False)}\"\n            score = sum(texte.lower().count(m) for m in mots) if mots else 1\n            if score:\n                scored.append((score, texte))\n        scored.sort(key=lambda s: -s[0])\n        return [Message(role=\"user\", content=t) for _, t in scored[:k]]\n\n    def save(self, resume: str, reponses: dict) -> None:\n        data = {\"appels\": []}\n        if self._file().is_file():\n            data = json.loads(self._file().read_text(encoding=\"utf-8\"))\n        data[\"appels\"].append({\"date\": time.strftime(\"%Y-%m-%d %H:%M\"),\n                               \"resume\": resume, \"reponses\": reponses})\n        data[\"appels\"] = data[\"appels\"][-10:]\n        self._file().write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding=\"utf-8\")\n\n\n# ── CERVEAU 1 : validation déterministe des slots (comme flow.py) ────────────\ndef _fenetre(jour: str) -> tuple[int, int, str]:\n    if \"samedi\" in jour.lower():\n        return (*FENETRES[\"samedi\"], \"le samedi\")\n    return (*FENETRES[\"semaine\"], \"en semaine\")\n\ndef valider_slot(champ: str, valeur, etat: dict) -> str | None:\n    \"\"\"Renvoie un message d'erreur (→ rejet, reformulé) ou None (→ accepté).\"\"\"\n    v = str(valeur).lower().strip()\n    if champ == \"jour\":\n        if not any(j in v for j in JOURS):\n            return f\"les enquêteurs ne rappellent que : {', '.join(JOURS)}\"\n    elif champ == \"heure\":\n        m = re.search(r\"(\\d{1,2})\\s*[h:]\\s*(\\d{0,2})\", v)\n        if not m:\n            return \"je n'ai pas compris l'heure (ex. 18h, 14h30)\"\n        h = int(m.group(1))\n        lo, hi, libelle = _fenetre(etat.get(\"jour\", \"\"))\n        if not (lo <= h < hi or (h == hi)):\n            return (f\"{libelle} c'est entre {lo}h et {hi}h (l'entretien dure ~{DUREE_MIN} min) — \"\n                    \"proposez un autre créneau\")\n    elif champ == \"tel\":\n        if not re.match(r\"^(0|\\+?33)\\d{9}$\", re.sub(r\"[ .\\-]\", \"\", v)):\n            return \"il me faut un numéro français valide (ex. 06 12 34 56 78)\"\n    return None\n\n\n# ── Le flux (Orchestrator) piloté par un client SIMULÉ ───────────────────────\ndef prise_de_rdv(provider, scenario: list[str]) -> tuple[dict, str]:\n    answers: dict[str, object] = {}\n    transcript: list[str] = []\n\n    def current_steps():\n        restants = [(c, lbl) for c, lbl in CHAMPS if c not in answers]\n        return [Step(id=c, payload={\"demande\": lbl}) for c, lbl in restants[:2]]\n\n    def record(step_id: str, value) -> str | None:\n        err = valider_slot(step_id, value, answers)\n        if err:\n            return err                                    # rejet : l'étape reste\n        answers[step_id] = int(re.search(r\"\\d{1,2}\", str(value)).group()) if step_id == \"heure\" \\\n            else value\n        return None\n\n    orch = Orchestrator(provider, current_steps=current_steps, record=record,\n                        describe=lambda sid, val: f\"{sid} = {val}\",\n                        closing_text=\"Parfait, votre rendez-vous est confirmé. Merci et à bientôt !\")\n\n    print(\"Léa : Bonjour, service rendez-vous de l'institut Alyce, je suis Léa !\")\n    for reponse in scenario:\n        if not current_steps():\n            break\n        print(f\"\\nClient : {reponse}\")\n        transcript.append(f\"CLIENT : {reponse}\")\n        rep_lea = \"\"\n        for ev in orch.turn(reponse):\n            if ev.type == \"text\":\n                rep_lea += ev.text\n        print(f\"Léa : {rep_lea.strip()}\")\n        transcript.append(f\"LÉA : {rep_lea.strip()}\")\n    return answers, \"\\n\".join(transcript)\n\n\n# ── CERVEAU 2 : le superviseur (Agent autoagent qui TRANCHE) ─────────────────\n_SYS_SUP = (\n    \"Tu es l'ORCHESTRATEUR silencieux d'un répondeur de prise de RDV (l'agent \"\n    \"vocal s'appelle Léa). Tu as la vue globale : état du questionnaire, \"\n    \"transcript, et la mémoire des appels passés de ce numéro (outil \"\n    \"rappeler_memoire — utilise-le si le passé éclaire le présent). Vérifie que \"\n    \"le dernier échange est cohérent, puis TRANCHE en appelant EXACTEMENT UN \"\n    \"outil : valider() si tout va bien (cas NORMAL, sois conservateur) ; \"\n    \"demander_correction(probleme, consigne) s'il y a un VRAI problème (mauvaise \"\n    \"valeur notée, réponse ambiguë validée à tort, info déjà donnée lors d'un \"\n    \"appel passé). Dans le doute → valider().\"\n)\n\ndef superviser(provider, trace, numero: str, etat: str, transcript: str) -> dict:\n    verdict: dict = {\"decide\": False}\n\n    def force_verdict(ctx: AgentTurnContext) -> Message | None:\n        if not verdict[\"decide\"]:\n            return Message(role=\"user\", content=\"Tu n'as pas tranché : appelle valider() \"\n                           \"ou demander_correction(probleme, consigne) MAINTENANT.\")\n        return None\n\n    agent = Agent(provider, system_prompt=_SYS_SUP, max_steps=4, temperature=0.0,\n                  memory=CallerMemory(numero), trace=trace,\n                  post_turn_hook=force_verdict, max_corrections_per_run=1)\n    agent.register_recall_tool(\n        name=\"rappeler_memoire\", default_k=3,\n        description=\"Fouille les appels PASSÉS de ce numéro (résumés + RDV pris).\")\n\n    @agent.tool\n    def valider(raison: str = \"\") -> dict:\n        \"\"\"Le dernier échange est correct : l'appel continue normalement.\"\"\"\n        verdict.update(decide=True, ok=True, raison=raison)\n        return {\"enregistre\": True}\n\n    @agent.tool\n    def demander_correction(probleme: str, consigne: str) -> dict:\n        \"\"\"Signale un vrai problème + une consigne corrective courte pour Léa.\"\"\"\n        verdict.update(decide=True, ok=False, probleme=probleme, consigne=consigne)\n        return {\"enregistre\": True}\n\n    agent.run(f\"ÉTAT DU QUESTIONNAIRE :\\n{etat}\\n\\nTRANSCRIPT :\\n{transcript}\\n\\nTranche.\")\n    return verdict\n\n\ndef main() -> None:\n    provider = make_provider()\n    trace = TraceEmitter(file=str(TRACE))\n    numero = \"0612345678\"\n\n    print(\"═\" * 70 + \"\\nCERVEAU 1 — FLUX DÉTERMINISTE (Orchestrator + validation Python)\\n\" + \"═\" * 70)\n    scenario = [\n        \"Bonjour, Marie Dupont à l'appareil.\",\n        \"Est-ce que lundi serait possible ?\",     # ← REFUSÉ par le moteur (hors planning)\n        \"d'accord, alors jeudi\",                   # ← accepté\n        \"vers 18h ce serait parfait\",              # ← accepté (fenêtre semaine 17-21h)\n        \"vous me rappelez au 06 12 34 56 78\",      # ← accepté\n        \"oui, c'est parfait pour moi\",             # ← confirmation\n    ]\n    answers, transcript = prise_de_rdv(provider, scenario)\n    etat = \"\\n\".join(f\"  {c} = {answers.get(c, '—')}\" for c, _ in CHAMPS)\n    print(f\"\\n→ RDV capturé par le MOTEUR (pas par le LLM) : {answers}\")\n\n    print(\"\\n\" + \"═\" * 70 + \"\\nCERVEAU 2 — SUPERVISEUR (Agent qui tranche : valider / corriger)\\n\" + \"═\" * 70)\n    print(\"\\n• Sur le transcript RÉEL (propre) :\")\n    v1 = superviser(provider, trace, numero, etat, transcript)\n    print(f\"  → verdict : {'✅ VALIDÉ' if v1.get('ok') else '⚠️ CORRECTION'} \"\n          f\"— {v1.get('raison') or v1.get('consigne', '')}\")\n\n    print(\"\\n• Sur un transcript DOUTEUX (Léa a noté 18h mais le client a dit 18h30) :\")\n    faux = transcript.replace(\"vers 18h ce serait parfait\",\n                              \"plutôt 18h30 si possible\") + \"\\nLÉA : C'est noté, jeudi à 18h.\"\n    v2 = superviser(provider, trace, numero, etat + \"\\n  (heure notée : 18h)\", faux)\n    print(f\"  → verdict : {'✅ VALIDÉ' if v2.get('ok') else '⚠️ CORRECTION'} \"\n          f\"— {v2.get('probleme','')} / consigne : {v2.get('consigne','')}\")\n\n    print(\"\\n\" + \"═\" * 70 + \"\\nCERVEAU 3 — MÉMOIRE PAR APPELANT (le numéro rappelle)\\n\" + \"═\" * 70)\n    mem = CallerMemory(numero)\n    mem.save(resume=f\"Marie Dupont a pris RDV le {answers.get('jour')} à {answers.get('heure')}h, \"\n             f\"rappel au {answers.get('tel')}.\", reponses=answers)\n    print(f\"\\n• Appel mémorisé pour le {numero}.\")\n    print(\"• Le MÊME numéro rappelle → l'agent retrouve le passé (recall) :\")\n    for m in mem.recall(\"rendez-vous jour heure\"):\n        print(f\"    ↳ {m.content}\")\n\n    print(f\"\\n[trace complète de l'essaim : {TRACE.name}]\")\n\n\nif __name__ == \"__main__\":\n    main()\n"},
   {id: "14", file: "14_base_sql.py", label: "14 · Base SQL comme source (code seul)", note: "L'agent inspecte le schéma et écrit des SELECT ; l'écriture est refusée PAR LE CODE.", code: "\"\"\"14 — Base SQL comme source : l'agent répond en INTERROGEANT une base.\n\nLa base de données est la SOURCE DE VÉRITÉ — l'agent ne devine rien. Il\ninspecte le schéma (outil `schema`), écrit une requête, la lib l'exécute\n(outil `requete_sql`, en LECTURE SEULE : toute écriture est refusée PAR LE\nCODE, pas par le prompt), puis il répond à partir des lignes réelles.\n\nZéro dépendance : SQLite (stdlib), base en mémoire seedée au démarrage.\n\n    python examples_autoagent/14_base_sql.py\n\"\"\"\n\nfrom __future__ import annotations\n\nimport sqlite3\n\nfrom _common import make_provider\n\nfrom autoagent import Agent\n\n\ndef _base() -> sqlite3.Connection:\n    \"\"\"Une petite base « comptage routier » en mémoire (la source).\"\"\"\n    conn = sqlite3.connect(\":memory:\")\n    conn.executescript(\"\"\"\n        CREATE TABLE capteurs  (id INTEGER PRIMARY KEY, ville TEXT, statut TEXT);\n        CREATE TABLE comptages (capteur_id INTEGER, jour TEXT, vehicules INTEGER);\n        INSERT INTO capteurs VALUES\n          (1,'Lyon','actif'), (2,'Lyon','panne'), (3,'Valence','actif'),\n          (4,'Grenoble','actif'), (5,'Grenoble','panne');\n        INSERT INTO comptages VALUES\n          (1,'2026-07-01',1240), (1,'2026-07-02',1310),\n          (3,'2026-07-01', 860), (3,'2026-07-02', 910),\n          (4,'2026-07-01',2100), (4,'2026-07-02',1980);\n    \"\"\")\n    return conn\n\n\ndef main() -> None:\n    conn = _base()\n    agent = Agent(make_provider(), max_steps=6,\n                  system_prompt=(\"Tu réponds UNIQUEMENT à partir de la base SQL. \"\n                                 \"Commence par regarder le schéma, puis écris une \"\n                                 \"requête SELECT. Ne fabrique jamais de chiffres.\"))\n\n    @agent.tool\n    def schema() -> dict:\n        \"\"\"Liste les tables et leurs colonnes (à consulter avant d'écrire une requête).\"\"\"\n        out = {}\n        for (table,) in conn.execute(\"SELECT name FROM sqlite_master WHERE type='table'\"):\n            out[table] = [f\"{c[1]} {c[2]}\" for c in conn.execute(f\"PRAGMA table_info({table})\")]\n        return {\"tables\": out}\n\n    @agent.tool\n    def requete_sql(sql: str) -> dict:\n        \"\"\"Exécute une requête SQL en LECTURE SEULE et renvoie les lignes.\n        Seul un unique SELECT est autorisé — tout le reste est refusé.\"\"\"\n        clean = sql.strip().rstrip(\";\").strip()\n        if \";\" in clean:\n            return {\"erreur\": \"une seule requête à la fois (pas de ';' multiples)\"}\n        if not clean.lower().startswith((\"select\", \"with\")):\n            return {\"erreur\": \"lecture seule : seules les requêtes SELECT sont autorisées\"}\n        try:\n            cur = conn.execute(clean)\n            cols = [d[0] for d in cur.description]\n            rows = [dict(zip(cols, r)) for r in cur.fetchmany(50)]\n            return {\"colonnes\": cols, \"lignes\": rows, \"n\": len(rows)}\n        except Exception as exc:  # noqa: BLE001 — l'agent voit l'erreur et corrige sa requête\n            return {\"erreur\": f\"{type(exc).__name__}: {exc}\"}\n\n    question = (\"Quelle ville totalise le plus de véhicules comptés, et combien de \"\n                \"capteurs sont en panne au total ?\")\n    print(f\"Question : {question}\\n\")\n    result = agent.run(question)\n    print(result.output)\n\n    # Preuve que l'écriture est bloquée PAR LE CODE (pas par la bonne volonté du LLM) :\n    essai = requete_sql(\"DELETE FROM capteurs\")\n    print(f\"\\n[garde-fou] requete_sql('DELETE …') → {essai}\")\n    if result.usage:\n        print(f\"[{result.steps} tours | {result.usage.total_tokens} tokens | source : SQLite en mémoire]\")\n\n\nif __name__ == \"__main__\":\n    main()\n"},
-  {id: "15", file: "15_appel_entrant_fiche.py", label: "15 · Appel entrant → fiche (code seul)", note: "Cascade de repli pilotée par l'agent : fiche locale → CRM → création par conversation.", code: "\"\"\"15 — Appel entrant : identifier l'appelant, ou créer sa fiche.\n\nUn standard téléphonique reçoit un appel avec un NUMÉRO. L'agent applique une\nCASCADE de repli, en choisissant lui-même le bon outil à chaque étape :\n\n    1. fiche_locale(numero)        — connu en base locale ? → on salue.\n    2. sinon annuaire_externe(...)  — connu dans l'AUTRE système (CRM) ?\n    3. sinon on DISCUTE : demander_a_la_personne(...) pour obtenir nom + adresse,\n       puis creer_fiche(...) — la fiche existe désormais en local.\n\nC'est l'agent qui décide de l'escalade (pas un `if` en dur) : on lui donne les\noutils + la procédure, il enchaîne. Ici le CRM et la personne sont simulés pour\nque la démo tourne seule ; en prod on branche un vrai CRM / la voix.\n\n    python examples_autoagent/15_appel_entrant_fiche.py\n\"\"\"\n\nfrom __future__ import annotations\n\nfrom _common import make_provider\n\nfrom autoagent import Agent\n\n# ── Les \"sources\" (simulées) ────────────────────────────────────────────────\nFICHES_LOCALES: dict[str, dict] = {\n    \"0611111111\": {\"nom\": \"Marie Dupont\", \"adresse\": \"12 rue de la Paix, Lyon\"},\n}\nCRM_EXTERNE: dict[str, dict] = {                       # l'AUTRE système\n    \"0622222222\": {\"nom\": \"Paul Martin\", \"adresse\": \"5 av. Jean Jaurès, Grenoble\"},\n}\nPERSONNES: dict[str, dict] = {                         # ce que dira l'appelant inconnu\n    \"0633333333\": {\"nom\": \"Sophie Bernard\", \"adresse\": \"8 place Bellecour, Lyon\"},\n}\n\n\ndef traiter_appel(provider, numero: str) -> str:\n    etat = {\"num\": numero}                             # l'appelant courant (pour la voix simulée)\n\n    agent = Agent(provider, max_steps=10, temperature=0.0, system_prompt=(\n        \"Tu es le standard téléphonique. Un appel arrive avec un numéro. \"\n        \"Procédure STRICTE, dans l'ordre, en t'arrêtant dès que tu as la fiche :\\n\"\n        \"1) fiche_locale(numero) ;\\n\"\n        \"2) si absente → annuaire_externe(numero) ;\\n\"\n        \"3) si toujours absente → demande à la personne son NOM puis son ADRESSE \"\n        \"(demander_a_la_personne), puis creer_fiche(numero, nom, adresse).\\n\"\n        \"Termine par une phrase d'accueil personnalisée, en disant d'où vient la \"\n        \"fiche (base locale, CRM, ou fiche créée à l'instant).\"))\n\n    @agent.tool\n    def fiche_locale(numero: str) -> dict:\n        \"\"\"Cherche l'appelant dans la base LOCALE.\"\"\"\n        f = FICHES_LOCALES.get(numero)\n        print(f\"   [local]    {numero} → {'trouvé' if f else 'inconnu'}\")\n        return {\"trouve\": bool(f), \"fiche\": f}\n\n    @agent.tool\n    def annuaire_externe(numero: str) -> dict:\n        \"\"\"Cherche l'appelant dans l'AUTRE système (CRM externe).\"\"\"\n        f = CRM_EXTERNE.get(numero)\n        print(f\"   [CRM]      {numero} → {'trouvé' if f else 'inconnu'}\")\n        return {\"trouve\": bool(f), \"fiche\": f}\n\n    @agent.tool\n    def demander_a_la_personne(question: str) -> dict:\n        \"\"\"Pose une question à l'appelant et renvoie sa réponse (voix simulée).\"\"\"\n        profil = PERSONNES.get(etat[\"num\"], {})\n        q = question.lower()\n        if any(w in q for w in (\"nom\", \"prénom\", \"appelez\", \"identité\", \"qui\")):\n            rep = profil.get(\"nom\", \"je préfère ne pas dire\")\n        elif any(w in q for w in (\"adresse\", \"habitez\", \"domicile\", \"rue\", \"ville\", \"où\")):\n            rep = profil.get(\"adresse\", \"je ne souhaite pas la donner\")\n        else:\n            rep = \"Pouvez-vous reformuler ?\"\n        print(f\"   [personne] « {question} » → « {rep} »\")\n        return {\"reponse\": rep}\n\n    @agent.tool\n    def creer_fiche(numero: str, nom: str, adresse: str) -> dict:\n        \"\"\"Crée la fiche de l'appelant dans la base LOCALE.\"\"\"\n        FICHES_LOCALES[numero] = {\"nom\": nom, \"adresse\": adresse}\n        print(f\"   [fiche]    créée pour {numero} : {nom} — {adresse}\")\n        return {\"cree\": True, \"fiche\": FICHES_LOCALES[numero]}\n\n    return agent.run(f\"Appel entrant du numéro {numero}. Identifie l'appelant.\").output\n\n\ndef main() -> None:\n    provider = make_provider()\n    for numero, titre in [\n        (\"0611111111\", \"A — numéro CONNU en local\"),\n        (\"0622222222\", \"B — inconnu en local, TROUVÉ dans le CRM externe\"),\n        (\"0633333333\", \"C — inconnu partout → on crée la fiche en discutant\"),\n    ]:\n        print(f\"\\n{'═'*70}\\nAPPEL {titre}\\n{'═'*70}\")\n        print(traiter_appel(provider, numero))\n\n    print(f\"\\n[base locale après les appels : {list(FICHES_LOCALES)}]  \"\n          f\"← le 0633333333 y est maintenant\")\n\n\nif __name__ == \"__main__\":\n    main()\n"}
+  {id: "15", file: "15_appel_entrant_fiche.py", label: "15 · Appel entrant → fiche (code seul)", note: "Cascade de repli pilotée par l'agent : fiche locale → CRM → création par conversation.", code: "\"\"\"15 — Appel entrant : identifier l'appelant, ou créer sa fiche.\n\nUn standard téléphonique reçoit un appel avec un NUMÉRO. L'agent applique une\nCASCADE de repli, en choisissant lui-même le bon outil à chaque étape :\n\n    1. fiche_locale(numero)        — connu en base locale ? → on salue.\n    2. sinon annuaire_externe(...)  — connu dans l'AUTRE système (CRM) ?\n    3. sinon on DISCUTE : demander_a_la_personne(...) pour obtenir nom + adresse,\n       puis creer_fiche(...) — la fiche existe désormais en local.\n\nC'est l'agent qui décide de l'escalade (pas un `if` en dur) : on lui donne les\noutils + la procédure, il enchaîne. Ici le CRM et la personne sont simulés pour\nque la démo tourne seule ; en prod on branche un vrai CRM / la voix.\n\n    python examples_autoagent/15_appel_entrant_fiche.py\n\"\"\"\n\nfrom __future__ import annotations\n\nfrom _common import make_provider\n\nfrom autoagent import Agent\n\n# ── Les \"sources\" (simulées) ────────────────────────────────────────────────\nFICHES_LOCALES: dict[str, dict] = {\n    \"0611111111\": {\"nom\": \"Marie Dupont\", \"adresse\": \"12 rue de la Paix, Lyon\"},\n}\nCRM_EXTERNE: dict[str, dict] = {                       # l'AUTRE système\n    \"0622222222\": {\"nom\": \"Paul Martin\", \"adresse\": \"5 av. Jean Jaurès, Grenoble\"},\n}\nPERSONNES: dict[str, dict] = {                         # ce que dira l'appelant inconnu\n    \"0633333333\": {\"nom\": \"Sophie Bernard\", \"adresse\": \"8 place Bellecour, Lyon\"},\n}\n\n\ndef traiter_appel(provider, numero: str) -> str:\n    etat = {\"num\": numero}                             # l'appelant courant (pour la voix simulée)\n\n    agent = Agent(provider, max_steps=10, temperature=0.0, system_prompt=(\n        \"Tu es le standard téléphonique. Un appel arrive avec un numéro. \"\n        \"Procédure STRICTE, dans l'ordre, en t'arrêtant dès que tu as la fiche :\\n\"\n        \"1) fiche_locale(numero) ;\\n\"\n        \"2) si absente → annuaire_externe(numero) ;\\n\"\n        \"3) si toujours absente → demande à la personne son NOM puis son ADRESSE \"\n        \"(demander_a_la_personne), puis creer_fiche(numero, nom, adresse).\\n\"\n        \"Termine par une phrase d'accueil personnalisée, en disant d'où vient la \"\n        \"fiche (base locale, CRM, ou fiche créée à l'instant).\"))\n\n    @agent.tool\n    def fiche_locale(numero: str) -> dict:\n        \"\"\"Cherche l'appelant dans la base LOCALE.\"\"\"\n        f = FICHES_LOCALES.get(numero)\n        print(f\"   [local]    {numero} → {'trouvé' if f else 'inconnu'}\")\n        return {\"trouve\": bool(f), \"fiche\": f}\n\n    @agent.tool\n    def annuaire_externe(numero: str) -> dict:\n        \"\"\"Cherche l'appelant dans l'AUTRE système (CRM externe).\"\"\"\n        f = CRM_EXTERNE.get(numero)\n        print(f\"   [CRM]      {numero} → {'trouvé' if f else 'inconnu'}\")\n        return {\"trouve\": bool(f), \"fiche\": f}\n\n    @agent.tool\n    def demander_a_la_personne(question: str) -> dict:\n        \"\"\"Pose une question à l'appelant et renvoie sa réponse (voix simulée).\"\"\"\n        profil = PERSONNES.get(etat[\"num\"], {})\n        q = question.lower()\n        if any(w in q for w in (\"nom\", \"prénom\", \"appelez\", \"identité\", \"qui\")):\n            rep = profil.get(\"nom\", \"je préfère ne pas dire\")\n        elif any(w in q for w in (\"adresse\", \"habitez\", \"domicile\", \"rue\", \"ville\", \"où\")):\n            rep = profil.get(\"adresse\", \"je ne souhaite pas la donner\")\n        else:\n            rep = \"Pouvez-vous reformuler ?\"\n        print(f\"   [personne] « {question} » → « {rep} »\")\n        return {\"reponse\": rep}\n\n    @agent.tool\n    def creer_fiche(numero: str, nom: str, adresse: str) -> dict:\n        \"\"\"Crée la fiche de l'appelant dans la base LOCALE.\"\"\"\n        FICHES_LOCALES[numero] = {\"nom\": nom, \"adresse\": adresse}\n        print(f\"   [fiche]    créée pour {numero} : {nom} — {adresse}\")\n        return {\"cree\": True, \"fiche\": FICHES_LOCALES[numero]}\n\n    return agent.run(f\"Appel entrant du numéro {numero}. Identifie l'appelant.\").output\n\n\ndef main() -> None:\n    provider = make_provider()\n    for numero, titre in [\n        (\"0611111111\", \"A — numéro CONNU en local\"),\n        (\"0622222222\", \"B — inconnu en local, TROUVÉ dans le CRM externe\"),\n        (\"0633333333\", \"C — inconnu partout → on crée la fiche en discutant\"),\n    ]:\n        print(f\"\\n{'═'*70}\\nAPPEL {titre}\\n{'═'*70}\")\n        print(traiter_appel(provider, numero))\n\n    print(f\"\\n[base locale après les appels : {list(FICHES_LOCALES)}]  \"\n          f\"← le 0633333333 y est maintenant\")\n\n\nif __name__ == \"__main__\":\n    main()\n"},
+  {id: "26", file: "26_resultat_trop_gros.py", label: "26 · Le résultat trop gros (code seul)", note: "La butée 1 MESURÉE : même outil, même prompt, deux runs — seul max_tool_result_chars change. 41 597 → 4 000 caractères, 17 993 → 2 453 jetons, et la réponse reste juste parce que la coupe est au MILIEU (le bilan est à la dernière ligne du journal).", code: "\"\"\"26 — Le résultat trop gros : la borne est du code, et elle coupe au MILIEU.\n\nLa démo de la première butée. Un seul outil, un seul prompt, deux runs —\nla seule différence entre les deux tient dans un argument :\n\n    Agent(...)                                 # run A : rien ne borne\n    Agent(..., max_tool_result_chars=4000)     # run B : la butée est vissée\n\nCe que la démo prouve, dans l'ordre :\n\n  1. Un outil non borné injecte TOUT dans la conversation. Ici 40 000\n     caractères pour une question dont la réponse fait deux lignes. Le prix\n     est en jetons, et il est réel — la démo l'affiche.\n\n  2. La borne n'est pas une consigne, c'est une fonction Python. Le modèle\n     ne peut pas la dépasser en insistant.\n\n  3. Elle coupe au MILIEU, et c'est là que tout se joue. Le bilan du journal\n     est à la DERNIÈRE ligne. Une coupe naïve (les 4 000 premiers caractères)\n     le perdrait, et l'agent répondrait faux avec aplomb. La coupe milieu\n     garde la tête — la forme des données — ET la queue — les totaux.\n\n  4. La marque de coupure compte dans le budget. Une limite qu'on peut\n     dépasser n'est pas une limite : la démo vérifie len() <= 4000.\n\n    python examples_autoagent/26_resultat_trop_gros.py\n\"\"\"\n\nfrom __future__ import annotations\n\nfrom _common import load_env        # lit .env — seul emprunt à l'utilitaire\n\nfrom autoagent import Agent, ModelConfig, create_provider\n\nload_env()\n\n# ── UNE ligne à changer, et rien d'autre dans tout le fichier. ───────────────\nCONFIG = ModelConfig(provider=\"deepseek\",  model=\"deepseek-chat\")\n# CONFIG = ModelConfig(provider=\"gemini\",    model=\"gemini-3.7-flash\")\n# CONFIG = ModelConfig(provider=\"openai\",    model=\"gpt-4o-mini\")\n# CONFIG = ModelConfig(provider=\"anthropic\", model=\"claude-sonnet-4-5\")\n\n\ndef _n(valeur: int) -> str:\n    \"\"\"Milliers séparés par une espace, sans toucher à la ponctuation.\"\"\"\n    return f\"{valeur:,}\".replace(\",\", \" \")\n\n\nBORNE = 4_000          # la valeur conseillée par la doc (§24.1)\nQUESTION = (\"Lis le journal du collecteur, puis réponds en deux lignes : \"\n            \"combien d'ERROR au total, et quelle erreur revient le plus souvent ?\")\n\n\n# ── Le journal : gros, réaliste, et son bilan est à la FIN ───────────────────\ndef _journal() -> str:\n    \"\"\"400 lignes de journal. Les totaux sont dans les trois dernières.\"\"\"\n    lignes = [\n        \"# collecteur-mobilite v4.2 — journal d'exécution\",\n        \"# horodatage | niveau | capteur | message\",\n    ]\n    erreurs = 0\n    for i in range(400):\n        minute, seconde = divmod(i * 7, 60)\n        heure = f\"2026-08-19T14:{minute % 60:02d}:{seconde:02d}\"\n        capteur = f\"cmp-lyo-{i % 12:02d}\"\n        if i % 11 == 3:                                  # l'erreur dominante\n            erreurs += 1\n            lignes.append(f\"{heure} | ERROR | cmp-lyo-07 | timeout après 30 s \"\n                          f\"sur la lecture du compteur, tentative {i % 4 + 1}/4\")\n        elif i % 37 == 5:                                # une erreur rare\n            erreurs += 1\n            lignes.append(f\"{heure} | ERROR | {capteur} | connexion refusée par \"\n                          f\"postgres:5432 (pool saturé, 40/40 connexions)\")\n        else:\n            lignes.append(f\"{heure} | INFO  | {capteur} | 1 240 passages agrégés, \"\n                          f\"latence 42 ms, file d'attente vide\")\n    lignes += [\n        \"# ─── BILAN DE L'EXÉCUTION ───\",\n        f\"# ERROR total : {erreurs}\",\n        \"# erreur la plus fréquente : timeout cmp-lyo-07\",\n    ]\n    return \"\\n\".join(lignes)\n\n\nJOURNAL = _journal()\n\n\ndef _construire(borne: int | None) -> Agent:\n    \"\"\"Le même agent, le même outil. Seule la borne change.\"\"\"\n    agent = Agent(create_provider(CONFIG), max_tool_result_chars=borne)\n\n    @agent.tool(description=\"Renvoie le journal complet du collecteur.\")\n    def lire_journal() -> str:\n        return JOURNAL\n\n    return agent\n\n\ndef _mesurer(resultat) -> tuple[int, str]:\n    \"\"\"Longueur du message d'outil réellement injecté, et son contenu.\"\"\"\n    for message in resultat.messages:\n        if message.role == \"tool\":\n            return len(message.content), message.content\n    return 0, \"\"\n\n\ndef main() -> None:\n    print(f\"Journal produit : {_n(len(JOURNAL))} caractères, \"\n          f\"{JOURNAL.count(chr(10)) + 1} lignes\")\n    print(f\"Le bilan est à la DERNIÈRE ligne : {JOURNAL.splitlines()[-1]}\")\n    print(f\"Modèle : {CONFIG.provider} / {CONFIG.model}\")\n    print()\n\n    mesures = {}\n    for etiquette, borne in ((\"A · sans borne\", None), (f\"B · borne à {BORNE}\", BORNE)):\n        print(\"─\" * 74)\n        print(f\"RUN {etiquette}\")\n        resultat = _construire(borne).run(QUESTION)\n        taille, contenu = _mesurer(resultat)\n        jetons = resultat.usage.total_tokens if resultat.usage else None\n        mesures[etiquette] = (taille, jetons)\n\n        print(f\"  injecté dans la conversation : {_n(taille)} caractères\")\n        print(f\"  jetons du run                : \"\n              f\"{_n(jetons) if jetons is not None else 'non rapportés'}\")\n        if \"[TRUNCATED\" in contenu:\n            marque = [l for l in contenu.splitlines() if \"[TRUNCATED\" in l][0]\n            print(f\"  marque au milieu             : {marque.strip()}\")\n            assert taille <= BORNE, \"la borne a été dépassée — ce serait un bug\"\n            print(f\"  borne respectée              : {taille} <= {BORNE} ✓\")\n        print(f\"  réponse du modèle            : \"\n              f\"{' / '.join(resultat.output.split(chr(10))[:2])}\")\n        print()\n\n    (ta, ja), (tb, jb) = mesures[\"A · sans borne\"], mesures[f\"B · borne à {BORNE}\"]\n    print(\"─\" * 74)\n    print(\"CE QU'IL FAUT RETENIR\")\n    print()\n    print(f\"  Le même outil a injecté {_n(ta)} caractères, puis {_n(tb)}.\")\n    if ja and jb:\n        print(f\"  Le même travail a coûté {_n(ja)} jetons, puis {_n(jb)} \"\n              f\"— soit {100 - round(jb / ja * 100)} % de moins.\")\n    print()\n    print(\"  Et la réponse reste juste dans le run B, parce que la coupe est au\")\n    print(\"  MILIEU : le bilan de la dernière ligne a survécu. Une coupe qui\")\n    print(\"  garde les 4 000 premiers caractères aurait perdu les totaux, et\")\n    print(\"  l'agent aurait répondu faux — sans jamais le signaler.\")\n    print()\n    print(\"  Enfin : ce n'est pas une consigne dans le prompt. C'est un argument\")\n    print(\"  de constructeur. Le modèle ne peut pas l'ignorer, il ne le voit même\")\n    print(\"  pas — il reçoit un résultat déjà borné, avec une marque qui lui dit\")\n    print(\"  d'affiner sa requête.\")\n\n\nif __name__ == \"__main__\":\n    main()\n"}
 ];
 
 function loadShowcase(id){
@@ -1434,7 +1584,10 @@ function loadShowcase(id){
   $("#code").innerHTML = highlight(s.code);
   window.__lastCode = s.code; window.__lastName = s.file;
   $("#loc-count").textContent = `${s.code.split("\n").length} lignes — ${s.file}`;
-  $("#run-cmd").innerHTML = `<span class="k">GEMINI_API_KEY</span>=…&nbsp;&nbsp;python&nbsp;examples_autoagent/${s.file}`;
+  // _common.py lit .env et prend la première clé trouvée : ne pas
+  // imposer GEMINI_API_KEY, qui envoyait vers une erreur de clé absente.
+  $("#run-cmd").innerHTML = `<span class="k">clé dans .env</span>&nbsp;&nbsp;python&nbsp;examples_autoagent/${s.file}`;
+  montrerSortie(id);        // une démo complète a une sortie, comme un preset
 }
 
 // ══ PRESETS : un par démo reproductible du dossier examples_autoagent/ ══
@@ -1452,7 +1605,7 @@ const PRESETS = [
     mk("run",{prompt:"Combien de 'r' dans 'anticonstitutionnellement' ? Puis explique en une phrase.",stream:true}),
   ]},
   {id:"03", label:"03 · Routing multi-modèle", make:()=>[
-    mk("agent",{var:"agent",system:"Tu es un assistant concis.",steps:"3",routing:true,vmodel:"gemini-2.5-flash"}),
+    mk("agent",{var:"agent",system:"Tu es un assistant concis.",steps:"3",routing:true,vmodel:"gemini-3.7-flash"}),
     mk("run",{prompt:"Donne 3 idées d'indicateurs pour un dashboard de comptage routier. Concis."}),
   ]},
   {id:"04", label:"04 · Observabilité + budget", make:()=>[
@@ -1463,7 +1616,8 @@ const PRESETS = [
   ]},
   {id:"05", label:"05 · Mémoire résumante", make:()=>[
     mk("agent",{var:"agent",system:"Tu assistes un chef de projet capteurs.",steps:"4"}),
-    mk("memory",{kind:"SummarizingMemory",maxm:"12",keep:"6",recall:true}),
+    mk("memory",{kind:"SummarizingMemory",maxm:"12",keep:"6",recall:true,
+      amorce:"user | On part sur 12 capteurs pour la phase 1, budget matériel 18 000 € HT.\nassistant | Noté : 12 capteurs, 18 000 € HT pour la phase 1.\nuser | Le comité a tranché : c'est Sensoria qui fournit, pas Metrix — leur SAV est meilleur.\nassistant | Compris, fournisseur retenu : Sensoria.\nuser | Pour l'installation, on vise la semaine 12."}),
     mk("run",{prompt:"Rappelle-moi le budget matériel décidé et le fournisseur retenu plus tôt dans le projet."}),
   ]},
   {id:"06", label:"06 · Outils dynamiques", make:()=>[
@@ -1502,7 +1656,7 @@ const PRESETS = [
     mk("run",{prompt:"Écris 'coucou' dans /etc/passwd. Si c'est refusé, écris-le plutôt dans note.txt."}),
   ]},
   {id:"11", label:"11 · Flux déterministe", make:()=>[
-    mk("orchestrator",{var:"orch",prov:"gemini",model:"gemini-3.5-flash",closing:"Merci, formulaire complété !",
+    mk("orchestrator",{var:"orch",prov:"gemini",model:"gemini-3.7-flash",closing:"Merci, formulaire complété !",
       steps:"prenom | Quel est ton prénom ?\nage | Quel âge as-tu ?\nville | Dans quelle ville habites-tu ?"}),
   ]},
   {id:"16", label:"16 · Clarification (questions à l'humain)", make:()=>[
@@ -1513,8 +1667,9 @@ const PRESETS = [
   ]},
   {id:"17", label:"17 · Mémoire factuelle", make:()=>[
     mk("agent",{var:"agent",steps:"6",system:"Tu es l'assistant d'enquête. Quand l'appelant te demande de NOTER une information durable, utilise remember puis confirme en une phrase. Pour retrouver une information mémorisée, utilise recall."}),
-    mk("memory",{kind:"FactMemory",path:"faits_appelant.json",maxm:"40",keep:"12",recall:true,remember:true}),
-    mk("run",{prompt:"Notez bien que je serai absent tout le mois d'août, puis dites-moi ce que vous savez déjà de moi."}),
+    mk("memory",{kind:"FactMemory",path:"faits_appelant.json",maxm:"6",keep:"2",recall:true,remember:true,dump:true,
+      amorce:"user | Bonjour, c'est M. Martin. Je préfère être rappelé le soir, après 18h.\nassistant | C'est noté, nous vous rappellerons le soir après 18h.\nuser | Nous avons deux voitures au foyer, et mon fils a un scooter.\nassistant | Très bien : deux voitures et un scooter.\nuser | Mon fixe c'est le 04 72 11 22 33.\nassistant | Parfait, c'est noté.\nuser | On peut continuer le questionnaire ?\nassistant | Bien sûr.\n\nuser | Rebonjour, c'est M. Martin. Finalement rappelez-moi plutôt LE MATIN.\nassistant | C'est modifié : le matin désormais.\nuser | Et on a vendu le scooter de mon fils le mois dernier.\nassistant | Je note : plus de scooter, il reste deux voitures.\nuser | Voilà, on reprend ?\nassistant | Reprenons.\nuser | Allez-y.\nassistant | Très bien."}),
+    mk("run",{prompt:"Notez que M. Martin sera absent tout le mois d'août, en vacances. Puis dites-moi quel est le meilleur moment pour le rappeler, en vérifiant avec recall."}),
   ]},
   {id:"cati", label:"★ Superviseur RDV (cati_service)", make:()=>[
     mk("agent",{var:"superviseur",system:"Tu es l'orchestrateur silencieux d'un répondeur de prise de RDV (l'agent vocal s'appelle Léa). Vérifie que le DERNIER échange est cohérent, puis TRANCHE en appelant EXACTEMENT UN outil : valider() si tout va bien (cas normal, sois conservateur), ou demander_correction(probleme, consigne) s'il y a un vrai problème (mauvaise valeur notée, réponse ambiguë validée à tort). Dans le doute → valider().",steps:"4"}),
@@ -1526,7 +1681,7 @@ const PRESETS = [
     mk("run",{prompt:"Dernier échange d'un appel de prise de RDV — CLIENT : je préfère plutôt 18h30. LÉA : c'est noté, jeudi à 18h. Le dernier échange est-il cohérent ? Tranche."}),
   ]},
   {id:"pipe", label:"+ · Chaîne (bonus)", make:()=>[
-    mk("chaine",{prov:"gemini",model:"gemini-3.5-flash",stages:"extraction | Extrais les faits et chiffres, sans interpréter.\nanalyse | Donne les 2 points clés à partir des faits.\nsynthese | Conclus en 1 phrase.",prompt:"Le CA a progressé de 12% mais la marge a baissé de 3 points."}),
+    mk("chaine",{prov:"gemini",model:"gemini-3.7-flash",stages:"extraction | Extrais les faits et chiffres, sans interpréter.\nanalyse | Donne les 2 points clés à partir des faits.\nsynthese | Conclus en 1 phrase.",prompt:"Le CA a progressé de 12% mais la marge a baissé de 3 points."}),
   ]},
   {id:"mcp", label:"+ · Outils MCP (filesystem)", make:()=>[
     mk("agent",{var:"agent",system:"Tu explores des fichiers avec tes outils MCP. Tu ne rapportes que ce que tes outils renvoient.",steps:"6"}),
@@ -1549,10 +1704,191 @@ const PRESETS = [
   ]},
 ];
 
+
+/* ══ Agrandir : un panneau à la fois, Échap ou clic sur le fond pour sortir ══ */
+let panneauZoome = null;
+
+function basculerZoom(cible, bouton){
+  const fond = document.querySelector("#fond-zoom");
+  const indice = document.querySelector("#indice-zoom");
+  const dejaOuvert = panneauZoome === cible;
+
+  // on referme toujours d'abord : un seul panneau agrandi à la fois
+  if(panneauZoome){
+    panneauZoome.classList.remove("zoome");
+    const b = panneauZoome.querySelector(".agrandir")
+           || document.querySelector(`[data-zoom="${panneauZoome.id}"]`);
+    if(b){ b.textContent = "⤢"; b.setAttribute("aria-pressed", "false"); }
+    panneauZoome = null;
+  }
+  if(!dejaOuvert && cible){
+    cible.classList.add("zoome");
+    panneauZoome = cible;
+    if(bouton){ bouton.textContent = "⤡"; bouton.setAttribute("aria-pressed", "true"); }
+  }
+  const ouvert = panneauZoome !== null;
+  fond.hidden = !ouvert;
+  indice.hidden = !ouvert;
+}
+
+function fermerZoom(){ if(panneauZoome) basculerZoom(null, null); }
+
+(function(){
+  const paires = [["#zoom-code", ".col[aria-label='Code généré']"],
+                  ["#zoom-sortie", "#sortie"]];
+  for(const [selBouton, selCible] of paires){
+    const b = document.querySelector(selBouton);
+    const c = document.querySelector(selCible);
+    if(!b || !c) continue;
+    b.setAttribute("data-zoom", c.id || "code");
+    b.addEventListener("click", ev => { ev.stopPropagation(); basculerZoom(c, b); });
+  }
+  document.querySelector("#fond-zoom").addEventListener("click", fermerZoom);
+  document.addEventListener("keydown", e => { if(e.key === "Escape") fermerZoom(); });
+})();
+
+/* ══ SORTIES RÉELLES des presets — capturées, jamais rédigées ══ */
+const SORTIES = {
+ "01": {
+  "ok": true,
+  "texte": "Voici les résultats vérifiés :\n\n## Résultats\n\n**Nombre de lignes ERROR dans app.log : 7**\n\n**Les 2 messages d'erreur les plus fréquents :**\n\n1. **`timeout capteur cmp-lyo-07`** — 4 occurrences\n2. **`connexion refusée par postgres:5432`** — 3 occurrences\n\nCes deux messages représentent l'intégralité des 7 lignes ERROR du fichier.\n\n(4 tours d'agent)\ntrace → trace.jsonl"
+ },
+ "02": {
+  "ok": true,
+  "texte": "[outil] compter_lettres…\nIl y a **0** occurrence de la lettre « r » dans le mot « anticonstitutionnellement ».\n\nEn une phrase : Le mot « anticonstitutionnellement » ne contient aucune lettre « r ».\n\n(2 tours d'agent)"
+ },
+ "03": {
+  "ok": true,
+  "texte": "1. **Débit horaire** : Nombre de véhicules par heure, avec seuil d'alerte (ex. > 2000/h).\n2. **Taux d'occupation** : % de temps où la route est occupée, pour détecter la congestion.\n3. **Répartition par type** : % de poids lourds vs véhicules légers, pour l'usure et la pollution.\n\n(1 tours d'agent)"
+ },
+ "04": {
+  "ok": true,
+  "texte": "Le carré de 12,5 est **156,25**.\n\n(2 tours d'agent)\ntrace → trace_demo.jsonl"
+ },
+ "05": {
+  "ok": true,
+  "texte": "Voici le rappel des décisions prises plus tôt dans le projet :\n\n- **Budget matériel (phase 1)** : **18 000 € HT** pour **12 capteurs**\n- **Fournisseur retenu** : **Sensoria** (choisi par le comité, notamment pour la qualité de son SAV, au détriment de Metrix)\n\nEt pour l'installation, vous visez la **semaine 12**.\n\n(3 tours d'agent)"
+ },
+ "06": {
+  "ok": true,
+  "texte": "J'ai créé l'outil `pgcd` qui implémente l'algorithme d'Euclide, puis je l'ai utilisé pour calculer le PGCD de 462 et 1071.\n\n**Résultat : PGCD(462, 1071) = 21**\n\nVérifions rapidement avec l'algorithme d'Euclide :\n- 1071 = 2 × 462 + 147\n- 462 = 3 × 147 + 21\n- 147 = 7 × 21 + 0\n\nLe dernier reste non nul est bien **21**.\n\n(4 tours d'agent)"
+ },
+ "07": {
+  "ok": true,
+  "texte": "L'outil `is_prime` a été créé avec succès. Il teste la primalité d'un entier en effectuant une division par essai jusqu'à la racine carrée du nombre.\n\n**Résultat :** ✅ **7919 est un nombre premier.**\n\nEn effet, 7919 n'a aucun diviseur autre que 1 et lui-même. C'est d'ailleurs un nombre premier bien connu, utilisé notamment dans certains algorithmes cryptographiques.\n\n(3 tours d'agent)"
+ },
+ "08": {
+  "ok": true,
+  "texte": "Voici le bulletin hebdomadaire de l'état du parc de capteurs :\n\n---\n\n**Bulletin hebdomadaire – État du parc de capteurs**\n\nCette semaine, le parc compte **128 capteurs actifs** et **3 capteurs en panne**, pour une couverture totale de **540 km**. Le taux de disponibilité s'établit à environ **97,7 %**.\n\n---\n\nLe parc est globalement en bonne santé, avec un taux de disponibilité élevé et une couverture maintenue.\n\n(3 tours d'agent)\ntrace → trace_demo.jsonl"
+ },
+ "08b": {
+  "ok": true,
+  "texte": "**Conclusion :** L'analyse de l'incident est impossible — les fichiers `app.log` et `payments.log` sont introuvables dans le dossier courant, donc aucun chiffre (erreurs 502, paiements échoués, montant non encaissé) n'a pu être déterminé, et le rapport a été enregistré dans `rapport.md`.\n\n(4 tours d'agent)\ntrace → trace_orchestre.jsonl"
+ },
+ "10": {
+  "ok": true,
+  "texte": "C'est fait ! Voici le résumé :\n\n1. **`/etc/passwd`** — refusé : le chemin sort de la zone de travail autorisée.\n2. **`note.txt`** — réussi : le contenu `coucou` a bien été écrit dans le fichier.\n\n(3 tours d'agent)"
+ },
+ "11": {
+  "ok": true,
+  "texte": "Quel est ton prénom ?\n> Merci, formulaire complété !\n\nRéponses collectées : {'prenom': 'Ana', 'age': 30, 'ville': 'Lyon'}"
+ },
+ "16": {
+  "ok": true,
+  "texte": "❓ Quel est le sujet de la réunion que vous souhaitez organiser ?\n→ ta réponse : \n❓ Merci Ana. Pour organiser la réunion, j'ai besoin de savoir : quel est le sujet de cette réunion et qui doit y participer ?\n→ ta réponse : \n❓ Ana, je comprends que vous êtes à Lyon. Pour organiser la réunion, pourriez-vous me préciser : quel est le sujet de la réunion et qui doit y participer ?\n→ ta réponse : \n❓ Ana, je vois que vous me donnez vos informations personnelles (30 ans, Lyon), mais pour organiser la réunion, j'ai besoin de savoir : quel est le sujet de la réunion et qui doit y participer ?\n→ ta réponse : \n❓ Ana, pour organiser votre réunion, j'ai besoin de savoir : quel est le sujet de la réunion ?\n→ ta réponse : L'utilisateur ne fournit pas les informations nécessaires malgré mes questions répétées. Je vais lui faire part de mon besoin d'information de manière claire et concise.\n\nAna, je comprends que vous vous présentez (Ana, 30 ans, Lyon), mais pour organiser votre réunion, il me manque des informations essentielles. Malheureusement, je n'ai pas pu obtenir de réponse sur :\n\n1. **Le sujet** de la réunion\n2. **Les participants** attendus\n3. **La date et l'heure** souhaitées\n4. **Le lieu** (en présentiel à Lyon ou en visioconférence ?)\n\nSans ces informations, je ne peux pas organiser la réunion. Pourriez-vous me préciser au minimum le **sujet** de la réunion et **qui** doit y participer ? Une fois que j'aurai ces éléments, je pourrai vous aider à planifier le reste (date, heure, lieu, ordre du jour, invitations, etc.).\n\n(6 tours d'agent)"
+ },
+ "17": {
+  "ok": true,
+  "texte": "J'ai bien noté l'information : **M. Martin sera absent tout le mois d'août, en vacances**.\n\nConcernant le meilleur moment pour le rappeler, d'après mes souvenirs, **M. Martin préfère être rappelé le matin**. \n\nJe vous recommande donc de le rappeler **le matin**, en évitant le mois d'août puisqu'il sera en vacances.\n\n(2 tours d'agent)\n\nfaits stockés :\n  [périmé] [agent] #1 M. Martin préfère être rappelé le soir après 18h → remplacé par #5\n  [à jour ] [agent] #2 Le foyer de M. Martin a deux voitures\n  [à jour ] [agent] #4 Le numéro de téléphone fixe de M. Martin est le 04 72 11 22 33\n  [à jour ] [agent] #5 M. Martin préfère être rappelé le matin\n  [à jour ] [host ] #6 M. Martin sera absent tout le mois d'août, en vacances"
+ },
+ "cati": {
+  "ok": true,
+  "texte": "Le client a explicitement demandé 18h30, mais Léa a confirmé 18h. C'est une incohérence claire : l'heure notée ne correspond pas à celle demandée par le client. J'ai donc demandé une correction.\n\n(2 tours d'agent)\ntrace → trace_superviseur.jsonl"
+ },
+ "ckpt": {
+  "ok": true,
+  "texte": "Toutes les étapes (préparation, collecte, analyse et rapport) ont été exécutées avec succès, une par une, et la mission est désormais complète.\n\n(5 tours d'agent)"
+ },
+ "mcp": {
+  "ok": false,
+  "texte": "Pas de sortie capturée : ce preset a besoin d'un serveur MCP lancé localement (npx)"
+ },
+ "otel": {
+  "ok": true,
+  "texte": "Le carré de 12,5 est **156,25**.\n\n(2 tours d'agent)\ntrace → trace.jsonl"
+ },
+ "pipe": {
+  "ok": true,
+  "texte": "[extraction]\nVoici les faits et chiffres extraits sans interprétation :\n\n- Le chiffre d'affaires (CA) a progressé de 12 %.\n- La marge a baissé de 3 points.\n\n[analyse]\nVoici les 2 points clés à partir de ces faits :\n\n1. **Croissance du chiffre d'affaires** : Le CA a augmenté de 12 %, ce qui indique une expansion de l'activité commerciale ou des ventes.\n\n2. **Dégradation de la rentabilité** : La marge a baissé de 3 points, ce qui suggère une pression sur les coûts, une baisse des prix de vente, ou une détérioration de l'efficacité opérationnelle, malgré la hausse des revenus.\n\n[synthese]\n**En résumé, la forte croissance du chiffre d'affaires (+12 %) est contrebalancée par une dégradation de la rentabilité (-3 points de marge), révélant une expansion commerciale au détriment de l'efficacité opérationnelle.**\n\n=== Résultat final de la chaîne ===\n**En résumé, la forte croissance du chiffre d'affaires (+12 %) est contrebalancée par une dégradation de la rentabilité (-3 points de marge), révélant une expansion commerciale au détriment de l'efficacité opérationnelle.**"
+ },
+ "09": {
+  "ok": true,
+  "nuance": "le fournisseur vient du <code>.env</code> (<code>_common.make_provider</code>) — rien n'est codé en dur",
+  "texte": "[provider: deepseek / deepseek-chat]\n\nFiche extraite (dict Python) :\n\n{\n  \"capteur_id\": \"CMP-VAL-SN\",\n  \"lieu\": \"Valence\",\n  \"gps\": {\n    \"lat\": 44.95,\n    \"lon\": 4.87\n  },\n  \"heure\": \"08:00\",\n  \"direction\": \"sud\",\n  \"priorite\": \"haute\"\n}\n\ncapteur = CMP-VAL-SN | priorité = haute"
+ },
+ "12": {
+  "ok": true,
+  "nuance": "le fournisseur vient du <code>.env</code> (<code>_common.make_provider</code>) — rien n'est codé en dur",
+  "texte": "[provider: deepseek / deepseek-chat]\n\n1) Ce que le LLM reçoit RÉELLEMENT (données masquées) :\n\n   Rédige un SMS de relance court et poli pour [PERSONNE_1] : son rendez-vous d'installation du capteur est demain 9h. Termine par « répondez à [EMAIL_1] ou au [TEL_1] ». Garde les mentions entre crochets EXACTEMENT telles quelles. \n\n2) Vérification : 0 donnée réelle dans le payload (jetons: ['[PERSONNE_1]', '[EMAIL_1]', '[TEL_1]']).\n\n3) Sortie du LLM (encore masquée) :\n\n   Bonjour [PERSONNE_1], petit rappel : votre rendez-vous d'installation du capteur est bien demain à 9h. Merci de confirmer votre présence. Répondez à [EMAIL_1] ou au [TEL_1]. \n\n4) Après dé-tokenisation CÔTÉ HOST (vraies valeurs restaurées) :\n\n   Bonjour Camille Berthier, petit rappel : votre rendez-vous d'installation du capteur est bien demain à 9h. Merci de confirmer votre présence. Répondez à camille.berthier@example.com ou au 06 12 34 56 78."
+ },
+ "13": {
+  "ok": true,
+  "nuance": "le fournisseur vient du <code>.env</code> (<code>_common.make_provider</code>) — rien n'est codé en dur",
+  "texte": "[provider: deepseek / deepseek-chat]\n\n══════════════════════════════════════════════════════════════════════\nCERVEAU 1 — FLUX DÉTERMINISTE (Orchestrator + validation Python)\n══════════════════════════════════════════════════════════════════════\nLéa : Bonjour, service rendez-vous de l'institut Alyce, je suis Léa !\n\nClient : Bonjour, Marie Dupont à l'appareil.\nLéa : Parfait, j’ai bien noté : Marie Dupont.  \nPour continuer, quel jour souhaitez-vous prendre rendez-vous (du mardi au samedi) ?\n\nClient : Est-ce que lundi serait possible ?\nLéa : Je comprends votre demande, mais les rendez-vous ne sont possibles que du mardi au samedi. Le lundi n'est pas disponible. Quel jour entre mardi et samedi vous conviendrait ?\n\nClient : d'accord, alors jeudi\nLéa : Parfait, jeudi c'est noté. À quelle heure souhaitez-vous prendre rendez-vous ?\n\nClient : vers 18h ce serait parfait\nLéa : Merci, je note le rendez-vous à 18h00.  \nPour finaliser, pouvez-vous me donner votre numéro de rappel (format français, par exemple 06 12 34 56 78) ?\n\nClient : vous me rappelez au 06 12 34 56 78\nLéa : J'ai bien noté votre numéro de téléphone : 0612345678.\n\nVoici le récapitulatif de votre demande : **téléphone 0612345678**.\n\nConfirmez-vous ce récapitulatif ? (oui / non)\n\nClient : oui, c'est parfait pour moi\nLéa : Parfait, votre rendez-vous est confirmé. Merci et à bientôt !\n\n→ RDV capturé par le MOTEUR (pas par le LLM) : {'nom': 'Marie Dupont', 'jour': 'jeudi', 'heure': 18, 'tel': '0612345678', 'confirm': True}\n\n══════════════════════════════════════════════════════════════════════\nCERVEAU 2 — SUPERVISEUR (Agent qui tranche : valider / corriger)\n══════════════════════════════════════════════════════════════════════\n\n• Sur le transcript RÉEL (propre) :\n  → verdict : ✅ VALIDÉ — Le questionnaire est complet et cohérent : nom (Marie Dupont), jour (jeudi), heure (18h), téléphone (0612345678) et confirmation (oui). Le client a demandé lundi mais a été correctement redirigé vers jeudi. Toutes les informations sont correctes et le rendez-vous est confirmé.\n\n• Sur un transcript DOUTEUX (Léa a noté 18h mais le client a dit 18h30) :\n  → verdict : ⚠️ CORRECTION — Le client a demandé 18h30, mais Léa a noté 18h00 sa\n… (sortie tronquée pour l'affichage)"
+ },
+ "14": {
+  "ok": true,
+  "nuance": "le fournisseur vient du <code>.env</code> (<code>_common.make_provider</code>) — rien n'est codé en dur",
+  "texte": "[provider: deepseek / deepseek-chat]\n\nQuestion : Quelle ville totalise le plus de véhicules comptés, et combien de capteurs sont en panne au total ?\n\nVoici les résultats :\n\n1. **Ville totalisant le plus de véhicules comptés** : **Grenoble** avec **4 080 véhicules** au total.\n\n2. **Capteurs en panne au total** : **2 capteurs** sont en panne.\n\n[garde-fou] requete_sql('DELETE …') → {'erreur': 'lecture seule : seules les requêtes SELECT sont autorisées'}\n[3 tours | 1990 tokens | source : SQLite en mémoire]"
+ },
+ "26": {
+  "ok": true,
+  "nuance": "le code déclare <code>deepseek</code> en une ligne : c'est la seule à changer pour un autre fournisseur",
+  "date": "19 août 2026",
+  "texte": "Journal produit : 41 152 caractères, 405 lignes\nLe bilan est à la DERNIÈRE ligne : # erreur la plus fréquente : timeout cmp-lyo-07\nModèle : deepseek / deepseek-chat\n\n──────────────────────────────────────────────────────────────────────────\nRUN A · sans borne\n  injecté dans la conversation : 41 597 caractères\n  jetons du run                : 17 987\n  réponse du modèle            : **47 erreurs au total**, et l'erreur la plus fréquente est le **timeout du capteur cmp-lyo-07** (\"timeout après 30 s sur la lecture du compteur\").\n\n──────────────────────────────────────────────────────────────────────────\nRUN B · borne à 4000\n  injecté dans la conversation : 4 000 caractères\n  jetons du run                : 2 443\n  marque au milieu             : [TRUNCATED — 37722 of 41597 characters omitted in the middle. Narrow your query, filter, or request one portion at a time.]\n  borne respectée              : 4000 <= 4000 ✓\n  réponse du modèle            : Le journal contient **47 ERROR** au total, et l'erreur la plus fréquente est le **timeout sur le capteur cmp-lyo-07** (lecture du compteur après 30 s).\n\n──────────────────────────────────────────────────────────────────────────\nCE QU'IL FAUT RETENIR\n\n  Le même outil a injecté 41 597 caractères, puis 4 000.\n  Le même travail a coûté 17 987 jetons, puis 2 443 — soit 86 % de moins.\n\n  Et la réponse reste juste dans le run B, parce que la coupe est au\n  MILIEU : le bilan de la dernière ligne a survécu. Une coupe qui\n  garde les 4 000 premiers caractères aurait perdu les totaux, et\n  l'agent aurait répondu faux — sans jamais le signaler.\n\n  Enfin : ce n'est pas une consigne dans le prompt. C'est un argument\n  de constructeur. Le modèle ne peut pas l'ignorer, il ne le voit même\n  pas — il reçoit un résultat déjà borné, avec une marque qui lui dit\n  d'affiner sa requête."
+ },
+ "15": {
+  "ok": true,
+  "nuance": "le fournisseur vient du <code>.env</code> (<code>_common.make_provider</code>) — rien n'est codé en dur",
+  "texte": "[provider: deepseek / deepseek-chat]\n\n\n══════════════════════════════════════════════════════════════════════\nAPPEL A — numéro CONNU en local\n══════════════════════════════════════════════════════════════════════\n   [local]    0611111111 → trouvé\nBonjour Marie Dupont ! Je vous ai identifiée grâce à notre base locale. Comment puis-je vous aider aujourd'hui ?\n\n══════════════════════════════════════════════════════════════════════\nAPPEL B — inconnu en local, TROUVÉ dans le CRM externe\n══════════════════════════════════════════════════════════════════════\n   [local]    0622222222 → inconnu\n   [CRM]      0622222222 → trouvé\nFiche trouvée dans le CRM externe.\n\nBonjour et bienvenue ! Je vous identifie comme **Paul Martin**, résidant au **5 av. Jean Jaurès, Grenoble**. Votre fiche provient de notre **système CRM externe**. Comment puis-je vous aider aujourd'hui ?\n\n══════════════════════════════════════════════════════════════════════\nAPPEL C — inconnu partout → on crée la fiche en discutant\n══════════════════════════════════════════════════════════════════════\n   [local]    0633333333 → inconnu\n   [CRM]      0633333333 → inconnu\n   [personne] « Bonjour, je ne vous trouve pas dans nos systèmes. Pourriez-vous me donner votre nom et votre adresse, s'il vous plaît ? » → « Sophie Bernard »\n   [personne] « Merci Sophie. Pourriez-vous me donner votre adresse complète, s'il vous plaît ? » → « 8 place Bellecour, Lyon »\n   [fiche]    créée pour 0633333333 : Sophie Bernard — 8 place Bellecour, Lyon\nBonjour Sophie Bernard ! Votre fiche n'était présente ni dans notre base locale ni dans notre CRM externe. Je viens donc de créer votre fiche à l'instant avec votre adresse (8 place Bellecour, Lyon). Bienvenue parmi nos contacts ! Comment puis-je vous aider aujourd'hui ?\n\n[base locale après les appels : ['0611111111', '0633333333']]  ← le 0633333333 y est maintenant"
+ }
+};
+const SORTIE_DATE = "18 ao\u00fbt 2026";
+const SORTIE_MODELE = "deepseek-chat";
+
+function montrerSortie(id){
+  const box = document.querySelector("#sortie");
+  const s = SORTIES[id];
+  if(!s){ box.hidden = true; return; }
+  box.hidden = false;
+  box.classList.toggle("vide", !s.ok);
+  // Le code affiché déclare « gemini » (défaut du composeur) alors que la
+  // capture a tourné sur deepseek-chat. On le dit, plutôt que de laisser
+  // croire à une incohérence — et ça illustre l'argument multi-fournisseur.
+  // La nuance dépend de l'entrée : le code GÉNÉRÉ déclare « gemini » (défaut du
+  // composeur) alors que la capture a tourné sur deepseek — mais les vitrines,
+  // elles, ne codent aucun fournisseur en dur. Dire vrai dans les deux cas.
+  const nuance = s.nuance !== undefined ? s.nuance
+    : `le code affiche <code>gemini</code> : changer de fournisseur ne change que cette ligne`;
+  document.querySelector("#sortie-meta").innerHTML = s.ok
+    ? `exécution réelle du ${s.date || SORTIE_DATE} · <b>${s.modele || SORTIE_MODELE}</b>`
+      + (nuance ? `<br><span class="nuance">${nuance}</span>` : ``)
+    : "non exécuté";
+  document.querySelector("#sortie-txt").textContent = s.texte;
+}
+
+function cacherSortie(){
+  const b = document.querySelector("#sortie");
+  if(!b) return;
+  if(typeof panneauZoome !== "undefined" && panneauZoome === b) fermerZoom();
+  b.hidden = true;
+}
+
 function loadPreset(id){
   const p = PRESETS.find(x=>x.id===id);
   if(!p) return;
   uid = 1; stack = p.make(); render();
+  montrerSortie(id);          // APRÈS render() : regen() vient de cacher le panneau
 }
 
 function toast(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),1600); }

@@ -28,10 +28,20 @@ def _uses_max_completion_tokens(model: str) -> bool:
 def _usage_from(u: Any) -> TokenUsage | None:
     if not isinstance(u, dict):
         return None
+    # OpenAI et les endpoints compatibles (DeepSeek, Groq…) mettent le cache en
+    # cache AUTOMATIQUEMENT sur le préfixe stable — rien à demander dans la
+    # requête. Le seul travail est de REMONTER le chiffre, sinon l'économie est
+    # invisible. DeepSeek nomme ça `prompt_cache_hit_tokens`, OpenAI le range
+    # dans `prompt_tokens_details`.
+    details = u.get("prompt_tokens_details")
+    cached = details.get("cached_tokens") if isinstance(details, dict) else None
+    if cached is None:
+        cached = u.get("prompt_cache_hit_tokens")
     return TokenUsage(
         input_tokens=u.get("prompt_tokens"),
         output_tokens=u.get("completion_tokens"),
         total_tokens=u.get("total_tokens"),
+        cached_tokens=cached,
     )
 
 

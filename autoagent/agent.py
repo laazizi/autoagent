@@ -6,7 +6,7 @@ import threading
 import time
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from .dynamic import DynamicToolBuilder, ToolBuildRequest
@@ -107,6 +107,7 @@ class RunState:
     turn_start: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_tokens: int = 0          # part de l'entree servie par le cache (0.19.0)
     have_usage: bool = False
     tainted: bool = False
 
@@ -118,6 +119,7 @@ class RunState:
             "turn_start": self.turn_start,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "cached_tokens": self.cached_tokens,
             "have_usage": self.have_usage,
             "tainted": self.tainted,
             "messages": [m.to_dict() for m in self.messages],
@@ -132,6 +134,8 @@ class RunState:
             turn_start=data.get("turn_start", 0),
             input_tokens=data.get("input_tokens", 0),
             output_tokens=data.get("output_tokens", 0),
+            # defaut 0 : un instantane anterieur a 0.19.0 se reprend sans erreur
+            cached_tokens=data.get("cached_tokens", 0),
             have_usage=data.get("have_usage", False),
             tainted=data.get("tainted", False),
         )
@@ -324,6 +328,68 @@ def _score_tools(query: str, specs: Sequence[ToolSpec]) -> list[ToolSpec]:
     return [spec for _, _, spec in scored]
 
 
+_PRUNE_MARK = "[PRUNED"
+_PRUNE_NOTE = (
+    "[PRUNED — the {chars}-character result of `{name}` was dropped from this "
+    "history to keep the context bounded. It was VALID when produced; nothing "
+    "about it failed. Call the tool again if you still need that data.]"
+)
+
+
+def _prune_tool_results(
+    messages: list[Message], keep: int
+) -> tuple[list[Message], int, int]:
+    """Replace the content of OLD tool results by a short marker.
+
+    A tool result is the biggest and least reusable object in a transcript.
+    The model needed those 40 000 characters at step 3; by step 12 it only
+    needs the conclusion it drew from them — yet the whole payload is re-sent
+    at EVERY step until it falls off the memory's tail, and it is never in the
+    provider's cached prefix because the history changes each turn.
+    ``max_tool_result_chars`` bounds a result's WIDTH; this bounds its LIFETIME.
+
+    The ``keep`` most recent tool messages are left untouched. Older ones keep
+    their role and ``tool_call_id`` — the conversation stays well-formed for
+    every provider — and lose only their payload. The marker says the result
+    was VALID, because a model told merely that something is "removed" tends to
+    re-plan around a failure that never happened.
+
+    Three invariants carry the whole difficulty:
+
+    * **Taint survives.** A pruned result that carried the UNTRUSTED framing is
+      re-framed. Dropping the marker would silently un-taint the run and
+      disarm the trifecta guard — the 0.15 hole, re-opened by the back door.
+    * **Pruning never GROWS the transcript.** A result shorter than its own
+      marker is left alone: a bound that costs context is not a bound.
+    * **The record is not touched.** The input list is not mutated; only the
+      VIEW handed to the provider is pruned, so the trace, the returned
+      messages and any checkpoint keep the full result.
+
+    Returns ``(view, pruned_count, chars_saved)``.
+    """
+    if keep < 0:
+        return messages, 0, 0
+    positions = [i for i, m in enumerate(messages) if m.role == "tool"]
+    if len(positions) <= keep:
+        return messages, 0, 0
+    view = list(messages)
+    pruned = saved = 0
+    for i in positions[: len(positions) - keep]:
+        message = view[i]
+        content = message.content or ""
+        if _PRUNE_MARK in content:  # idempotent: never prune a marker again
+            continue
+        note = _PRUNE_NOTE.format(chars=len(content), name=message.name or "tool")
+        if UNTRUSTED_OPEN in content:
+            note = f"{UNTRUSTED_OPEN}\n{note}\n{UNTRUSTED_CLOSE}"
+        if len(note) >= len(content):
+            continue
+        view[i] = replace(message, content=note)
+        pruned += 1
+        saved += len(content) - len(note)
+    return view, pruned, saved
+
+
 def _tool_message(call: ToolCall, tool_result: Any, *, untrusted: bool = False,
                   max_chars: int | None = None) -> Message:
     """The transcript message carrying one tool result back to the LLM.
@@ -431,6 +497,20 @@ class Agent:
             the result only — the untrusted framing markers are never
             cut. See also ``ProjectWorkspace(max_read_chars=...)``, which
             bounds workspace reads specifically.
+        prune_tool_results_after: Optional CODE-LEVEL bound on how LONG a
+            tool result stays in the transcript (0.19.0). ``None``
+            (default) keeps the historical behaviour: every result is
+            re-sent verbatim at every step until it falls off the
+            memory's tail. Set to N and only the N most recent tool
+            results keep their payload; older ones are replaced — in the
+            view sent to the provider only — by a marker naming the tool
+            and the size dropped, so the model can call it again. This is
+            the complement of ``max_tool_result_chars``: that one bounds
+            a result's WIDTH, this one bounds its LIFETIME. It also ages
+            out stale tool ERRORS, which otherwise keep instructing the
+            model long after the condition that produced them is gone.
+            The untrusted framing is preserved on a pruned result, so
+            pruning can never un-taint a run.
         max_repeated_tool_calls: Optional loop guard (0.18.0). ``None``
             (default) keeps the historical behaviour. Set to N and the
             (N+1)-th IDENTICAL call — same tool, same arguments — is not
@@ -462,6 +542,7 @@ class Agent:
         token_budget: int | None = None,
         tool_policy: ToolPolicy | None = None,
         max_tool_result_chars: int | None = None,
+        prune_tool_results_after: int | None = None,
         max_repeated_tool_calls: int | None = None,
         trifecta_guard: str = "deny",
     ) -> None:
@@ -480,6 +561,7 @@ class Agent:
         self.token_budget = token_budget
         self.tool_policy = tool_policy
         self.max_tool_result_chars = max_tool_result_chars
+        self.prune_tool_results_after = prune_tool_results_after
         self.max_repeated_tool_calls = max_repeated_tool_calls
         self.trifecta_guard = trifecta_guard
         self.dynamic_builder: DynamicToolBuilder | None = None
@@ -1210,6 +1292,12 @@ class Agent:
         turn_start = resume_from.turn_start if resume_from else len(working_messages)
         spent_in = resume_from.input_tokens if resume_from else 0
         spent_out = resume_from.output_tokens if resume_from else 0
+        spent_cached = resume_from.cached_tokens if resume_from else 0
+        # « 0 jeton servi par le cache » est une MESURE ; « rien rapporte » est
+        # une absence. Sans ce drapeau les deux se confondraient en None, et on
+        # ne saurait jamais distinguer un cache qui ne mord pas d'un fournisseur
+        # qui se tait — donc jamais si activer le cache a servi a quelque chose.
+        saw_cached = bool(resume_from and resume_from.cached_tokens)
         have_usage = resume_from.have_usage if resume_from else False
         start_step = (resume_from.step if resume_from else 0) + 1
         # La compaction mémoire (résumé / extraction de faits) appelle SON
@@ -1219,6 +1307,9 @@ class Agent:
         if mem_usage is not None:
             spent_in += mem_usage.input_tokens or 0
             spent_out += mem_usage.output_tokens or 0
+            if mem_usage.cached_tokens is not None:
+                spent_cached += mem_usage.cached_tokens
+                saw_cached = True
             have_usage = True
         # Teinte = flag MONOTONE (cellule mutable pour les closures). Semé du
         # RunState à la reprise, sinon du transcript initial (marqueur/sentinelle
@@ -1234,6 +1325,7 @@ class Agent:
                 turn_start=turn_start,
                 input_tokens=spent_in,
                 output_tokens=spent_out,
+                cached_tokens=spent_cached,
                 have_usage=have_usage,
                 tainted=taint[0],
             )
@@ -1543,8 +1635,27 @@ class Agent:
                     request_payload["streaming"] = True
                 req_span = self._emit("llm_request", request_payload, parent_id=run_span)
 
+                # L'élagage porte sur la VUE envoyée au fournisseur, jamais sur
+                # `working_messages` : la teinte, la garde anti-boucle, les
+                # outils révélés, la trace et le snapshot continuent de lire le
+                # transcript COMPLET. Élaguer le registre lui-même reviendrait à
+                # perdre des preuves pour économiser des jetons.
+                view = working_messages
+                if self.prune_tool_results_after is not None:
+                    view, pruned_count, chars_saved = _prune_tool_results(
+                        working_messages, self.prune_tool_results_after
+                    )
+                    if pruned_count:
+                        self._emit(
+                            "context_pruned",
+                            {"step": step, "pruned": pruned_count,
+                             "chars_saved": chars_saved,
+                             "kept": self.prune_tool_results_after},
+                            parent_id=req_span,
+                        )
+
                 request = LLMRequest(
-                    messages=working_messages,
+                    messages=view,
                     tools=self._visible_specs(),
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
@@ -1581,6 +1692,9 @@ class Agent:
                     have_usage = True
                     spent_in += response.usage.input_tokens or 0
                     spent_out += response.usage.output_tokens or 0
+                    if response.usage.cached_tokens is not None:
+                        spent_cached += response.usage.cached_tokens
+                        saw_cached = True
                 working_messages.append(
                     Message(
                         role="assistant",
@@ -1619,7 +1733,9 @@ class Agent:
                         messages=working_messages,
                         steps=step,
                         usage=(
-                            TokenUsage(input_tokens=spent_in, output_tokens=spent_out)
+                            TokenUsage(input_tokens=spent_in, output_tokens=spent_out,
+                                       cached_tokens=spent_cached if saw_cached
+                                       else None)
                             if have_usage
                             else None
                         ),

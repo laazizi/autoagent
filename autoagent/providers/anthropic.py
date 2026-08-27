@@ -13,7 +13,28 @@ from .base import LLMProvider
 def _usage_from(u: Any) -> TokenUsage | None:
     if not isinstance(u, dict):
         return None
-    return TokenUsage(input_tokens=u.get("input_tokens"), output_tokens=u.get("output_tokens"))
+    # NORMALISATION À LA FRONTIÈRE — le point délicat de tout ce fichier.
+    #
+    # OpenAI et Gemini rapportent un `input_tokens` qui INCLUT déjà la part
+    # servie par le cache. Anthropic non : il rend `input_tokens` (l'entrée NON
+    # mise en cache) et met à côté `cache_read_input_tokens` (lue depuis le
+    # cache) et `cache_creation_input_tokens` (écrite dans le cache). Recopier
+    # tel quel ferait dire à `TokenUsage` deux choses différentes selon le
+    # fournisseur — et sous-évaluerait l'entrée dès que le cache mord, donc
+    # fausserait `token_budget` en silence.
+    #
+    # On ramène donc tout le monde à la convention majoritaire : `input_tokens`
+    # = TOUT ce qui est entré, `cached_tokens` = la part qui en venait du cache.
+    entree = u.get("input_tokens")
+    lu = u.get("cache_read_input_tokens")
+    ecrit = u.get("cache_creation_input_tokens")
+    if entree is not None and (lu is not None or ecrit is not None):
+        entree = entree + (lu or 0) + (ecrit or 0)
+    return TokenUsage(
+        input_tokens=entree,
+        output_tokens=u.get("output_tokens"),
+        cached_tokens=lu,
+    )
 
 
 class AnthropicProvider(LLMProvider):
@@ -41,7 +62,21 @@ class AnthropicProvider(LLMProvider):
             "messages": self._messages_to_wire(request.messages),
         }
         if system_text:
-            payload["system"] = system_text
+            # Anthropic est le seul des trois à exiger un marqueur EXPLICITE : le
+            # cache couvre le préfixe `tools` + `system`, dans cet ordre, jusqu'au
+            # dernier bloc marqué. Marquer le bloc système met donc les schémas
+            # d'outils dans le cache par la même occasion — d'où un seul marqueur.
+            # Sans `cache_prompt`, on garde la chaîne nue : payload plus court, et
+            # aucune écriture de cache facturée pour un préfixe qui ne sert qu'une
+            # fois.
+            if self.config.cache_prompt:
+                payload["system"] = [{
+                    "type": "text",
+                    "text": system_text,
+                    "cache_control": {"type": "ephemeral"},
+                }]
+            else:
+                payload["system"] = system_text
         if request.tools and request.tool_choice == "none":
             # Anthropic has no portable "none": simply don't offer the tools.
             pass
@@ -116,7 +151,7 @@ class AnthropicProvider(LLMProvider):
         # index -> {"id","name","json": "<accumulated partial json>"}
         tool_blocks: dict[int, dict[str, Any]] = {}
         model: str | None = None
-        usage_in: int | None = None
+        usage_start: dict[str, Any] | None = None   # bloc `usage` du message_start
         usage_out: int | None = None
 
         for event in post_sse(
@@ -129,7 +164,11 @@ class AnthropicProvider(LLMProvider):
             if etype == "message_start":
                 message = event.get("message") or {}
                 model = message.get("model")
-                usage_in = (message.get("usage") or {}).get("input_tokens")
+                # On garde le bloc ENTIER : il porte aussi les compteurs de
+                # cache, et c'est `_usage_from` qui sait les normaliser. Ne
+                # prélever que `input_tokens` ici sous-évaluerait l'entrée dès
+                # que le cache mord — le bug que la version non streamée évite.
+                usage_start = message.get("usage") or {}
             elif etype == "message_delta":
                 # The closing delta carries the final output token count.
                 out = (event.get("usage") or {}).get("output_tokens")
@@ -170,11 +209,12 @@ class AnthropicProvider(LLMProvider):
                 ToolCall(id=block["id"], name=block["name"], arguments=args)
             )
 
-        usage = (
-            TokenUsage(input_tokens=usage_in, output_tokens=usage_out)
-            if usage_in is not None or usage_out is not None
-            else None
-        )
+        # Le compte d'entrée (cache compris) arrive dans `message_start`, celui
+        # de sortie dans le dernier `message_delta` : on recompose le bloc que
+        # `_usage_from` attend, pour que streamé et non streamé comptent pareil.
+        usage = None
+        if usage_start is not None or usage_out is not None:
+            usage = _usage_from({**(usage_start or {}), "output_tokens": usage_out})
         yield StreamChunk(
             type="final",
             response=LLMResponse(
@@ -183,8 +223,8 @@ class AnthropicProvider(LLMProvider):
                 model=model or self.config.model,
                 # No single raw dict exists for a stream; provide a summary so
                 # `response.raw` is not None only in the non-streaming path.
-                raw={"stream": True, "model": model, "usage": {
-                    "input_tokens": usage_in, "output_tokens": usage_out}},
+                raw={"stream": True, "model": model,
+                     "usage": {**(usage_start or {}), "output_tokens": usage_out}},
                 usage=usage,
             ),
         )

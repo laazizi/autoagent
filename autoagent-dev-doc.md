@@ -3,7 +3,7 @@
 > Référence technique complète pour intégrer, étendre et tester `autoagent` dans un projet Python.
 > **Public visé** : devs qui vont écrire des tools, brancher l'agent sur leur app, ou éventuellement contribuer à la lib.
 
-**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-08-05 · **Couvre autoagent** : 0.18.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
+**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-08-27 · **Couvre autoagent** : 0.19.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
 
 ---
 
@@ -45,6 +45,8 @@
 24. [Bornes de contexte, garde anti-boucle, trifecta, tool search](#24-bornes-de-contexte-garde-anti-boucle-trifecta-tool-search) *(0.18.0)*
 25. [Recall hybride, oubli en langue naturelle, OTel GenAI, fiabilité pass^k](#25-recall-hybride-oubli-en-langue-naturelle-otel-genai-fiabilité-passk) *(0.18.0)*
 26. [Mémoire bi-temporelle et politique d'outils déclarative](#26-mémoire-bi-temporelle-et-politique-doutils-déclarative) *(0.18.0)*
+27. [Cache de prompt — mesurer avant d'activer](#27-cache-de-prompt--mesurer-avant-dactiver) *(0.19.0)*
+28. [`prune_tool_results_after` — borner la DURÉE de vie d'un résultat](#28-prune_tool_results_after--borner-la-durée-de-vie-dun-résultat) *(0.19.0)*
 
 ---
 
@@ -3008,7 +3010,7 @@ print(rapport.summary())
 ```
 
 `pass@1` ne dit presque rien à un exploitant : comme `pass^k ≈ p^k`, **90 % de
-pass@1 devient 57 % à k=8**. Le rapport donne `pass@1`, le `pass^k` **observé**,
+pass@1 devient 43 % à k=8**. Le rapport donne `pass@1`, le `pass^k` **observé**,
 l'estimation `p^k` (l'effondrement que `pass@1` masque), la dispersion des étapes
 et toutes les erreurs.
 
@@ -3148,6 +3150,231 @@ Asymétrie assumée : le chemin d'**oubli n'est PAS réparé**. `[123]` tronqué
 `[12]` donnerait un id valide mais faux, donc la suppression d'un fait innocent.
 Perdre une opération d'extraction se rattrape au tour suivant ; détruire la donnée
 d'un client, non.
+
+## 27. Cache de prompt — mesurer avant d'activer
+
+*(0.19.0)*
+
+Un agent n'a pas de mémoire côté fournisseur : à **chaque** tour, tout repart —
+prompt système, schémas de tous les outils, transcript entier. Sur un run de huit
+étapes, le même préfixe part donc huit fois. Les fournisseurs savent servir ce
+préfixe depuis un cache ; l'économie existe déjà, mais elle est **invisible** tant
+que personne ne la rapporte. D'où l'ordre choisi ici : le compteur d'abord,
+l'activation ensuite.
+
+### 27.1 `TokenUsage.cached_tokens` et `cache_hit_ratio`
+
+```python
+resultat = agent.run("…")
+usage = resultat.usage
+usage.input_tokens      # TOUT ce qui est entré
+usage.cached_tokens     # la part qui venait du cache — None si rien n'est rapporté
+usage.cache_hit_ratio   # cached / input, ou None
+```
+
+Deux invariants tiennent tout le reste :
+
+* **`cached_tokens` est un SOUS-ENSEMBLE de `input_tokens`**, jamais un ajout.
+  L'additionner à `total_tokens` facturerait deux fois les mêmes jetons.
+* **`None` n'est pas `0`.** « Le fournisseur n'a rien dit » et « le cache n'a pas
+  mordu » sont deux faits différents : le premier ne permet aucune conclusion, le
+  second dit que le cache existait et n'a pas servi. Un run agrège donc `None`
+  seulement si aucune réponse n'a rapporté quoi que ce soit ; un zéro **mesuré**
+  reste `0`. (Le premier jet faisait `spent_cached or None` et écrasait cette
+  distinction — bug trouvé en écrivant `tests/test_prompt_cache.py`, verrouillé
+  par `TestAgregationSurUnRun`.)
+
+`RunState` porte `cached_tokens` : un run repris garde sa comptabilité. Les
+snapshots et fixtures de rejeu écrits avant 0.19.0 se relisent inchangés — clé
+absente ⇒ `None`/`0`, jamais un chiffre inventé.
+
+### 27.2 La normalisation à la frontière
+
+Le même fait — « 1 000 jetons d'entrée dont 800 servis par le cache » — arrive
+sous quatre formes de fil incompatibles :
+
+| Fournisseur | Champ | L'entrée inclut-elle le cache ? |
+|---|---|---|
+| OpenAI | `prompt_tokens_details.cached_tokens` | oui |
+| DeepSeek | `prompt_cache_hit_tokens` | oui |
+| Gemini | `cachedContentTokenCount` | oui |
+| **Anthropic** | `cache_read_input_tokens` / `cache_creation_input_tokens` | **non — à CÔTÉ** |
+
+Anthropic rend un `input_tokens` qui est l'entrée **non** mise en cache. Recopié
+tel quel, le run de l'exemple rapporterait 200 jetons d'entrée au lieu de 1 000 :
+`token_budget` croirait la dépense cinq fois moindre et laisserait filer un run
+qu'il devait couper. L'adaptateur replie donc les trois champs dans
+`input_tokens` (`providers/anthropic.py:_usage_from`), et les quatre formes
+produisent un `TokenUsage` identique — c'est ce que vérifie
+`TestNormalisationEntreFournisseurs`.
+
+Seule la **lecture** compte comme économie : `cache_creation_input_tokens` entre
+dans le total (l'écriture se paie) mais jamais dans `cached_tokens`.
+
+Le chemin **streamé** avait le même piège en plus discret : le compte d'entrée
+arrive dans `message_start`, celui de sortie dans le dernier `message_delta`. On
+conserve donc le bloc `usage` entier du `message_start` et on le recompose, au
+lieu d'en prélever le seul `input_tokens` — sans quoi streamé et non streamé
+compteraient différemment dès que le cache mord.
+
+### 27.3 `ModelConfig(cache_prompt=True)` — opt-in, Anthropic seul
+
+```python
+ModelConfig(provider="anthropic", model="claude-sonnet-4-5", cache_prompt=True)
+```
+
+Anthropic est le seul à exiger un marqueur **explicite**. Le bloc système porte
+alors `cache_control: {"type": "ephemeral"}` ; comme le cache couvre le préfixe
+`tools` + `system` jusqu'au dernier bloc marqué, un seul marqueur met aussi les
+schémas d'outils dans le cache. Sans le drapeau, `system` reste une chaîne nue :
+payload plus court, aucune écriture de cache facturée.
+
+**Éteint par défaut, et c'est voulu** : chez Anthropic, *écrire* dans le cache
+coûte plus cher qu'une entrée normale. Sur un préfixe court, ou utilisé une seule
+fois, l'activer fait perdre de l'argent.
+
+> ⚠️ **Non vérifié en réel.** Les tests couvrent la forme du payload
+> (`TestActivationAnthropic`), pas la réponse du fournisseur : aucune clé
+> Anthropic n'était disponible au moment du lot. Le comportement de bout en bout
+> reste à confirmer sur un compte réel.
+
+### 27.4 Le cache implicite est OPPORTUNISTE — ce qui se promet et ce qui se constate
+
+Chez Gemini et OpenAI, rien à activer : le fournisseur met le préfixe stable en
+cache tout seul. Mais **tout seul** veut aussi dire **quand il veut**. Balayage de
+la taille du préfixe contre Gemini depuis ce dépôt, question identique, trois
+appels par taille :
+
+| Préfixe | appel 1 | appel 2 | appel 3 |
+|---|---|---|---|
+| 2 346 jetons | — | — | — |
+| 7 026 jetons | — | **4 074** | — |
+| 9 366 jetons | — | — | — |
+| 14 046 jetons | — | **8 170** | **8 170** |
+
+Ni seuil franc (9 366 échoue là où 7 026 réussit), ni garantie (le même préfixe
+mord puis ne mord plus). Le préfixe de la démo 27, qui servait 59 % une heure
+plus tôt, n'a rien donné à la reprise.
+
+Trois conséquences, dans l'ordre :
+
+1. **Un run sans cache n'est pas un bug.** Les démos 22 et 27 le disent
+   explicitement, pour ne pas envoyer quelqu'un déboguer le fournisseur.
+2. **Le seul cache déterministe est celui d'Anthropic**, parce qu'il est
+   explicite. C'est le renversement habituel : ce qui est automatique n'est pas
+   garanti, ce qui se déclare l'est.
+3. **Ce qui se promet dans un devis, c'est le PLAFOND, pas l'économie.**
+   `token_budget` est du code qui refuse ; le cache implicite est une faveur.
+   Chiffrer un forfait en comptant sur le second, c'est signer une économie que
+   personne ne garantit.
+
+### 27.5 Tarifer un run — la lib mesure, l'hôte tarife
+
+Multiplier `total_tokens` par un tarif unique **surestime** dès que le cache
+mord, puisque l'entrée cachée n'est pas facturée comme l'entrée pleine :
+
+```python
+entree  = usage.input_tokens or 0
+cachee  = usage.cached_tokens or 0        # None ⇒ 0 : on facture au plein tarif,
+pleine  = entree - cachee                 # le choix prudent (surestimer, pas sous-facturer)
+cout = (pleine * TARIF_ENTREE
+        + cachee * TARIF_ENTREE_CACHEE
+        + (usage.output_tokens or 0) * TARIF_SORTIE) / 1_000_000
+```
+
+Les tarifs ne sont **pas** dans la bibliothèque et n'y entreront pas : un prix
+périme, une lib non, et deux comptes chez le même fournisseur n'ont pas forcément
+la même grille. Même partage que pour le juge de fiabilité ou la politique
+d'outils — la lib fournit le fait mesuré, l'hôte fournit la règle. Voir
+`examples_autoagent/22_budget_et_reprise.py`, qui affiche le coût naïf, le coût
+réel, et le nombre de runs que le même plafond finance dans les deux cas.
+
+## 28. `prune_tool_results_after` — borner la DURÉE de vie d'un résultat
+
+*(0.19.0)*
+
+Le §24.1 borne la **largeur** d'un résultat d'outil : ce qui entre une fois dans
+le transcript. Rien ne bornait sa **durée**. Or l'agent renvoie tout le
+transcript à chaque étape, et cet historique n'est jamais dans le préfixe mis en
+cache (§27) puisqu'il change à chaque tour : un résultat de 3 000 caractères lu
+à l'étape 1 se repaie plein tarif aux étapes 2, 3, 4…
+
+```python
+agent = Agent(provider, prune_tool_results_after=1)   # None par défaut
+```
+
+Au-delà des N plus récents, un message d'outil **garde son rôle et son
+`tool_call_id`** — la conversation reste bien formée pour tous les fournisseurs
+— et perd seulement sa charge :
+
+```
+[PRUNED — the 2157-character result of `lire_journal` was dropped from this
+history to keep the context bounded. It was VALID when produced; nothing about
+it failed. Call the tool again if you still need that data.]
+```
+
+Mesuré par `examples_autoagent/28_elagage_contexte.py`, même tâche, seul ce
+paramètre change : **16 360 jetons d'entrée sans élagage, 7 592 avec (−54 %)**,
+et la même réponse. L'économie porte sur l'**entrée**, la part qu'on repaie à
+chaque étape — elle grandit donc avec le nombre d'étapes.
+
+Trace : `context_pruned` (`pruned`, `chars_saved`, `kept`).
+
+### 28.1 Les trois invariants
+
+**1. Le marqueur dit que le résultat était VALIDE.** Un modèle à qui on annonce
+seulement « supprimé » replanifie autour d'un échec qui n'a pas eu lieu — il
+rappelle l'outil en boucle, ou pire, annonce une panne à l'utilisateur. Le
+marqueur nomme donc l'outil, la taille retirée, et qualifie explicitement le
+résultat de valide. C'est la même leçon que le message de refus de la 0.18 : un
+texte qui reste dans le transcript est une instruction durable, pas une note.
+
+**2. La teinte survit.** `is_tainted()` cherche `UNTRUSTED_OPEN` dans les
+messages d'outil. Élaguer un résultat untrusted sans reconduire son cadre le
+ferait disparaître : le run redeviendrait « propre », et la garde trifecta se
+désarmerait toute seule. C'est exactement le trou de la 0.15 (la compaction qui
+lavait la teinte, corrigé en 0.17 par la sentinelle) — réouvert par la porte de
+service. Un résultat élagué qui portait le cadre le porte encore.
+
+**3. L'élagage ne fait jamais grossir.** Le marqueur pèse environ 200
+caractères. L'appliquer à un résultat de 12 caractères ajouterait du contexte au
+lieu d'en retirer : un résultat plus court que son propre marqueur est laissé
+tel quel. Une borne qui coûte n'est pas une borne. L'opération est aussi
+idempotente : un marqueur n'est jamais ré-emballé dans un autre.
+
+### 28.2 On élague la VUE, jamais le REGISTRE
+
+L'élagage s'applique à la liste passée au fournisseur, au moment de construire
+la requête — pas à `working_messages`. Continuent donc de lire le transcript
+**complet** : la teinte, la garde anti-boucle, les outils révélés par la
+divulgation progressive, la trace, le snapshot de `RunState` et les messages
+rendus à l'hôte.
+
+```python
+resultat = agent.run(tache)          # prune_tool_results_after=1
+resultat.messages                    # ← les résultats COMPLETS sont là
+```
+
+C'est un choix, et il se défend en une phrase : économiser des jetons en perdant
+des preuves serait un mauvais échange. Le corollaire pratique est que `resume`
+et le rejeu (§23) ne sont pas affectés — un run élagué se reprend et se rejoue
+exactement comme les autres.
+
+### 28.3 Choisir N
+
+Il n'y a pas de valeur universelle, et la doc n'en proposera pas : ce qui doit
+rester est ce que le modèle a encore besoin de **relire**, et ça dépend de la
+tâche.
+
+* Une tâche de **collecte puis synthèse** (lire 4 journaux, conclure) tolère
+  `N=1` : chaque résultat est consommé à l'étape suivante.
+* Une tâche de **comparaison** (confronter trois sources entre elles) a besoin
+  des trois en même temps — `N` trop bas y fait rappeler les outils, ce qui
+  coûte plus cher que de les garder.
+
+La démo 28 affiche les deux réponses côte à côte pour cette raison : si elles
+divergent, le seuil est trop agressif. C'est un réglage qui se **mesure**, comme
+le reste.
 
 ---
 

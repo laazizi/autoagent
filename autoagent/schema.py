@@ -71,6 +71,14 @@ class ModelConfig:
     # `{"generationConfig": {"thinkingConfig": …}}` en simple écrasement ferait
     # perdre la `temperature` et le `maxOutputTokens` déjà posés par la requête.
     extra_body: JsonDict = field(default_factory=dict)
+    # Cache de prompt (0.19.0). Un agent renvoie TOUT le transcript à chaque tour :
+    # le prompt système et les schémas d'outils repartent identiques 8 fois sur un
+    # run de 8 étapes. Les fournisseurs savent servir ce préfixe depuis un cache.
+    # Opt-in, parce que ce n'est pas gratuit partout : chez Anthropic l'écriture du
+    # cache coûte plus cher que l'entrée normale, donc sur un préfixe court ou
+    # utilisé une seule fois, c'est une perte. À activer quand le préfixe est gros
+    # et stable — beaucoup d'outils, un prompt système long, des runs répétés.
+    cache_prompt: bool = False
 
     def resolved_api_key(self) -> str:
         if self.api_key:
@@ -419,17 +427,35 @@ class TokenUsage:
     ``input_tokens``/``output_tokens`` are ``None`` when the provider did
     not report them (never invented). ``total_tokens`` falls back to the
     sum of the two when the provider omits an explicit total.
+
+    ``cached_tokens`` (0.19.0) is the part of ``input_tokens`` the provider
+    served from its prompt cache. It is a SUBSET of the input, never an
+    addition — so it must not enter ``total_tokens``. Without it, prompt
+    caching is unobservable: you pay less and nothing tells you. Providers
+    that report nothing leave it ``None``.
     """
 
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
+    cached_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if self.total_tokens is None and (
             self.input_tokens is not None or self.output_tokens is not None
         ):
             self.total_tokens = (self.input_tokens or 0) + (self.output_tokens or 0)
+
+    @property
+    def cache_hit_ratio(self) -> float | None:
+        """Share of the input served from cache, or ``None`` if unknown.
+
+        The single number that says whether caching actually bites: a stable
+        prefix that keeps missing the cache reads 0.0 run after run.
+        """
+        if self.cached_tokens is None or not self.input_tokens:
+            return None
+        return self.cached_tokens / self.input_tokens
 
 
 @dataclass
@@ -460,6 +486,7 @@ class LLMResponse:
                 "input_tokens": self.usage.input_tokens,
                 "output_tokens": self.usage.output_tokens,
                 "total_tokens": self.usage.total_tokens,
+                "cached_tokens": self.usage.cached_tokens,
             }
         return out
 
@@ -475,6 +502,9 @@ class LLMResponse:
                 input_tokens=usage.get("input_tokens"),
                 output_tokens=usage.get("output_tokens"),
                 total_tokens=usage.get("total_tokens"),
+                # .get() sans défaut : un enregistrement d'avant 0.19.0 se relit,
+                # il rend simplement None — jamais un zéro inventé.
+                cached_tokens=usage.get("cached_tokens"),
             ) if usage else None,
         )
 

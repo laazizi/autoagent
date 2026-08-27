@@ -5,7 +5,77 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.19.0] - 2026-08-27
+
+### Added — `prune_tool_results_after`, a bound on how LONG a result lives
+
+- **`Agent(prune_tool_results_after=N)` — opt-in, `None` by default.**
+  `max_tool_result_chars` (0.18.0) bounds a tool result's WIDTH; nothing bounded
+  its LIFETIME. Since the whole transcript is re-sent at every step — and the
+  history is never in the provider's cached prefix, because it changes each turn
+  — a 3 000-character result read at step 1 is paid again at steps 2, 3, 4…
+  Past the N most recent, a tool result now keeps its role and `tool_call_id`
+  (the conversation stays well-formed for every provider) and loses only its
+  payload. Measured on demo 28, same task and same answer: **16 360 → 7 592
+  input tokens, −54 %**. Trace: `context_pruned` (count + characters dropped).
+- **Three invariants, each with its own regression test.** (1) The marker states
+  the result was VALID and names the tool and the size dropped — a model told
+  only that something was "removed" re-plans around a failure that never
+  happened. (2) The untrusted framing is carried over onto a pruned result:
+  dropping it would silently un-taint the run and disarm the trifecta guard,
+  re-opening the 0.15 hole by the back door. (3) A result shorter than its own
+  marker is left alone — a bound that costs context is not a bound.
+- **The record is never pruned, only the VIEW.** Taint, the loop guard, revealed
+  tools, the trace, the returned messages and any checkpoint keep reading the
+  full transcript; pruning applies to the list handed to the provider. Saving
+  tokens by losing evidence would be a bad trade.
+
+### Added — prompt caching, measured before it is enabled
+
+- **`TokenUsage.cached_tokens` + `cache_hit_ratio`.** An agent resends the whole
+  transcript every turn: on an 8-step run the system prompt and every tool
+  schema go out 8 times. All three providers can serve that stable prefix from
+  a cache — but the saving is invisible unless it is reported, so the counter
+  comes first. `cached_tokens` is a SUBSET of `input_tokens`, never added to
+  `total_tokens`. A provider that reports nothing leaves it `None`; a measured
+  zero stays `0`, because "the cache did not bite" and "nobody said" are
+  different facts.
+- **Cross-provider normalisation at the boundary.** OpenAI-compatible endpoints
+  report the cached share inside `prompt_tokens_details` (DeepSeek uses
+  `prompt_cache_hit_tokens`), Gemini as `cachedContentTokenCount` — both already
+  counted inside the prompt total. Anthropic does NOT: it reports uncached
+  `input_tokens` and puts `cache_read_input_tokens` /
+  `cache_creation_input_tokens` beside it. Copied verbatim, the same run would
+  report 200 input tokens instead of 1000 and `token_budget` would silently
+  under-count. The Anthropic adapter now folds all three into `input_tokens`,
+  so the four wire shapes produce one `TokenUsage`.
+- **`ModelConfig(cache_prompt=True)` — opt-in, Anthropic only.** The one
+  provider that needs an explicit marker: the system block carries
+  `cache_control`, which caches the `tools` + `system` prefix in one marker.
+  Off by default, because a cache write costs MORE than normal input — enabling
+  it on a short or single-use prefix loses money. The other providers cache the
+  stable prefix on their own; the only work there was reporting it.
+  ⚠️ **Not exercised against a live Anthropic account.** The tests cover the
+  payload shape, not the provider's response — no Anthropic key was available
+  for this release. The flag is opt-in and off by default, so nothing changes
+  for anyone who does not set it, but treat the end-to-end behaviour as
+  unconfirmed until someone runs it on a real account.
+- `RunState` carries `cached_tokens`, so a resumed run keeps its cache
+  accounting. Snapshots and replay fixtures written before this version reload
+  unchanged (missing key → `None`/`0`, never an invented figure).
+- **The implicit cache is OPPORTUNISTIC — measured, and it changes what may be
+  promised.** Sweeping prefix sizes against Gemini from this repo: 2 346 tokens
+  never hit; 7 026 hit on the 2nd call and not the 3rd; 9 366 never hit; 14 046
+  hit on the 2nd and 3rd. The same prefix that served 59 % an hour earlier
+  served nothing on re-run. So there is no clean threshold and no guarantee —
+  only Anthropic's explicit `cache_prompt` is deterministic. Demos 22 and 27
+  now state this, and a run with no cache is documented as a normal outcome
+  rather than a defect to debug.
+- **Demo 22 costs a run correctly.** Its session cap priced everything at one
+  rate; cached input is not billed like full input, so a single rate on
+  `total_tokens` OVER-states the spend. The demo now splits full input / cached
+  input / output, with the rates supplied by the HOST — prices expire, a
+  library should not carry them.
 
 ## [0.18.0] - 2026-08-05
 
@@ -152,7 +222,7 @@ that does not pass the new keyword is byte-for-byte unchanged on the wire.
   *agent* spans are still experimental.
 - **`autoagent.eval.run_k()` — `pass^k` reliability measurement.** `pass@1` tells
   an operator almost nothing: since `pass^k ≈ p^k`, 90 % of `pass@1` becomes
-  **57 % at k=8**. `run_k` runs the same task k times, asks a HOST-supplied
+  **43 % at k=8**. `run_k` runs the same task k times, asks a HOST-supplied
   DETERMINISTIC predicate whether each result is good, and reports `pass@1`,
   observed `pass^k`, the estimated `p^k` collapse, step dispersion and every
   error. Deliberately no LLM-as-judge: on agent failures, LLM judges cap under
@@ -851,7 +921,8 @@ underscored or imported from a submodule path is internal and may change.
 - CI invariants: `ruff check`, `ruff format --check`, `mypy autoagent/`,
   and `pytest` are all green.
 
-[Unreleased]: https://github.com/laazizi/autoagent/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/laazizi/autoagent/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/laazizi/autoagent/releases/tag/v0.19.0
 [0.18.0]: https://github.com/laazizi/autoagent/releases/tag/v0.18.0
 [0.17.0]: https://github.com/laazizi/autoagent/releases/tag/v0.17.0
 [0.16.0]: https://github.com/laazizi/autoagent/releases/tag/v0.16.0
