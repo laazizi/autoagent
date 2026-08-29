@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.1] - 2026-08-29
+
+### Changed — packaging metadata only, no code change
+
+- **`keywords` were empty**, which is what PyPI indexes on: the package was
+  effectively invisible in its own search. Twenty terms added (llm, agent,
+  tool-use, function-calling, mcp, the four provider names, sandbox,
+  prompt-injection…).
+- **`Topic::` classifiers added** — Artificial Intelligence and Libraries. They
+  are the facets people click to filter a PyPI search; without them the package
+  appeared in no filter at all. Plus `Python :: 3.13` (already in the CI matrix
+  on ubuntu AND windows, so the claim matches what actually runs) and
+  `Operating System :: OS Independent`.
+- Project links: Documentation, Examples, Visual builder, Issues.
+- **`Development Status` stays `3 - Alpha` on purpose.** Both 0.18.0 and 0.20.0
+  shipped a behaviour change; announcing Beta would claim an API stability that
+  does not exist yet.
+- No library code changed. Metadata cannot be edited on an already-published
+  release, which is the only reason this is a new version.
+
 ## [0.20.0] - 2026-08-27
 
 ### Added — `shadow_guards`, measure a bound before you live under it

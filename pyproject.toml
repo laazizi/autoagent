@@ -4,18 +4,37 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autoagent-core"
-version = "0.20.0"
+version = "0.20.1"
 description = "LLM agent library with tool use, dynamic tool generation, and software evolution capabilities"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
+keywords = [
+    "llm", "agent", "llm-agent", "ai-agent", "agentic", "multi-agent",
+    "tool-use", "function-calling", "mcp", "model-context-protocol",
+    "openai", "anthropic", "claude", "gemini", "deepseek",
+    "sandbox", "observability", "opentelemetry", "guardrails",
+    "prompt-injection", "streaming",
+]
 classifiers = [
+    # Alpha assumé, et pas par modestie : la 0.18.0 comme la 0.20.0 ont
+    # embarqué un changement de comportement. Tant que ça arrive, annoncer
+    # « Beta » raconterait une stabilité d'API qui n'existe pas encore.
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    # Testée en CI sur ubuntu ET windows (cf. .github/workflows/tests.yml) —
+    # on ne déclare que ce qui tourne vraiment.
+    "Programming Language :: Python :: 3.13",
+    # Les `Topic::` sont les facettes que les gens CLIQUENT dans la recherche
+    # PyPI ; sans eux le paquet n'apparaît dans aucun filtre.
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
     "jsonschema>=4.0",
@@ -25,6 +44,10 @@ dependencies = [
 Homepage = "https://github.com/laazizi/autoagent"
 Repository = "https://github.com/laazizi/autoagent"
 Changelog = "https://github.com/laazizi/autoagent/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/laazizi/autoagent/blob/main/autoagent-dev-doc.md"
+Examples = "https://github.com/laazizi/autoagent/tree/main/examples_autoagent"
+"Visual builder" = "https://laazizi.github.io/autoagent/"
+Issues = "https://github.com/laazizi/autoagent/issues"
 
 [project.optional-dependencies]
 otel = [
