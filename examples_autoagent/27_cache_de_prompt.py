@@ -27,10 +27,13 @@ chez Gemini et OpenAI le cache est IMPLICITE — le fournisseur décide seul,
 sans garantie. Mesuré sur ce dépôt : le même préfixe de 7 026 jetons a mordu
 sur un appel et pas sur le suivant, et un préfixe de 9 366 jetons n'a rien
 donné là où un de 14 046 marchait. Cette démo peut donc afficher « inconnu »
-partout un jour et 59 % le lendemain, sans qu'une ligne ait changé. Le seul
-cache DÉTERMINISTE est celui d'Anthropic, qui s'active explicitement (voir la
-fin de cette démo). Conséquence pratique : le cache est un bonus qu'on
-CONSTATE, jamais une économie qu'on PROMET dans un devis.
+partout un jour et 59 % le lendemain, sans qu'une ligne ait changé. Et ça se
+mesure FOURNISSEUR PAR FOURNISSEUR : la même démo sur DeepSeek a rapporté un
+zéro MESURÉ au 1ᵉʳ appel puis 100 % (7 552 / 7 571) aux suivants — déterministe
+en pratique. Anthropic est seulement le seul à exiger un marqueur explicite
+(voir la fin de cette démo). Conséquence pratique : le cache est un bonus qu'on
+CONSTATE, jamais une économie qu'on PROMET dans un devis — sauf à l'avoir
+mesuré chez le fournisseur qu'on facture.
 
     python examples_autoagent/27_cache_de_prompt.py
 """
@@ -135,7 +138,7 @@ def main() -> None:
     print("  court, ou utilisé une seule fois, l'activer fait perdre de l'argent.")
 
     # La garantie qu'on ne double compte pas, vérifiée et pas seulement affirmée.
-    for entree, cache in zip(entrees, caches):
+    for entree, cache in zip(entrees, caches, strict=False):
         if cache is not None and entree:
             assert cache <= entree, "la part cachée dépasse l'entrée — ce serait un bug"
 

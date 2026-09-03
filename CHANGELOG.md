@@ -5,6 +5,271 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.0] - 2026-08-29
+
+### Changed — persistent HTTP connections: one TLS handshake per host, not per call
+
+- `http.py` used `urllib.request.urlopen` for every call — a fresh TCP + TLS
+  handshake each time. Measured against the Gemini host: 251 / 105 / 95 ms for
+  three fresh connections vs 57 / 40 / 16 ms on one reused connection —
+  **~120 ms of overhead per LLM call, about one second per 8-step run**, before
+  the model has produced a token. Requests now go through one
+  `http.client.HTTP(S)Connection` per (thread, scheme, host), reused across
+  calls; a connection the server closed is discarded and the request retried
+  IMMEDIATELY on a fresh one (no backoff for that first retry). SSE streams are
+  read to the end and the response closed so the connection stays reusable; a
+  stream interrupted mid-way discards its connection. `http://` stays supported
+  (Ollama, vLLM, LM Studio). Still stdlib only. `tests/test_http.py` rewritten on
+  the new seam, every previous assertion kept, plus reuse / dead-connection / SSE
+  tests. Verified over the wire on Gemini and DeepSeek (demos 02, 32).
+
+### Added — `Bounds`: the eight bounds of an agent as ONE object
+
+- `Agent.__init__` had grown to 20 keyword arguments, eight of them bounds
+  (`max_steps`, `token_budget`, `max_tool_result_chars`,
+  `prune_tool_results_after`, `prune_batch`, `max_repeated_tool_calls`,
+  `trifecta_guard`, `shadow_guards`). `Bounds(...)` groups them: readable at a
+  glance, shareable between agents, serialisable into a trace via
+  `agent.bounds.to_dict()`. `Agent(provider, bounds=PROD)` sets all eight; an
+  explicit keyword that differs from its default overrides the field.
+  `agent.bounds` is a snapshot of what is IN FORCE — the attributes stay plain
+  and writable, so `agent.token_budget = 8000` before a `resume` (demo 22)
+  keeps working. Backward compatible: every existing keyword is unchanged.
+
+### Changed — the guards moved out of the loop (`guards.py`), and stopped recounting
+
+- `agent.py` had passed 2 300 lines, several hundred of them three closures
+  nested inside the loop generator (loop guard, trifecta, host policy). They
+  now live in `autoagent/guards.py` as `TurnGuards`, built once per run with
+  the state they already read (transcript, taint, shadow counter, snapshot).
+  **Same verdicts, same trace events and payloads, same order** — the 940 tests
+  and the replay fixtures see no difference. `agent.py`: 2 298 → 2 155 lines.
+- **The loop guard no longer recounts the whole transcript every turn.** It
+  used to recompute every call signature from scratch each step — 80 600
+  `_call_signature` calls for a 400-step run, quadratic. It now keeps an
+  incremental counter over the messages it has not seen yet: same result,
+  linear. Per-step overhead at 400 steps with guards + pruning: 1.33 → 1.00 ms
+  (the remainder is view pruning, O(n) per step by design).
+- **Fix: the early (streaming) check now gives the SAME verdict as the real
+  one.** The pending call is not in the transcript yet, so the early loop-guard
+  check was one unit more permissive than the turn's check — an idempotent tool
+  could be launched early and then refused. `pending=True` counts the call;
+  regression test in `test_early_tools.py`.
+
+### Fixed — `enable_software_evolution` crashed on a callable `system_prompt`
+
+- `Agent.system_prompt` may be a callable (a dynamic prompt recomputed each
+  turn). `enable_software_evolution` concatenated it as a string —
+  `TypeError: argument of type 'function' is not iterable` — so an agent with a
+  dynamic prompt could not enable evolution. Found while reviewing the "pre-
+  existing" mypy errors one by one: of 14, this was the only one with a runtime
+  consequence (the 13 others are guarded upstream or typing-only). The prompt
+  now stays dynamic and the evolution instructions are appended to the resolved
+  text, idempotently. Regression test.
+
+### Changed — exception attributes are declared, not improvised
+
+- `MaxStepsExceeded`, `TokenBudgetExceeded`, `AgentCancelled` and
+  `ApprovalRequired` carried `state`, `messages`, `spent`, `step`, `calls` set
+  dynamically by the loop — invisible to editors and type checkers (they were
+  most of the 27 mypy errors). They are now declared on a common
+  `_ResumableError` base with defaults; constructors are unchanged
+  (`Exception(message)`), the loop keeps filling them in. mypy: 27 → 14 errors,
+  the rest pre-existing in `memory.py` / `sandbox.py` / `evolution.py`.
+
+### Added — `cascade()`: the cheap model first, the big one only if YOUR judge says no
+
+- **Routing AFTER the call, on the result.** `RoutingProvider` routes before the
+  call on the request's shape; `cascade([lite, pro], prompt, check=judge)` tries
+  tiers in order and stops at the first the host's judge accepts. What decides
+  to escalate is CODE — the same deterministic `check(AgentResult)` contract as
+  `run_k` — never the small model's opinion of itself.
+- **Failed tiers are paid and counted.** `CascadeResult.usage` cumulates every
+  tier tried. Demo 33 against a real provider (gemini-3.5-flash-lite →
+  gemini-3.7-flash, four checkable tasks): 1 escalation in 4, **369 tokens vs
+  307 for the big model alone — the cascade cost MORE in tokens**, because one
+  escalation pays two tiers and 60–100-token tasks do not amortise a failed
+  attempt. The demo says so, then prints the break-even: the cascade wins in
+  money only if the lite token costs less than X % of the pro token, X computed
+  from the run. A second run of the same demo had 0 escalations (279 vs 288
+  tokens, break-even 103 %): the lite tier's acceptance rate varies run to run,
+  and it is THE variable that decides — measure it on your tasks before
+  deploying. The library presumes no tariff (demo 22).
+- **A human pause is not a failure.** `ApprovalRequired` and `AgentCancelled`
+  propagate; escalating on them would route around the human gate with another
+  model. Regression test. A tier that crashes (`MaxStepsExceeded`, provider
+  error…) is a failed tier and the cascade continues, carrying the spend from
+  `exc.state` when the loop knows it. A judge that raises refuses.
+
+### Added — `summarize_trace()`: efficiency read from the trace, after the fact
+
+- **Nothing added to the run.** `summarize_trace(path | events)` reads the JSONL
+  a `TraceEmitter` already writes and counts what a success rate does not:
+  redundant tool calls (same run, same tool, same arguments — seen before),
+  tool errors, refusals per guard (`loop_guard_block`, `trifecta_block`,
+  `tool_policy_deny`) and shadow observations (`*_would_block`), early tool
+  launches, pruned characters, and tokens per SUCCESS with failed runs included
+  in the spend. Runs are rebuilt from span parentage, so interleaved runs in one
+  file do not contaminate each other.
+- Probe&Prefill (arXiv 2605.09252) finds nearly half of tool calls unnecessary
+  on its benchmark by reading the model's hidden states — impossible over an
+  API. Reading what the model DID is the API-side answer. AgentAtlas
+  (arXiv 2605.20530) argues a trajectory is judged on its decisions, not only
+  its outcome; the guard counters are that.
+- No invented figure: no tokens in the trace → `None`; zero successful runs →
+  `None`, not an infinity. Demo 34 runs offline on the repo's `trace_demo.jsonl`
+  and on a scripted looping model (5 calls, 4 redundant, 3 refused, 7 266 chars
+  pruned — all read from the trace).
+
+### Added — tools run WHILE the model is still talking (`idempotent=True`)
+
+- **`StreamChunk(type="tool_call")`.** All three providers now emit one tool
+  call as soon as it is fully assembled — OpenAI when the next index opens,
+  Anthropic at `content_block_stop`, Gemini immediately (function calls arrive
+  whole) — before the message ends. The `final` chunk still carries the full
+  list, so a consumer that ignores `tool_call` sees exactly what it saw before.
+  Consequence on the OpenAI wire (OpenAI, DeepSeek, Kimi…): the LAST call of a
+  turn is only known complete at end of stream, so N calls → N−1 launched early.
+  Verified for real on DeepSeek (demo 32): 1 of 2 launched early, **5.0 s →
+  4.0 s (−20 %)**, transcript identical; a single-call turn launches nothing
+  early and behaves exactly as before (demo 02).
+- **`@agent.tool(idempotent=True)` + early execution in the streaming loop.**
+  When a tool is declared idempotent AND the guards let the call through, the
+  loop launches it the moment its chunk arrives, in the background; the normal
+  tool phase then CONSUMES the result instead of re-running it. Demo 32 against
+  a real provider, two 1.2 s lookups requested in one turn: **6.1 s → 4.3 s,
+  −29 %**, transcript byte-identical. PASTE (arXiv 2603.18897) reports −43 %
+  task time from the same overlap.
+- **Three rules, each with a regression test.** (1) Never without
+  `idempotent=True` — a broken stream discards the early result, and an
+  idempotent tool changed nothing; side-effecting tools must not carry the flag,
+  the library does not guess (arXiv 2606.07846: "a wrong speculative result
+  cannot undo the irreversible"). (2) The SAME guards run BEFORE launch — loop
+  guard, trifecta, host policy — on that single call; a refused call is not
+  launched. (3) Exactly one execution, same event order, same transcript as the
+  non-early path. `run_end` carries `early_tool_calls`; trace event
+  `tool_call_early_start`.
+- Orphan early results (announced in the stream, absent from `final`) are
+  dropped at run end; the executor is shut down without waiting.
+
+### Verified — DeepSeek's cache accounting, for real
+
+- The `prompt_cache_hit_tokens` normalisation shipped in 0.19.0 had only been
+  unit-tested. Run against a live DeepSeek key (demo 27, ~7 500-token stable
+  prefix): call 1 reports a **measured zero** (`0`, not `None` — exactly the
+  distinction the accounting was built to keep), calls 2 and 3 report
+  **7 552 / 7 571 = 100 %**. DeepSeek's cache is deterministic in practice,
+  where Gemini's is opportunistic (0.19.0 sweep). The earlier wording "Anthropic
+  is the only deterministic cache" was too strong and is corrected: Anthropic is
+  the only one that needs an explicit marker.
+- `cascade()` verified across providers (deepseek-chat → gemini-3.7-flash):
+  tier 1 accepted, usage aggregated.
+
+### Added — `prune_batch`: pruning that does not break the prompt cache
+
+- **`Agent(prune_batch=K)`, default 1.** Pruning at every step rewrites the view
+  at every step, and a provider's prompt cache only serves a byte-identical
+  prefix — so 0.19.0's pruning restarted the cache each turn. With K > 1 the
+  number of pruned results is always a multiple of K: the view changes once
+  every K tool results and is byte-stable in between. Stateless (derived from
+  the transcript), so it survives resume and replay. TokenPilot
+  (arXiv 2606.17016) measures cache-miss tokens 5.9 M → 1.6 M from batching
+  compaction at stable boundaries.
+- **Measured honestly on demo 28**, which now reports "prefix breaks": 3 → 1
+  with K=3 on a four-read run — but **12 028 vs 7 567 input tokens**, because a
+  batch DELAYS pruning until K old results exist. Batching pays only when the
+  run is long relative to K AND the provider's cache is deterministic
+  (Anthropic). On Gemini's opportunistic cache (demo 27), K=1 stays the right
+  setting. The trade-off is stated in the demo instead of hidden.
+
+### Added — cost-normalised reliability in `eval`
+
+- **A score without its cost says nothing.** `ReliabilityReport` now exposes
+  `usage` (spend over ALL attempts, failures included — they are paid too),
+  `tokens_per_success`, `cost(cost_fn)` / `cost_per_success(cost_fn)` with a
+  HOST-supplied tariff (prices never live in the library, cf. demo 22), and
+  `pass_hat_k_at_budget(n)`: 1.0 only if every attempt succeeded AND stayed under
+  the budget — a success obtained by blowing the cap is not one you can
+  reproduce in production. Serious benchmarks (AstaBench, Prime Agent) report
+  "score at fixed expenditure"; this is that.
+- No invented figure: no usage reported → `None`, zero successes → `None` (not
+  an infinity), an attempt without usage cannot prove it is under budget and
+  counts as over. `Attempt` carries `input_tokens` / `output_tokens` /
+  `cached_tokens`; `to_dict()` and `summary()` include the new fields.
+
+### Changed — ⚠️ BREAKING: `delegate_to` speaks English on the wire
+
+- The tool registered by `delegate_to()` had French JSON fields (`demandes`,
+  `specialiste`, `demande`, response key `reponses`) and a French default name
+  (`deleguer`) while every other model-facing string in the library is English
+  (`RepeatedCall`, `EgressBlocked`, the pruning marker, `as_tool`'s `request`).
+  Renamed: `requests` / `specialist` / `request`, response `responses` and
+  `specialist`, default tool name `delegate`; description and error messages in
+  English. Alpha, and shipped two days ago in 0.20.0 — changed now, before anyone
+  depends on the old shape. A host that pinned `name="deleguer"` keeps working
+  (the `name=` parameter is unchanged); one that parsed `reponses` must read
+  `responses`.
+
+### Changed — ⚠️ `jsonschema` removed: the "zero dependencies" claim is now TRUE
+
+- **The core has no runtime dependency at all.** The README, the GitHub
+  description and the `zero-dependency` topic had said so for months while
+  `pyproject.toml` declared `jsonschema>=4.0` — six packages, one of them a
+  compiled Rust extension. The headline promise did not survive `pip install`.
+  It does now: JSON-Schema validation of tool arguments is internal
+  (`autoagent/validation.py`, ~330 lines, stdlib only).
+- **Coverage is the subset the library generates plus what MCP servers and
+  model-written schemas actually use**: `type` (incl. lists with `null`),
+  `properties` / `required` / `additionalProperties` / `patternProperties` /
+  `propertyNames`, `items` / `prefixItems` / `minItems` / `maxItems` /
+  `uniqueItems`, `enum` / `const`, numeric and string bounds, `pattern`,
+  `multipleOf`, `anyOf` / `oneOf` / `allOf` / `not`, local `$ref`, boolean
+  schemas. Unknown keywords (`format`, `if`/`then`, `contains`…) are ignored, as
+  `jsonschema` does by default — a fail-OPEN choice on argument QUALITY, never on
+  security, which lives in `tool_policy`, taint and the sandbox.
+- **Equivalence is measured, not asserted.** `tests/test_validation.py` compares
+  verdicts against `jsonschema` on a corpus when it is installed (now a `dev`
+  extra). That differential test caught one real divergence before release:
+  `True` against `enum: [1]` — equal in Python, not in JSON Schema.
+- Error messages keep the exact shape the model already read (`'x' is a
+  required property`, `1 is not of type 'string'`, prefix `ValidationError:`);
+  schema-validity errors keep `Unknown type 'OBJECT'`, the one that exposed
+  Gemini's upper-case schemas in 0.18.0. A subprocess test proves
+  `import autoagent` no longer loads `jsonschema`.
+- **Migration:** nothing to do. Hosts that imported `jsonschema` themselves must
+  now install it themselves — the library no longer brings it.
+
+### Added — `synthesize_tool()`: the model proposes, YOUR cases decide
+
+- **Program synthesis by example, bounded.** `DynamicToolBuilder` already let the
+  model write a tool, AST-check it, sandbox it and run the self-tests the model
+  supplied. The weak point fit in one sentence: the model wrote the tests that
+  judged it. `synthesize_tool(builder, goal, examples)` inverts who judges — the
+  host brings `Example(args, expected)` truth, the code runs them in the sandbox,
+  a failing tool is discarded (file included) and the model gets a few failing
+  cases back; a passing tool is registered and enters the usual hash-manifest
+  promotion path.
+- **The examples are SPLIT, and the held-out ones never reach the model** — not
+  in the request, not in failure feedback, not even their content when they
+  fail ("N of M UNSEEN cases fail", nothing more). Without this a model asked to
+  "make these cases pass" hard-codes them one by one: 100 % pass, 0 % use. The
+  split turns "pass these cases" into "find the rule". A test decodes every
+  request sent to the provider and asserts no hidden case leaked.
+- **Measured on demo 31** against a real provider — ten sensor-log lines with
+  three traps (two date formats, an optional level, variable spacing), 40 %
+  hidden: **accepted at attempt 1, 6/6 shown + 4/4 hidden, 11.2 s, 2 177
+  tokens**, and correct on a line neither the model nor the loop had seen.
+- Bounded by construction: `max_attempts`, a deterministic seeded split
+  (replayable), at least one shown case always, `holdout == 0` reported honestly
+  when a single example is given, spend aggregated into `SynthesisResult.usage`,
+  a rejected tool never left loadable in `tools_dir`.
+- What it does NOT do, stated in the docstring: make the model smarter. It
+  converts attempts into correctness, which is only possible where the truth is
+  already known — with data AND expected results it pays; without a judge it has
+  nothing to offer.
+- `.autoagent/` (where generated tools land) is now in `.gitignore`: a dynamic
+  tool only enters the repo promoted, through the manifest.
+
 ## [0.20.1] - 2026-08-29
 
 ### Changed — packaging metadata only, no code change
@@ -1026,7 +1291,9 @@ underscored or imported from a submodule path is internal and may change.
 - CI invariants: `ruff check`, `ruff format --check`, `mypy autoagent/`,
   and `pytest` are all green.
 
-[Unreleased]: https://github.com/laazizi/autoagent/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/laazizi/autoagent/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/laazizi/autoagent/releases/tag/v0.21.0
+[0.20.1]: https://github.com/laazizi/autoagent/releases/tag/v0.20.1
 [0.20.0]: https://github.com/laazizi/autoagent/releases/tag/v0.20.0
 [0.19.0]: https://github.com/laazizi/autoagent/releases/tag/v0.19.0
 [0.18.0]: https://github.com/laazizi/autoagent/releases/tag/v0.18.0

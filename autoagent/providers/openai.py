@@ -116,6 +116,15 @@ class OpenAICompatibleProvider(LLMProvider):
         tool_deltas: dict[int, dict[str, Any]] = {}
         model: str | None = None
         usage_raw: dict[str, Any] | None = None
+        emis: set[int] = set()
+
+        def _assemble(index: int, slot: dict[str, Any]) -> ToolCall:
+            raw_args = slot["arguments"].strip()
+            try:
+                args = json.loads(raw_args) if raw_args else {}
+            except json.JSONDecodeError:
+                args = {"_raw": raw_args}
+            return ToolCall(id=slot["id"] or f"tool_call_{index}", name=slot["name"], arguments=args)
 
         for event in post_sse(
             f"{self.base_url}/chat/completions",
@@ -138,8 +147,16 @@ class OpenAICompatibleProvider(LLMProvider):
             if reasoning:
                 reasoning_parts.append(reasoning)
             for tc in delta.get("tool_calls") or []:
+                index = tc.get("index", 0)
+                # Un NOUVEL index ouvre : les appels d'index inférieur sont
+                # COMPLETS (OpenAI streame les arguments d'un appel d'un bloc,
+                # index par index). On les émet tout de suite — le dernier ne
+                # peut être connu complet qu'à la fin du flux.
+                for fini in sorted(k for k in tool_deltas if k < index and k not in emis):
+                    emis.add(fini)
+                    yield StreamChunk(type="tool_call", tool_call=_assemble(fini, tool_deltas[fini]))
                 slot = tool_deltas.setdefault(
-                    tc.get("index", 0), {"id": None, "name": "", "arguments": ""}
+                    index, {"id": None, "name": "", "arguments": ""}
                 )
                 if tc.get("id"):
                     slot["id"] = tc["id"]
@@ -149,21 +166,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 if function.get("arguments"):
                     slot["arguments"] += function["arguments"]
 
-        tool_calls: list[ToolCall] = []
-        for index in sorted(tool_deltas):
-            slot = tool_deltas[index]
-            raw_args = slot["arguments"].strip()
-            try:
-                args = json.loads(raw_args) if raw_args else {}
-            except json.JSONDecodeError:
-                args = {"_raw": raw_args}
-            tool_calls.append(
-                ToolCall(
-                    id=slot["id"] or f"tool_call_{index}",
-                    name=slot["name"],
-                    arguments=args,
-                )
-            )
+        tool_calls: list[ToolCall] = [_assemble(i, tool_deltas[i]) for i in sorted(tool_deltas)]
 
         yield StreamChunk(
             type="final",

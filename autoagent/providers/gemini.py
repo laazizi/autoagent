@@ -167,8 +167,13 @@ class GeminiProvider(LLMProvider):
             content = candidate.get("content") or {}
             if isinstance(event.get("usageMetadata"), dict):
                 usage_meta = event["usageMetadata"]  # cumulative; last one wins
+            deja = len(tool_calls)
             for fragment in self._parse_parts(content.get("parts") or [], tool_calls, text_parts):
                 yield StreamChunk(type="text", text=fragment)
+            # Chez Gemini un functionCall arrive ENTIER dans son événement : il
+            # est complet dès qu'on l'a vu. On l'émet tout de suite.
+            for call in tool_calls[deja:]:
+                yield StreamChunk(type="tool_call", tool_call=call)
 
         yield StreamChunk(
             type="final",

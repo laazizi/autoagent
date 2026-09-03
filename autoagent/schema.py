@@ -163,6 +163,13 @@ class ToolSpec:
     # ce drapeau rend la troisième gouvernable PAR DU CODE au lieu de laisser
     # chaque hôte réinventer la règle (0.18.0). Opt-in : False par défaut.
     egress: bool = False
+    # `idempotent=True` déclare qu'appeler cet outil deux fois avec les mêmes
+    # arguments est SANS CONSÉQUENCE (lecture, calcul, recherche…). C'est ce qui
+    # autorise la boucle à le lancer AU FIL DU FLUX, pendant que le modèle émet
+    # encore la suite de sa réponse (0.21.0) : si le flux casse, le résultat est
+    # jeté et rien n'a changé dans le monde. Un outil à effet de bord ne doit
+    # JAMAIS porter ce drapeau — la lib ne le devine pas, l'hôte le déclare.
+    idempotent: bool = False
 
     def __post_init__(self) -> None:
         # Frontière d'entrée des schémas : un schéma peut venir du MODÈLE (outil
@@ -526,9 +533,16 @@ class StreamChunk:
     streaming API is uniform across every provider.
     """
 
-    type: Literal["text", "final"]
+    type: Literal["text", "tool_call", "final"]
     text: str = ""
     response: "LLMResponse | None" = None
+    # ``"tool_call"`` (0.21.0) : UN appel d'outil COMPLET (nom + arguments
+    # entiers), émis dès que le fournisseur l'a fini d'assembler — avant que le
+    # message ne se termine. La boucle peut alors lancer un outil idempotent
+    # pendant que le modèle émet encore la suite. Le ``"final"`` porte TOUJOURS
+    # la liste complète : un consommateur qui ignore ``tool_call`` voit
+    # exactement ce qu'il voyait avant.
+    tool_call: "ToolCall | None" = None
 
 
 @dataclass

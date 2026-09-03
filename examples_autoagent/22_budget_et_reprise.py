@@ -37,8 +37,10 @@ d'intervalle — relevé sur ce dépôt :
 Ce n'est donc ni un seuil franc ni une garantie : le fournisseur décide. Un
 run sans cache n'est pas un bug de ton code. Conséquence directe sur la façon
 de vendre : le PLAFOND se promet (c'est du code qui refuse), l'ÉCONOMIE du
-cache implicite ne se promet pas. Seul Anthropic offre un cache explicite,
-donc déterministe (`ModelConfig(cache_prompt=True)`).
+cache implicite ne se promet pas — sauf à l'avoir MESURÉE chez le fournisseur
+qu'on facture : DeepSeek s'est montré déterministe (100 % dès le 2ᵉ appel,
+démo 27), Gemini non. Anthropic est le seul à exiger un marqueur explicite
+(`ModelConfig(cache_prompt=True)`).
 
     python examples_autoagent/22_budget_et_reprise.py
 """
@@ -190,7 +192,7 @@ def main() -> None:
         print(f"   Écart : {ecart*100:.3f} ¢ sur {lance} runs, soit "
               f"{ecart/depense_naive:.0%} de dépense imaginaire.")
         if runs_naif is not None and runs_naif < lance:
-            print(f"   Concrètement : au tarif unique, ce même plafond aurait coupé la")
+            print("   Concrètement : au tarif unique, ce même plafond aurait coupé la")
             print(f"   campagne après {runs_naif} runs. En comptant le cache, elle en a "
                   f"financé {lance}.")
     else:
@@ -217,7 +219,7 @@ def main() -> None:
         print(f"\n   PROJECTION (hypothèse, pas mesure) — si {TAUX_POSE:.0%} de l'entrée")
         print(f"   était servie par le cache, ces {lance} runs coûteraient "
               f"{projete*100:.3f} ¢ au lieu de {depense_naive*100:.3f} ¢,")
-        print(f"   soit −{1 - projete/depense_naive:.0%}. Le même plafond de {PLAFOND}$ "
+        print(f"   soit -{1 - projete/depense_naive:.0%}. Le même plafond de {PLAFOND}$ "
               f"financerait alors")
         print(f"   {avec_cache} runs au lieu de {sans_cache} — c'est ça, la vraie "
               f"unité de mesure : du travail fait.")

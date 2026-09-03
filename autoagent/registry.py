@@ -8,11 +8,9 @@ import types
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Union, get_args, get_origin, get_type_hints
 
-import jsonschema
-from jsonschema import Draft202012Validator
-
 from .errors import ToolError
 from .schema import JsonDict, ToolCall, ToolSpec
+from .validation import check_schema, format_errors, validate
 
 __all__ = [
     "RegisteredTool",
@@ -66,13 +64,15 @@ class RegisteredTool:
         # every execute() was pure waste (both are static for a tool's
         # lifetime). `_schema_error` keeps the old behaviour of reporting an
         # invalid input_schema at call time rather than raising here.
-        self._validator: Draft202012Validator | None = None
+        # Validateur INTERNE (0.21.0) : `jsonschema` a quitté les dépendances, la
+        # promesse « zéro dépendance » est enfin vraie. Même contrat qu'avant : un
+        # schéma invalide est signalé À L'APPEL, pas ici, pour ne pas faire
+        # planter l'enregistrement d'un outil qu'on n'appellera peut-être jamais.
         self._schema_error: str | None = None
         if self.spec.input_schema:
-            try:
-                self._validator = Draft202012Validator(self.spec.input_schema)
-            except jsonschema.SchemaError as exc:
-                self._schema_error = f"SchemaError: tool input_schema is invalid: {exc.message}"
+            probleme = check_schema(self.spec.input_schema)
+            if probleme:
+                self._schema_error = f"SchemaError: tool input_schema is invalid: {probleme}"
         try:
             self._wants_context = "context" in inspect.signature(self.handler).parameters
         except (TypeError, ValueError):  # builtins / exotic callables
@@ -81,14 +81,10 @@ class RegisteredTool:
     def execute(self, args: JsonDict, context: JsonDict | None = None) -> ToolResult:
         if self._schema_error is not None:
             return ToolResult(ok=False, error=self._schema_error)
-        if self._validator is not None:
-            errors = sorted(self._validator.iter_errors(args), key=lambda e: list(e.absolute_path))
+        if self.spec.input_schema:
+            errors = validate(args, self.spec.input_schema)
             if errors:
-                parts = [
-                    (".".join(str(p) for p in err.absolute_path) or "<root>") + f": {err.message}"
-                    for err in errors
-                ]
-                return ToolResult(ok=False, error="ValidationError: " + "; ".join(parts))
+                return ToolResult(ok=False, error=format_errors(errors))
 
         try:
             if self._wants_context:
@@ -146,18 +142,11 @@ def _validate_args(args: JsonDict, input_schema: JsonDict | None) -> str | None:
     """
     if not input_schema:
         return None
-    try:
-        validator = Draft202012Validator(input_schema)
-    except jsonschema.SchemaError as exc:
-        return f"SchemaError: tool input_schema is invalid: {exc.message}"
-    errors = sorted(validator.iter_errors(args), key=lambda e: list(e.absolute_path))
-    if not errors:
-        return None
-    parts: list[str] = []
-    for err in errors:
-        location = ".".join(str(p) for p in err.absolute_path) or "<root>"
-        parts.append(f"{location}: {err.message}")
-    return "ValidationError: " + "; ".join(parts)
+    probleme = check_schema(input_schema)
+    if probleme:
+        return f"SchemaError: tool input_schema is invalid: {probleme}"
+    errors = validate(args, input_schema)
+    return format_errors(errors) if errors else None
 
 
 class ToolRegistry:
@@ -184,6 +173,7 @@ class ToolRegistry:
         permissions: list[str] | None = None,
         untrusted: bool = False,
         egress: bool = False,
+        idempotent: bool = False,
     ):
         def decorator(handler: ToolHandler) -> ToolHandler:
             spec = ToolSpec(
@@ -193,6 +183,7 @@ class ToolRegistry:
                 permissions=permissions or [],
                 untrusted=untrusted,
                 egress=egress,
+                idempotent=idempotent,
             )
             self.add(spec, handler)
             return handler
@@ -287,7 +278,7 @@ def schema_from_callable(func: ToolHandler) -> JsonDict:
     # brute si la résolution échoue (forward ref indisponible).
     try:
         hints = get_type_hints(func)
-    except Exception:  # noqa: BLE001 — annotation exotique / import manquant
+    except Exception:
         hints = {}
     properties: dict[str, Any] = {}
     required: list[str] = []

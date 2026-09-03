@@ -17,8 +17,10 @@ gates, durable runs, fact memory, MCP client, OpenTelemetry export.
 1. **The CODE is the source of truth.** Docs have lagged before. When in
    doubt, read `autoagent/*.py` — every module has `__all__` and rich
    docstrings. Never invent an API from memory.
-2. **Zero runtime dependencies.** The core imports stdlib + `jsonschema`
-   only. Never add a dependency. Optional integrations (OpenTelemetry)
+2. **Zero runtime dependencies.** The core imports stdlib ONLY — since
+   0.21.0 even JSON-Schema validation is internal (`autoagent/validation.py`,
+   differential-tested against `jsonschema`, which is now a `dev` extra).
+   Never add a dependency. Optional integrations (OpenTelemetry)
    use lazy imports inside the class + an extra in `pyproject.toml`.
    Provider adapters speak raw wire formats via `urllib` — no SDKs.
 3. **Sync by design.** No `async def` in the public API. Streaming is a
@@ -29,7 +31,7 @@ gates, durable runs, fact memory, MCP client, OpenTelemetry export.
    | Observability (trace, checkpoint, OTel, memory compaction) | **fail-open**: log and continue, never break the run |
    | Security (`tool_policy`, workspace, sandbox, approval manifest) | **fail-closed**: a crashing policy DENIES |
    | Tool handlers | exceptions become tool errors the model sees — never a crash |
-5. **Run the tests**: `pytest tests -q` (818 tests, <30 s). Docker
+5. **Run the tests**: `pytest tests -q` (954 tests, <30 s). Docker
    sandbox tests skip themselves when no daemon. `tests/conftest.py`
    provides `FakeLLMProvider` (records requests in `.calls`).
 6. **Sync the docs with any change** — the recurring failure mode of this
@@ -52,10 +54,16 @@ gates, durable runs, fact memory, MCP client, OpenTelemetry export.
 | `autoagent/registry.py` / `schema.py` | tool registry + JSON-schema generation; wire types |
 | `autoagent/workspace.py` / `sandbox.py` / `approval.py` | bounded writes; Docker/AST sandbox; hash-manifest promotion |
 | `autoagent/orchestrator.py` | host-driven deterministic flows |
+| `autoagent/validation.py` | internal JSON-Schema validator (0.21.0) — replaces `jsonschema`; the subset the library generates + MCP/model schemas; differential-tested against `jsonschema` when the `dev` extra is present |
+| `autoagent/synthesis.py` | `synthesize_tool` — program synthesis by example (0.21.0): host truth split shown/held-out, the sandbox judges, held-out cases never reach the model |
+| `autoagent/guards.py` | `TurnGuards` — loop guard, trifecta, host policy, moved out of the loop (0.21.0); incremental signature counter |
+| `autoagent/bounds.py` | `Bounds` — the eight bounds as one frozen dataclass; `agent.bounds` snapshot (0.21.0) |
+| `autoagent/cascade.py` | `cascade` — cheap tier first, escalate only when the host's `check` refuses (0.21.0); failed tiers paid; `ApprovalRequired` propagates |
+| `autoagent/trace_metrics.py` | `summarize_trace` — efficiency counters from a JSONL trace, runs rebuilt from span parentage (0.21.0) |
 | `autoagent/policy.py` | `ToolPolicySpec` — tool policy as versionable JSON; `compile()` → the existing `tool_policy` signature; monotonic containment (`narrow`/`expand`) |
 | `autoagent/eval.py` | `run_k` — `pass^k` reliability measurement with a host-supplied DETERMINISTIC judge (never an LLM judge) |
 | `autoagent/providers/` | OpenAI, Anthropic, DeepSeek, Gemini (raw wire) + `RoutingProvider` |
-| `examples_autoagent/` | 30 runnable demos (French), one facet each — `_common.py` picks the provider from `.env` |
+| `examples_autoagent/` | 34 runnable demos (French), one facet each — `_common.py` picks the provider from `.env` |
 | `examples/` | the 55-line vs 164-line before/after argument |
 | `constructeur_autoagent.html` | offline visual builder → generates Python; presets must compile (see harness note in git history) |
 | `autoagent-dev-doc.md` | the full reference (§1–26) |

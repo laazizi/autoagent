@@ -13,7 +13,7 @@ calls are stateless and can be issued concurrently.
 
 from __future__ import annotations
 
-__version__ = "0.20.1"
+__version__ = "0.21.0"
 
 from .agent import (
     Agent,
@@ -26,6 +26,8 @@ from .agent import (
     ToolPolicyContext,
     delegate_to,
 )
+from .bounds import Bounds
+from .cascade import CascadeResult, TierAttempt, cascade
 from .dynamic import DynamicToolBuilder, ToolBuildRequest
 from .errors import (
     AgentCancelled,
@@ -84,7 +86,9 @@ from .schema import (
     ToolSpec,
     normalize_schema_types,
 )
+from .synthesis import Attempt, Example, SynthesisResult, synthesize_tool
 from .trace import OnEvent, TraceEmitter, TraceEvent
+from .trace_metrics import TraceMetrics, summarize_trace
 from .workspace import ProjectWorkspace
 
 __all__ = [
@@ -99,6 +103,16 @@ __all__ = [
     "BufferMemory",
     "CheckpointHook",
     "delegate_to",
+    "Attempt",
+    "Example",
+    "SynthesisResult",
+    "synthesize_tool",
+    "CascadeResult",
+    "TierAttempt",
+    "cascade",
+    "Bounds",
+    "TraceMetrics",
+    "summarize_trace",
     "RunState",
     "SummarizingMemory",
     "DeepSeekProvider",

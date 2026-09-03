@@ -31,6 +31,8 @@ Trois points que la démo rend visibles :
 
 from __future__ import annotations
 
+import itertools
+
 from _common import make_provider
 
 from autoagent import Agent, TraceEmitter
@@ -53,12 +55,13 @@ def journal(jour: int) -> str:
     return "\n".join(lignes)
 
 
-def construire(elagage: int | None, trace: TraceEmitter) -> Agent:
+def construire(elagage: int | None, trace: TraceEmitter, lot: int = 1) -> Agent:
     agent = Agent(
         make_provider(),
         max_steps=10,
         trace=trace,
         prune_tool_results_after=elagage,
+        prune_batch=lot,
         system_prompt="Tu utilises tes outils, un appel à la fois, et tu es bref.",
     )
 
@@ -70,24 +73,36 @@ def construire(elagage: int | None, trace: TraceEmitter) -> Agent:
     return agent
 
 
-def mesurer(titre: str, elagage: int | None) -> tuple[int, str]:
+def mesurer(titre: str, elagage: int | None, lot: int = 1) -> tuple[int, str, int]:
     economies: list[int] = []
+    elagues_par_etape: list[int] = []       # combien de résultats élagués, à chaque appel LLM
+    appels = [0]
 
     def on_event(ev) -> None:
-        if ev.type == "context_pruned":
+        if ev.type == "llm_request":
+            appels[0] += 1
+            elagues_par_etape.append(0)
+        elif ev.type == "context_pruned":
             economies.append(ev.payload["chars_saved"])
+            elagues_par_etape[-1] = ev.payload["pruned"]
 
     with TraceEmitter(on_event=on_event) as trace:
-        resultat = construire(elagage, trace).run(TACHE)
+        resultat = construire(elagage, trace, lot).run(TACHE)
+
+    # RUPTURES DE PRÉFIXE : une étape où le nombre de résultats élagués a changé
+    # est une étape où la vue a été RÉÉCRITE — le cache du fournisseur ne peut
+    # pas la resservir. Mesure locale, indépendante du fournisseur.
+    ruptures = sum(1 for a, b in itertools.pairwise(elagues_par_etape) if a != b)
 
     entree = resultat.usage.input_tokens or 0
     print(f"\n  {titre}")
-    print(f"    entrée cumulée : {entree} jetons")
+    print(f"    entrée cumulée      : {entree} jetons")
     if economies:
-        print(f"    élagages       : {len(economies)} tours, "
+        print(f"    élagages            : {len(economies)} tours, "
               f"{sum(economies)} caractères retirés de la vue")
-    print(f"    réponse        : {resultat.output.strip()[:90]}")
-    return entree, resultat.output.strip()
+    print(f"    ruptures de préfixe : {ruptures} sur {appels[0]} appels LLM")
+    print(f"    réponse             : {resultat.output.strip()[:80]}")
+    return entree, resultat.output.strip(), ruptures
 
 
 def main() -> None:
@@ -98,8 +113,9 @@ def main() -> None:
     print("Un seul paramètre change entre les deux runs.")
     print("─" * 76)
 
-    sans, rep_sans = mesurer("SANS élagage — chaque journal repart à chaque étape", None)
-    avec, rep_avec = mesurer("AVEC prune_tool_results_after=1", 1)
+    sans, rep_sans, _ = mesurer("SANS élagage — chaque journal repart à chaque étape", None)
+    avec, rep_avec, rupt_1 = mesurer("AVEC prune_tool_results_after=1", 1)
+    lot, rep_lot, rupt_3 = mesurer("AVEC prune_tool_results_after=1, prune_batch=3", 1, 3)
 
     print("\n" + "─" * 76)
     print("CE QU'IL FAUT RETENIR\n")
@@ -123,6 +139,24 @@ def main() -> None:
     print("  À noter : le transcript RENDU garde tout. `resultat.messages` porte")
     print("  les journaux complets, la trace aussi. On élague ce qu'on ENVOIE,")
     print("  jamais ce qu'on GARDE.")
+    print()
+    print("ET LE CACHE DU FOURNISSEUR ?\n")
+    print("  Élaguer à CHAQUE étape réécrit la vue à chaque étape : le cache de")
+    print("  préfixe, qui ne sert qu'un préfixe identique à l'octet, repart de zéro.")
+    print(f"  Ici : {rupt_1} ruptures avec prune_batch=1, {rupt_3} avec prune_batch=3.")
+    print()
+    print("  MAIS LE LOT A UN PRIX, et la démo le montre plutôt que de le cacher :")
+    print(f"  {avec} jetons d'entrée avec prune_batch=1, {lot} avec prune_batch=3,")
+    print(f"  soit {lot - avec:+d} jetons. Un lot RETARDE l'élagage : tant que K vieux")
+    print("  résultats ne sont pas réunis, rien ne part — et sur un run de quatre")
+    print("  lectures, ça ne se produit qu'à la fin. Le compromis est donc :")
+    print("  moins de ruptures de cache CONTRE des jetons envoyés en plus.")
+    print()
+    print("  Il n'est rentable que si (1) le run est LONG devant K, pour que les lots")
+    print("  se répètent, et (2) le cache est DÉTERMINISTE — Anthropic. Sur Gemini")
+    print("  il est opportuniste (démo 27) : là, prune_batch=1 est le bon choix.")
+    print("  TokenPilot (arXiv 2606.17016) mesure 5,9 M → 1,6 M jetons hors cache")
+    print("  avec ce principe — sur des sessions longues, avec un cache qui répond.")
 
 
 if __name__ == "__main__":

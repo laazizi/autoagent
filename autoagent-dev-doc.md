@@ -3,7 +3,7 @@
 > Référence technique complète pour intégrer, étendre et tester `autoagent` dans un projet Python.
 > **Public visé** : devs qui vont écrire des tools, brancher l'agent sur leur app, ou éventuellement contribuer à la lib.
 
-**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-08-27 · **Couvre autoagent** : 0.20.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
+**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-08-29 · **Couvre autoagent** : 0.21.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
 
 ---
 
@@ -49,6 +49,12 @@
 28. [`prune_tool_results_after` — borner la DURÉE de vie d'un résultat](#28-prune_tool_results_after--borner-la-durée-de-vie-dun-résultat) *(0.19.0)*
 29. [`delegate_to` — plusieurs spécialistes en même temps](#29-delegate_to--plusieurs-spécialistes-en-même-temps) *(0.20.0)*
 30. [`shadow_guards` — mesurer une borne avant de la subir](#30-shadow_guards--mesurer-une-borne-avant-de-la-subir) *(0.20.0)*
+31. [Validateur JSON Schema interne — zéro dépendance, pour de vrai](#31-validateur-json-schema-interne--zéro-dépendance-pour-de-vrai) *(0.21.0)*
+32. [`synthesize_tool` — le modèle propose, tes cas décident](#32-synthesize_tool--le-modèle-propose-tes-cas-décident) *(0.21.0)*
+33. [`idempotent` — les outils tournent pendant que le modèle parle](#33-idempotent--les-outils-tournent-pendant-que-le-modèle-parle) *(0.21.0)*
+34. [`cascade` — le petit modèle d'abord, le gros si ton juge dit non](#34-cascade--le-petit-modèle-dabord-le-gros-si-ton-juge-dit-non) *(0.21.0)*
+35. [`summarize_trace` — l'efficacité lue dans la trace](#35-summarize_trace--lefficacité-lue-dans-la-trace) *(0.21.0)*
+36. [Usage et performance : connexions persistantes, `Bounds`, `guards.py`, exceptions typées](#36-usage-et-performance--connexions-persistantes-bounds-guardspy-exceptions-typées) *(0.21.0)*
 
 ---
 
@@ -130,7 +136,7 @@ Ou depuis les sources (dev de la lib) :
 ```bash
 git clone https://github.com/laazizi/autoagent.git
 cd autoagent
-pip install jsonschema                # seule dépendance du cœur
+# rien d'autre : le cœur n'a AUCUNE dépendance (validateur JSON Schema interne, 0.21.0)
 ```
 
 `.env` à la racine :
@@ -3052,6 +3058,27 @@ hors-ligne et gratuite.
 
 ---
 
+### 25.5 Coût normalisé — « score à dépense fixe » *(0.21.0)*
+
+Un `pass^k` isolé ne dit pas ce qu'il a coûté. `ReliabilityReport` expose :
+
+```python
+rapport = run_k(agent, tache, k=8, check=juge)
+rapport.usage                      # dépense cumulée des k tentatives, ratées comprises
+rapport.tokens_per_success         # None si rien n'a réussi ou rien n'est rapporté
+rapport.cost_per_success(tarif)    # tarif = callable(TokenUsage) -> montant, FOURNI PAR L'HÔTE
+rapport.pass_hat_k_at_budget(n)    # 1.0 seulement si tout a réussi SOUS le budget
+```
+
+Trois principes : les **échecs se paient aussi** et entrent dans le compte ; le
+**tarif n'est jamais dans la lib** (un prix périme, cf. §27.5) ; **aucun chiffre
+inventé** — pas d'usage → `None`, zéro succès → `None` (pas un infini), une
+tentative sans usage ne peut pas prouver qu'elle est sous le budget et compte
+comme au-dessus. C'est la métrique des benchmarks sérieux (AstaBench, Prime
+Agent) : le score à dépense fixe, pas le score tout seul.
+
+---
+
 ## 26. Mémoire bi-temporelle et politique d'outils déclarative
 
 *(0.18.0)*
@@ -3284,6 +3311,13 @@ Ni seuil franc (9 366 échoue là où 7 026 réussit), ni garantie (le même pr�
 mord puis ne mord plus). Le préfixe de la démo 27, qui servait 59 % une heure
 plus tôt, n'a rien donné à la reprise.
 
+**Contre-exemple mesuré (DeepSeek, 0.21.0)** : même démo, même préfixe de
+~7 500 jetons — appel 1 : cache **`0` mesuré** (pas `None` : DeepSeek rapporte le
+zéro), appels 2 et 3 : **7 552 / 7 571 = 100 %**. Le cache de DeepSeek s'est
+montré déterministe en pratique. La règle n'est donc pas « seul Anthropic est
+déterministe » mais « **le comportement se mesure fournisseur par fournisseur** » :
+Anthropic est seulement le seul à exiger un marqueur explicite.
+
 Trois conséquences, dans l'ordre :
 
 1. **Un run sans cache n'est pas un bug.** Les démos 22 et 27 le disent
@@ -3404,6 +3438,30 @@ La démo 28 affiche les deux réponses côte à côte pour cette raison : si ell
 divergent, le seuil est trop agressif. C'est un réglage qui se **mesure**, comme
 le reste.
 
+### 28.4 `prune_batch` — élaguer sans casser le cache *(0.21.0)*
+
+Le cache de prompt d'un fournisseur ne sert qu'un préfixe **identique à
+l'octet**. Élaguer à chaque étape réécrit la vue à chaque étape : le cache
+repart de zéro à chaque tour (TokenPilot, arXiv 2606.17016 — jetons hors cache
+5,9 M → 1,6 M quand la compaction se fait par lots à des frontières stables).
+
+```python
+Agent(provider, prune_tool_results_after=1, prune_batch=3)   # défaut : 1
+```
+
+Avec `K > 1`, le nombre de résultats élagués est toujours un **multiple de K** :
+la vue ne change qu'une fois tous les K résultats et reste stable entre deux
+lots. Dérivé du transcript seul — survit à `resume` et au rejeu.
+
+**Le compromis, mesuré (démo 28, quatre lectures) :** ruptures de préfixe
+3 → 1, mais entrée **12 028 contre 7 567 jetons** — un lot *retarde* l'élagage
+jusqu'à ce que K vieux résultats existent, ce qui sur un run court arrive à la
+fin. Rentable seulement si le run est long devant K **et** que le cache est
+déterministe (Anthropic). Sur le cache opportuniste de Gemini (§27.4),
+`prune_batch=1` reste le bon réglage. La démo affiche les deux chiffres.
+
+---
+
 ## 29. `delegate_to` — plusieurs spécialistes en même temps
 
 *(0.20.0)*
@@ -3472,7 +3530,12 @@ cesserait d'être déterministe.
 * **L'échec, entrée par entrée.** Un nom inconnu ou un spécialiste qui plante
   produit un `error` sur SA réponse ; les autres aboutissent.
 
-### 29.4 Pourquoi `specialiste` n'est pas un `enum`
+### 29.4 Pourquoi `specialist` n'est pas un `enum`
+
+*(Champs de fil en anglais depuis 0.21.0 : `requests` / `specialist` / `request`,
+réponse `responses`, nom par défaut `delegate` — comme tout ce que le modèle lit
+dans la lib. La 0.20.0 les avait en français ; changement de rupture assumé en
+Alpha, noté dans le CHANGELOG.)*
 
 Le champ pourrait porter un `enum` des noms valides. Il ne le fait pas : la
 validation de schéma rejette la **requête entière** au premier nom inconnu, donc
@@ -3549,6 +3612,373 @@ n'aurait bloqué » et « le mode n'était pas actif » ne sont pas le même fai
 même règle que pour `cached_tokens` (§27.1). Un zéro inventé ferait croire à une
 mesure qui n'a pas eu lieu.
 
+## 31. Validateur JSON Schema interne — zéro dépendance, pour de vrai
+
+*(0.21.0)*
+
+Pendant des mois, la première ligne du README a dit *« zero dependencies for the
+core »* pendant que `pyproject.toml` déclarait `jsonschema>=4.0` — six paquets,
+dont un binaire Rust compilé. La promesse ne survivait pas à `pip install`.
+`autoagent/validation.py` la rend vraie : la validation des arguments d'un appel
+d'outil contre son `input_schema` est désormais interne, ~330 lignes, stdlib
+seule.
+
+### 31.1 Ce qui est couvert, et pourquoi ce périmètre
+
+Le sous-ensemble que `schema_from_callable` GÉNÈRE, plus ce qu'on rencontre dans
+les schémas écrits par un modèle ou fournis par un serveur MCP :
+
+| famille | mots-clés |
+|---|---|
+| typage | `type` (simple ou liste, avec `null`), `enum`, `const` |
+| objets | `properties`, `required`, `additionalProperties` (bool ou schéma), `patternProperties`, `propertyNames`, `min/maxProperties` |
+| tableaux | `items`, `prefixItems`, `min/maxItems`, `uniqueItems` |
+| nombres / chaînes | `minimum`, `maximum`, `exclusive*`, `multipleOf`, `min/maxLength`, `pattern` |
+| combinateurs | `anyOf`, `oneOf`, `allOf`, `not`, `$ref` local (`#/$defs/…`, `#/definitions/…`), schémas booléens |
+
+Ce qui est **ignoré**, comme `jsonschema` le fait par défaut : `format`,
+`default`, `description`, `title`, `examples`. Ce qui n'est **pas implémenté**
+(`if`/`then`/`else`, `contains`, `dependentRequired`, `$ref` distant) est ignoré
+aussi : un mot-clé inconnu ne fait jamais échouer une validation. C'est un choix
+**fail-open sur la qualité** des arguments — la frontière de sécurité, ce sont
+`tool_policy` (§20), la teinte (§22) et le bac à sable (§7), pas ce fichier.
+
+### 31.2 Deux comportements reproduits exprès
+
+**La validité du schéma est vérifiée** (`check_schema`). Un `type` inconnu, une
+regex invalide ou un `$ref` insoluble sont signalés — à l'appel, pas à
+l'enregistrement, comme avant. C'est ce qui avait révélé les schémas Gemini en
+MAJUSCULES (0.18.0, §24) : `Unknown type 'OBJECT'` reste le message.
+
+**Les messages gardent la forme que le modèle lisait** : `'x' is a required
+property`, `1 is not of type 'string'`, `Additional properties are not allowed
+('z' was unexpected)`, préfixe `ValidationError:` et emplacement pointé
+(`a.b.0`, ou `<root>`). Un consommateur qui attendait ces textes ne voit rien
+changer.
+
+### 31.3 L'équivalence est mesurée
+
+`tests/test_validation.py` compare les verdicts du module à ceux de
+`jsonschema.Draft202012Validator` sur un corpus, **quand `jsonschema` est
+installé** (il est désormais un extra `dev`). Sans lui le test est sauté, pas
+réussi en silence. Ce test différentiel a attrapé une vraie divergence avant la
+release : `True` contre `enum: [1]` — égaux en Python (`True == 1`), pas en JSON
+Schema. D'où `_json_equal`, qui sépare booléens et nombres mais confond `1.0` et
+`1`.
+
+Et un test en sous-processus prouve la promesse elle-même : après
+`import autoagent`, `jsonschema` n'est pas dans `sys.modules`.
+
+**Migration :** rien à faire. Un hôte qui importait `jsonschema` pour son propre
+compte doit maintenant l'installer lui-même — la lib ne l'apporte plus.
+
 ---
 
+## 32. `synthesize_tool` — le modèle propose, tes cas décident
+
+*(0.21.0)*
+
+```
+entrée connue + sortie connue  →  le modèle écrit un outil  →  TES cas tranchent
+                                   ↑                                │
+                                   └──── 2-3 cas ratés en retour ───┘
+```
+
+`DynamicToolBuilder` (§6) sait déjà faire écrire un outil au modèle, le passer à
+l'AST, l'exécuter en bac à sable et lancer les auto-tests **que le modèle a
+fournis**. Le point faible tient en une phrase : il écrit les tests qui le
+jugent. Il ne triche pas — il se trompe deux fois de la même façon.
+
+```python
+from autoagent import Example, synthesize_tool
+
+res = synthesize_tool(builder, "Parse one sensor log line into …",
+                      examples=[Example({"ligne": "…"}, {"date": "…", …}), …],
+                      holdout=0.4, max_attempts=5, seed=0, register_on=agent)
+res.accepted        # True si TOUS les cas — montrés ET cachés — passent
+res.attempts        # le journal : par essai, montrés passés / cachés passés / erreur
+res.usage           # ce que la synthèse a coûté
+```
+
+### 32.1 La règle qui fait tout : les cas cachés ne sortent jamais
+
+Les exemples sont **coupés en deux**, de façon déterministe (graine). Les cas
+montrés servent au modèle pour écrire et corriger. Les cas cachés (`holdout`,
+40 % par défaut) ne lui sont **jamais transmis** — ni dans la demande, ni dans un
+retour d'échec, même pas leur contenu quand ils ratent. Il apprend seulement
+*« N cas que tu n'as pas vus échouent — ta règle est trop spécifique »*.
+
+Sans cette coupure, un modèle à qui l'on demande de « faire passer ces cas »
+écrit volontiers un outil qui les traite un par un (`if entree == …`) : 100 %
+de réussite, 0 % d'utilité. Ce n'est pas de la malhonnêteté, c'est ce qu'on lui a
+demandé. La coupure transforme la consigne en « trouve la règle ».
+
+Un test **décode chaque requête envoyée au fournisseur** (la demande est
+encapsulée en JSON par `_user_prompt`, donc chercher en clair passait à vide) et
+vérifie qu'aucun cas caché n'y figure.
+
+### 32.2 Le protocole d'un essai
+
+1. `builder.build(...)` avec la demande = but + cas montrés + retour de l'essai
+   précédent. Un échec de construction (JSON invalide, AST refusé, auto-test du
+   modèle raté) compte comme un essai, avec l'erreur en retour.
+2. Les cas **montrés** tournent dans le bac à sable. S'il en rate, le modèle
+   reçoit jusqu'à `feedback_cases` cas ratés **avec** leur contenu (attendu /
+   obtenu) — ce sont les siens, il peut les voir.
+3. S'ils passent tous, les cas **cachés** tournent. S'il en rate, le modèle
+   reçoit le **compte**, rien d'autre.
+4. Tout passe → l'outil est accepté, et enregistré sur `register_on` s'il est
+   fourni — par le même `registry.replace` qu'un outil dynamique ordinaire, donc
+   dans le même circuit de promotion par empreinte (§7.4).
+
+Un outil refusé est **supprimé du disque** : rien de non validé ne reste
+chargeable dans `tools_dir`. Le fournisseur du `builder` est restauré à la fin ;
+pendant la boucle il est enveloppé pour compter la dépense.
+
+### 32.3 Mesuré (démo 31)
+
+Dix lignes de journal capteur, trois pièges (deux formats de date, un niveau
+parfois absent, des espaces variables), 40 % cachées, contre un vrai
+fournisseur : **accepté à l'essai 1, 6/6 montrés + 4/4 cachés, 11,2 s, 2 177
+jetons** — et juste sur une ligne que ni le modèle ni la boucle n'avaient vue.
+
+### 32.4 Ce que ça ne fait pas
+
+Rendre le modèle plus intelligent. La boucle convertit des essais en justesse,
+ce qui n'est possible que **là où la vérité est déjà connue**. Avec des données
+ET les résultats attendus (fichiers capteurs, adresses déjà rapprochées, exports
+déjà codés), elle est très rentable : le modèle peut essayer cinquante fois, ça
+ne coûte que des jetons, et tu ne relis rien. Sans juge automatique — rédiger,
+juger une pertinence — elle n'a rien à offrir, et un jeu d'exemples faux produit
+un outil faux qui passe.
+
+---
+
+## 33. `idempotent` — les outils tournent pendant que le modèle parle
+
+*(0.21.0)*
+
+En streaming, un appel d'outil est souvent **complet bien avant la fin du
+message** : le modèle a décidé « lire capteur A », puis continue d'émettre « lire
+capteur B », puis du texte. Jusqu'ici la boucle attendait le `final` pour lancer
+quoi que ce soit — génération et outils s'additionnaient.
+
+```python
+@agent.tool(idempotent=True)
+def lire_capteur(nom: str) -> dict: ...
+```
+
+### 33.1 Le mécanisme
+
+* **`StreamChunk(type="tool_call")`** — les trois fournisseurs émettent un appel
+  dès qu'il est assemblé : OpenAI quand l'index suivant s'ouvre, Anthropic au
+  `content_block_stop`, Gemini immédiatement (les `functionCall` arrivent
+  entiers). Le `final` porte toujours la liste complète : un consommateur qui
+  ignore `tool_call` voit exactement ce qu'il voyait avant.
+  Conséquence sur le fil OpenAI (OpenAI, DeepSeek, Kimi…) : le **dernier**
+  appel d'un tour n'est connu complet qu'à la fin du flux, donc N appels →
+  N−1 lancés en avance. Vérifié en réel sur DeepSeek (démo 32) : 1 sur 2 en
+  avance, **5,0 s → 4,0 s (−20 %)** ; un tour à un seul appel ne lance rien en
+  avance et se comporte exactement comme avant (démo 02).
+* **Lancement anticipé** — si l'outil est `idempotent` **et** que les gardes
+  laissent passer cet appel (anti-boucle, trifecta, politique — les mêmes que
+  la voie normale, sur cet appel seul), la boucle le soumet à un exécuteur en
+  arrière-plan. Trace : `tool_call_early_start`.
+* **Consommation** — dans la phase d'outils, `_timed` retrouve le résultat par
+  `call.id` et l'**attend** au lieu de relancer. Un seul appel ; événements et
+  transcript dans le même ordre qu'en voie normale. `run_end` porte
+  `early_tool_calls`.
+
+Mesuré (démo 32, deux capteurs de 1,2 s demandés dans le même tour) :
+**6,1 s → 4,3 s (−29 %)**, transcript identique à l'octet. PASTE (arXiv
+2603.18897) rapporte −43 % de temps par tâche avec ce recouvrement.
+
+### 33.2 Les trois règles
+
+1. **Jamais sans `idempotent=True`.** Un flux qui casse jette le résultat
+   anticipé ; un outil idempotent n'a rien changé dans le monde. Un outil à
+   effet de bord ne doit pas porter le drapeau — la lib ne le devine pas,
+   l'hôte le déclare. Le papier compagnon (arXiv 2606.07846) le dit : *« un
+   mauvais résultat spéculatif ne peut pas annuler l'irréversible »*.
+2. **Les gardes AVANT.** Un appel refusé par la politique n'est pas lancé en
+   avance, et le refus apparaît comme d'habitude — test dédié.
+3. **Un seul appel.** Le résultat anticipé est consommé, jamais recalculé ;
+   les orphelins (annoncés dans le flux, absents du `final`) sont jetés en fin
+   de run et l'exécuteur fermé sans attendre.
+
+### 33.3 Ce que ça ne fait pas
+
+Prédire un appel que le modèle n'a pas encore émis (ce que PASTE fait par
+motifs récurrents). Ici on ne spécule que sur un appel **déjà complet** : le
+gain vient du recouvrement avec ce qui reste à générer, pas d'une devinette.
+Moins ambitieux, mais aucun faux positif possible.
+
+---
+
+## 34. `cascade` — le petit modèle d'abord, le gros si ton juge dit non
+
+*(0.21.0)*
+
+```
+palier 1 (pas cher) → check(résultat) ? oui → fini
+                            │ non
+palier 2 (plus cher) → check(résultat) ? oui → fini
+```
+
+`RoutingProvider` (§9) route **avant** l'appel, sur la forme de la requête. La
+cascade route **après**, sur le résultat : le petit modèle répond, un juge en
+code vérifie, et on ne paie le gros que si le petit a raté.
+
+```python
+from autoagent import cascade
+
+r = cascade([lambda: Agent(lite), lambda: Agent(pro)], tache, check=juge)
+r.tier          # palier qui a convaincu (1-based), None si aucun
+r.escalations   # combien de fois on est monté
+r.usage         # dépense de TOUS les paliers, ratés compris
+```
+
+### 34.1 Ce qui décide de monter est du code
+
+`check` est le juge de l'**hôte** — le contrat de `run_k` (§25.4) : un prédicat
+déterministe sur `AgentResult`. Un `check` qui lève refuse. Si c'était le petit
+modèle qui disait « je ne suis pas sûr », on serait revenu à une consigne qu'on
+espère. Sans juge déterministe il n'y a pas de cascade, il y a un pari.
+
+### 34.2 Les paliers ratés se paient — mesuré, et ça ne flatte pas la cascade
+
+Démo 33, quatre tâches vérifiables, `gemini-3.5-flash-lite → gemini-3.7-flash` :
+1 escalade sur 4, et **369 jetons contre 307** pour le gros seul. En **jetons**,
+la cascade a coûté plus : une escalade paie deux paliers, et des tâches de 60 à
+100 jetons n'amortissent pas l'essai raté. La démo le dit, puis imprime le
+**seuil** : la cascade gagne en euros si le jeton lite coûte moins de X % du
+jeton pro, X calculé du run (`jetons de pro évités / jetons de lite dépensés`).
+Le rapport de prix réel est la donnée de l'hôte — la lib ne présume aucun tarif
+(§27.5). Ce qui décide en pratique : le **taux d'acceptation** du palier lite sur
+*tes* tâches. Il se mesure avant de déployer, pas après.
+
+### 34.3 Une pause n'est pas un échec
+
+`ApprovalRequired` et `AgentCancelled` **remontent** tels quels. Monter de palier
+sur une pause reviendrait à contourner le feu vert humain avec un autre modèle :
+la cascade ne doit jamais devenir une porte dérobée dans `tool_policy` (§20).
+Test dédié. Un palier qui plante (`MaxStepsExceeded`, `TokenBudgetExceeded`,
+erreur fournisseur) est un palier **raté** — la cascade continue et porte la
+dépense engagée quand l'exception la connaît (`exc.state`).
+
+---
+
+## 35. `summarize_trace` — l'efficacité lue dans la trace
+
+*(0.21.0)*
+
+Chaque run écrit déjà une trace JSONL (§4.5). Elle répond à des questions que le
+taux de réussite ne pose pas, **sans rien ajouter au run** :
+
+```python
+from autoagent import summarize_trace
+
+m = summarize_trace("trace.jsonl")         # ou une liste d'événements / TraceEvent
+m.redundant_tool_calls, m.redundant_ratio  # même run, même outil, mêmes arguments — déjà vu
+m.blocked_by_guard, m.would_block          # refus par garde ; observations du mode témoin (§30)
+m.tokens_per_success                       # échecs compris ; None si rien n'est rapporté
+m.early_tool_calls, m.pruned_chars         # §33, §28
+print(m.summary())
+```
+
+Les runs sont reconstitués par la **parenté des spans** (`parent_id`), pas par
+l'ordre des lignes : deux runs entrelacés dans un même fichier ne se contaminent
+pas (test dédié). Aucun chiffre inventé — pas de jetons dans la trace → `None`,
+zéro succès → `None`, jamais un infini.
+
+Pourquoi ça compte : Probe&Prefill (arXiv 2605.09252) trouve près de la moitié
+des appels d'outils inutiles sur son banc — en lisant les états cachés du
+modèle, impossible par API. Lire ce que le modèle a **fait** est la réponse côté
+API. Et AgentAtlas (arXiv 2605.20530) rappelle qu'une trajectoire se juge sur ses
+décisions (agir, refuser, s'arrêter…), pas sur le seul résultat : les compteurs
+de gardes sont exactement ça.
+
+Ce que le module ne fait **pas** : juger la qualité d'une réponse — c'est le
+`check` de l'hôte. Il compte ce qui est comptable. Et il ne vaut que sur du
+**trafic réel** : sur une démo, il mesure une démo (démo 34).
+
+---
+
+## 36. Usage et performance : connexions persistantes, `Bounds`, `guards.py`, exceptions typées
+
+*(0.21.0)*
+
+Cinq chantiers issus d'une revue MESURÉE de la lib (pas d'une impression), du
+plus rentable au moins urgent. Règle tenue : la suite reste verte à chaque
+étape, aucune API existante ne bouge.
+
+### 36.1 Une connexion par hôte, pas par appel
+
+`http.py` ouvrait une connexion neuve à chaque appel (`urllib.request.urlopen`) :
+poignée de main TCP + TLS à chaque fois. Mesuré contre l'hôte Gemini :
+
+```
+connexion neuve à chaque appel : 251 / 105 / 95 ms
+connexion réutilisée           :  57 /  40 / 16 ms
+→ ~120 ms de surcoût par appel, ~1 s par run de 8 étapes
+```
+
+Désormais UNE `http.client.HTTP(S)Connection` par (thread, schéma, hôte),
+réutilisée. Une connexion fermée par le serveur est jetée et la requête
+réessayée **immédiatement** sur une neuve. Les flux SSE sont lus jusqu'au bout
+et fermés (connexion réutilisable) ; un flux interrompu jette sa connexion.
+`http://` reste accepté (Ollama, vLLM, LM Studio). Toujours stdlib. Vérifié sur
+le fil avec Gemini et DeepSeek.
+
+### 36.2 `Bounds` — les huit bornes en un objet
+
+```python
+from autoagent import Agent, Bounds
+
+PROD = Bounds(max_steps=12, token_budget=40_000, max_tool_result_chars=4_000,
+              prune_tool_results_after=2, max_repeated_tool_calls=3)
+agent = Agent(provider, bounds=PROD)
+agent.bounds.to_dict()        # dans une trace, un rapport
+```
+
+Un kwarg explicite différent de sa valeur par défaut l'emporte sur le champ de
+`Bounds`. `agent.bounds` est une **photo** des bornes en vigueur : les attributs
+restent ordinaires et modifiables (`agent.token_budget = 8000` avant `resume`,
+démo 22). Les vingt kwargs continuent de marcher.
+
+### 36.3 Les gardes hors de la boucle — et sans recomptage
+
+`agent.py` dépassait 2 300 lignes ; les trois gardes (anti-boucle, trifecta,
+politique) étaient des fermetures imbriquées dans le générateur. Elles vivent
+dans `guards.py` (`TurnGuards`), construites une fois par run avec l'état
+qu'elles lisaient déjà. **Mêmes verdicts, mêmes événements, même ordre** :
+les fixtures de rejeu ne voient rien. `agent.py` : 2 298 → 2 155 lignes.
+
+La garde anti-boucle **recomptait toutes les signatures du transcript à chaque
+tour** (80 600 appels pour 400 étapes — quadratique). Compteur incrémental sur
+les messages pas encore vus : même résultat, coût linéaire. Surcoût par étape à
+400 étapes, gardes + élagage : 1,33 → 1,00 ms.
+
+**Correctif attrapé au passage** : la vérification anticipée (§33) comptait le
+transcript SANS l'appel en attente — plus permissive d'une unité que la
+vérification du tour ; un outil idempotent pouvait partir en avance puis être
+refusé. `pending=True` le compte ; test dédié.
+
+### 36.4 Des exceptions dont les attributs existent
+
+`exc.state`, `exc.spent`, `exc.messages`, `exc.calls` étaient posés
+dynamiquement — invisibles aux éditeurs et au typage (l'essentiel des 27 erreurs
+mypy). Déclarés sur une base `_ResumableError` avec défauts ; constructeurs
+inchangés, la boucle continue de les renseigner. mypy : 27 → 14, le reste
+antérieur (`memory.py`, `sandbox.py`, `evolution.py`).
+
+### 36.5 Ce qui a été mesuré et laissé tel quel
+
+Le surcoût de la boucle nue est de **0,14 ms par étape** : tout le temps est dans
+le réseau (d'où le §36.1). Le validateur interne (§31) est **2,3× plus rapide**
+que `jsonschema`. L'élagage de la vue reste O(n) par étape par construction — il
+relit le transcript pour produire la vue — et c'est acceptable tant que les
+appels réseau se comptent en centaines de millisecondes.
+
+---
 *Doc maintenue par l'équipe Alyce R&D. Pour questions, ouvrir une issue sur le repo interne ou taper l'auteur sur Slack.*

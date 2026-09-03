@@ -11,5 +11,9 @@ __pycache__/
 build/
 dist/
 
+# Outils écrits par le modèle (DynamicToolBuilder, synthesize_tool) — jamais
+# commités : un outil dynamique n'entre dans le dépôt que promu, par le manifeste.
+.autoagent/
+
 # Secrets
 .env

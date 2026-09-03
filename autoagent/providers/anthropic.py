@@ -153,6 +153,15 @@ class AnthropicProvider(LLMProvider):
         model: str | None = None
         usage_start: dict[str, Any] | None = None   # bloc `usage` du message_start
         usage_out: int | None = None
+        emis: set[int] = set()
+
+        def _assemble(block: dict[str, Any]) -> ToolCall:
+            raw_json = block["json"].strip()
+            try:
+                args = json.loads(raw_json) if raw_json else {}
+            except json.JSONDecodeError:
+                args = {}
+            return ToolCall(id=block["id"], name=block["name"], arguments=args)
 
         for event in post_sse(
             self._url(),
@@ -194,20 +203,17 @@ class AnthropicProvider(LLMProvider):
                         yield StreamChunk(type="text", text=chunk_text)
                 elif dtype == "input_json_delta" and index in tool_blocks:
                     tool_blocks[index]["json"] += delta.get("partial_json") or ""
-            # content_block_stop / message_delta / message_stop need no action;
-            # tool args are parsed below once the stream completes.
+            elif etype == "content_block_stop":
+                # Le bloc tool_use est COMPLET : on l'émet tout de suite, sans
+                # attendre message_stop — la boucle peut lancer un outil
+                # idempotent pendant que le modèle émet les blocs suivants.
+                index = event.get("index", 0)
+                if index in tool_blocks and index not in emis:
+                    emis.add(index)
+                    yield StreamChunk(type="tool_call", tool_call=_assemble(tool_blocks[index]))
+            # message_delta / message_stop need no action here.
 
-        tool_calls: list[ToolCall] = []
-        for index in sorted(tool_blocks):
-            block = tool_blocks[index]
-            raw_json = block["json"].strip()
-            try:
-                args = json.loads(raw_json) if raw_json else {}
-            except json.JSONDecodeError:
-                args = {}
-            tool_calls.append(
-                ToolCall(id=block["id"], name=block["name"], arguments=args)
-            )
+        tool_calls: list[ToolCall] = [_assemble(tool_blocks[i]) for i in sorted(tool_blocks)]
 
         # Le compte d'entrée (cache compris) arrive dans `message_start`, celui
         # de sortie dans le dernier `message_delta` : on recompose le bloc que

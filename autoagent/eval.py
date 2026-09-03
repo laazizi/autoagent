@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .logging import get_logger
+from .schema import TokenUsage
 
 __all__ = ["Attempt", "ReliabilityReport", "run_k"]
 
@@ -57,6 +58,10 @@ class Attempt:
     total_tokens: int | None = None
     output: str = ""
     error: str = ""
+    # Détail de la dépense (0.21.0) : un score sans coût ne veut rien dire.
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cached_tokens: int | None = None
 
 
 @dataclass
@@ -103,6 +108,71 @@ class ReliabilityReport:
     def errors(self) -> list[str]:
         return [a.error for a in self.attempts if a.error]
 
+    # ── Coût normalisé (0.21.0) — « score à dépense fixe », pas score tout seul ──
+    #
+    # Un pass^k isolé ne dit pas ce qu'il a coûté : un agent qui réussit 8/8 en
+    # brûlant dix fois plus de jetons qu'un autre n'est pas « meilleur ». Les
+    # benchmarks sérieux (AstaBench, Prime Agent) rapportent le score À
+    # DÉPENSE FIXE. Trois mesures, aucune n'invente un chiffre : sans usage
+    # rapporté, on rend None, pas zéro.
+
+    @property
+    def usage(self) -> TokenUsage | None:
+        """Dépense cumulée des k tentatives, ou None si rien n'a été rapporté."""
+        vus = [a for a in self.attempts if a.total_tokens is not None]
+        if not vus:
+            return None
+        caches = [a.cached_tokens for a in vus if a.cached_tokens is not None]
+        return TokenUsage(
+            input_tokens=sum(a.input_tokens or 0 for a in vus),
+            output_tokens=sum(a.output_tokens or 0 for a in vus),
+            total_tokens=sum(a.total_tokens or 0 for a in vus),
+            cached_tokens=sum(caches) if caches else None,
+        )
+
+    @property
+    def tokens_per_success(self) -> float | None:
+        """Jetons dépensés (TOUTES les tentatives, ratées comprises) par succès.
+
+        Les échecs se paient aussi : c'est la vraie unité de l'efficacité.
+        None si aucune dépense n'est rapportée ou si rien n'a réussi — diviser
+        par zéro succès donnerait un infini qu'aucun tableau ne sait lire.
+        """
+        u = self.usage
+        if u is None or not self.successes or not u.total_tokens:
+            return None
+        return u.total_tokens / self.successes
+
+    def cost(self, cost_fn: Callable[[TokenUsage], float]) -> float | None:
+        """Coût total via un tarif FOURNI PAR L'HÔTE — jamais dans la lib.
+
+        `cost_fn(TokenUsage) -> montant` : le partage entrée pleine / entrée
+        cachée / sortie est à lui (cf. démo 22). Un prix périme, une lib non.
+        """
+        u = self.usage
+        return None if u is None else float(cost_fn(u))
+
+    def cost_per_success(self, cost_fn: Callable[[TokenUsage], float]) -> float | None:
+        total = self.cost(cost_fn)
+        if total is None or not self.successes:
+            return None
+        return total / self.successes
+
+    def pass_hat_k_at_budget(self, budget_tokens: int) -> float:
+        """pass^k À BUDGET FIXE : 1.0 si les k tentatives ont réussi ET qu'aucune
+        n'a dépassé `budget_tokens`. Une réussite obtenue en crevant le plafond
+        n'est pas une réussite qu'on peut reproduire en production.
+
+        Une tentative sans usage rapporté ne peut pas prouver qu'elle est sous
+        le budget : elle compte comme au-dessus (prudent, pas optimiste).
+        """
+        if not self.attempts:
+            return 0.0
+        for a in self.attempts:
+            if not a.ok or a.total_tokens is None or a.total_tokens > budget_tokens:
+                return 0.0
+        return 1.0
+
     def summary(self) -> str:
         low, high = self.steps_range
         return (
@@ -112,6 +182,8 @@ class ReliabilityReport:
             f"(toutes réussies : {'oui' if self.pass_hat_k else 'non'}) · "
             f"estimation pass^{self.k}={self.estimated_pass_hat_k:.2f} · "
             f"étapes {low}-{high} (méd. {self.median_steps:g})"
+            + (f" · {self.tokens_per_success:.0f} jetons/succès"
+               if self.tokens_per_success is not None else "")
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -123,9 +195,13 @@ class ReliabilityReport:
             "pass_hat_k": self.pass_hat_k,
             "estimated_pass_hat_k": self.estimated_pass_hat_k,
             "median_steps": self.median_steps,
+            "total_tokens": self.usage.total_tokens if self.usage else None,
+            "tokens_per_success": self.tokens_per_success,
             "attempts": [
                 {"index": a.index, "ok": a.ok, "steps": a.steps,
-                 "total_tokens": a.total_tokens, "error": a.error}
+                 "total_tokens": a.total_tokens, "input_tokens": a.input_tokens,
+                 "output_tokens": a.output_tokens, "cached_tokens": a.cached_tokens,
+                 "error": a.error}
                 for a in self.attempts
             ],
         }
@@ -172,6 +248,9 @@ def run_k(
             attempt.steps = getattr(result, "steps", 0)
             usage = getattr(result, "usage", None)
             attempt.total_tokens = getattr(usage, "total_tokens", None)
+            attempt.input_tokens = getattr(usage, "input_tokens", None)
+            attempt.output_tokens = getattr(usage, "output_tokens", None)
+            attempt.cached_tokens = getattr(usage, "cached_tokens", None)
             attempt.output = getattr(result, "output", "") or ""
             try:
                 attempt.ok = bool(check(result))

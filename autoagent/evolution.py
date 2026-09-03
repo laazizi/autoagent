@@ -416,6 +416,22 @@ def enable_software_evolution(
     capabilities: set[str] | None = None,
 ) -> EvolutionRuntime:
     runtime.register_tools(agent, capabilities=capabilities)
-    if EVOLUTION_SYSTEM_PROMPT.strip() not in agent.system_prompt:
-        agent.system_prompt = f"{agent.system_prompt.rstrip()}{EVOLUTION_SYSTEM_PROMPT}"
+    # `Agent.system_prompt` peut être un CALLABLE (prompt dynamique, recalculé à
+    # chaque tour). Le concaténer comme une chaîne plantait :
+    # « TypeError: argument of type 'function' is not iterable » — un agent à
+    # prompt dynamique ne pouvait pas activer l'évolution. mypy le signalait
+    # (0.21.0). On enveloppe : le prompt reste dynamique, l'ajout est fait sur
+    # le texte résolu, et reste idempotent (pas de double ajout).
+    marqueur = EVOLUTION_SYSTEM_PROMPT.strip()
+    base = agent.system_prompt
+    if callable(base):
+        dynamique: Callable[[], str] = base
+
+        def _avec_evolution() -> str:
+            texte = dynamique()
+            return texte if marqueur in texte else f"{texte.rstrip()}{EVOLUTION_SYSTEM_PROMPT}"
+
+        agent.system_prompt = _avec_evolution
+    elif marqueur not in base:
+        agent.system_prompt = f"{base.rstrip()}{EVOLUTION_SYSTEM_PROMPT}"
     return runtime
