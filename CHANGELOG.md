@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A rejected generated tool's bytecode could run in its successor's place.**
+  The `SubprocessSandbox` runner loaded the tool file through `importlib`,
+  hence through `__pycache__`, and Python validates a `.pyc` on (source mtime
+  in whole seconds, source size). `synthesize_tool` discards attempt 1 and
+  writes attempt 2 under the same name: on a fast CI runner both land in the
+  same second, and `x * 3` has exactly the size of `x * 2` — so attempt 2
+  executed attempt 1's stale bytecode and was rejected. CI was red on all 8
+  jobs (0.21.0) while the slower local run stayed green. The runner now
+  compiles the source on every run (as the bridge and Docker runners already
+  did) and gets `-B`; `_discard` also removes the tool's `.pyc`. A test forces
+  both conditions with `os.utime` and failed before the fix (`assert 15 == 10`).
+- **`examples_autoagent/trace_demo.jsonl` is now versioned.** Demo 34 and
+  `tests/test_trace_metrics.py` read it as "the trace already in the repo",
+  but the examples `.gitignore` excluded it: the test could only pass on a
+  machine that had run demo 04 first. Demo 04 still rewrites it (same trace,
+  kept current).
+
 ### Changed — the visual builder catches up with 0.21.0, and is now TESTED
 
 - **A headless test for the builder.** `constructeur_autoagent.html` is

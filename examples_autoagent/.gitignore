@@ -1,6 +1,7 @@
 # Artefacts produits par les démos à l'exécution
 outils_generes/
-trace_demo.jsonl
+# trace_demo.jsonl est VERSIONNÉE : la démo 34 et tests/test_trace_metrics.py la lisent
+# (la démo 04 la réécrit ; c'est la même trace, à jour).
 trace_rdv.jsonl
 memoire_demo/
 __pycache__/

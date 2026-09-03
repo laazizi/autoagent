@@ -34,11 +34,11 @@ __all__ = [
 
 RUNNER_CODE = r"""
 import contextlib
-import importlib.util
 import io
 import json
 import sys
 import traceback
+import types
 
 path = sys.argv[1]
 payload = json.loads(sys.stdin.read() or "{}")
@@ -46,9 +46,14 @@ args = payload.get("args", {})
 context = payload.get("context", {})
 
 try:
-    spec = importlib.util.spec_from_file_location("generated_tool", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Le SOURCE est compilé à chaque exécution — jamais via importlib, donc
+    # jamais via __pycache__ : un fichier réécrit avec la même taille dans la
+    # même seconde exécutait le bytecode PÉRIMÉ de la version précédente.
+    with open(path, encoding="utf-8") as fh:
+        code = fh.read()
+    module = types.ModuleType("generated_tool")
+    module.__file__ = path
+    exec(compile(code, path, "exec"), module.__dict__)
     stdout = io.StringIO()
     with contextlib.redirect_stdout(stdout):
         result = module.run(args, context)
@@ -290,7 +295,7 @@ class SubprocessSandbox:
         payload = json.dumps({"args": args, "context": context or {}}, ensure_ascii=False)
         try:
             completed = subprocess.run(
-                [sys.executable, "-X", "utf8", "-I", "-S", "-c", RUNNER_CODE, str(path)],
+                [sys.executable, "-X", "utf8", "-I", "-S", "-B", "-c", RUNNER_CODE, str(path)],
                 input=payload,
                 text=True,
                 encoding="utf-8",
