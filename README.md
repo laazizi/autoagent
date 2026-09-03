@@ -31,7 +31,10 @@ type annotations. The loop, retries, and provider wire formats are handled for y
 Prefer assembling visually? **[Try the visual builder online](https://laazizi.github.io/autoagent/)** —
 drag blocks (agent, tools, memory, MCP, checkpoint…), get runnable Python. Emit either a
 standalone script or a `build_agent()` function to import into your own app. Fully offline,
-also ships in the repo as `constructeur_autoagent.html`.
+also ships in the repo as `constructeur_autoagent.html` — and is tested headlessly: every preset
+is generated in CI and checked to compile against the current library, and the page must declare
+the library version it covers (`tests/test_constructeur.py`). A diagnostic strip tells you what
+your assembly ignores or handles (approval, audit) before you copy anything.
 
 [![The visual builder cycling through presets: tools, fact memory, MCP, checkpoint — blocks on the left, runnable Python on the right](assets/constructeur.gif)](https://laazizi.github.io/autoagent/)
 

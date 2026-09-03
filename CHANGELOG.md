@@ -5,6 +5,126 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed — the visual builder catches up with 0.21.0, and is now TESTED
+
+- **A headless test for the builder.** `constructeur_autoagent.html` is
+  JavaScript that emits Python; nothing ran it in CI, so it could drift from the
+  library in silence. `tests/constructeur_headless.js` loads the page without a
+  browser (DOM stubs), runs `make()` → `generate()` for EVERY preset, and
+  `tests/test_constructeur.py` checks each output: not the "add a block"
+  placeholder (an empty check would pass), compiles, imports only names that
+  exist in `autoagent`, passes only kwargs `Agent` accepts (by AST — a regex
+  swallowed the next call on the line), and contains no stale wire name
+  (`deleguer`, `"demandes"`). Skipped when Node is absent. Finding on the way
+  in: all 18 existing presets already generated valid 0.21.0 code — the
+  builder was behind, not broken.
+- **Four blocks for what shipped since 0.19.** *Bornes* emits `Bounds(...)`
+  and `bounds=` (and removes the individual bound kwargs so the two cannot
+  disagree); *Délégation parallèle* emits `delegate_to({...})`; *Cascade par
+  résultat* emits `cascade([...], check=juge)` with the judge as CODE the user
+  edits — and works with no Agent block at all; *Synthèse par l'exemple* emits
+  `Example(...)` + `synthesize_tool(...)` from "args JSON => expected JSON"
+  lines. Agent options gain `prune_batch` and `shadow_guards`; tools gain the
+  `idempotent` flag. Four presets exercise them, so the headless test covers
+  them.
+- **Showcases 27–34** added with their code and the outputs actually recorded
+  in session (dated), including the two results that contradicted the
+  hypothesis (`prune_batch` costing tokens on a short run; the cascade costing
+  more tokens on micro-tasks).
+- Not done on purpose: `Chaîne` and `Parallèle` still emit hand-rolled glue
+  (a `for` loop; a raw `ThreadPoolExecutor`) with no judge, no shared budget,
+  no taint. Rewriting them requires the `Step` contract + combinators in the
+  library first — the "language" work — otherwise the builder would just emit
+  better glue.
+
+### Changed — the builder, second pass: complete, and honest about what it emits
+
+- **Three blocks the palette lacked.** *Politique d'outils* emits
+  `ToolPolicySpec.from_dict({...}).compile()` from "tool | action | JSON
+  condition | reason" lines (JSON becomes Python literals; an invalid condition
+  is reported in the diagnostic, not dropped in silence). When a rule says
+  `approve`, the generated script handles `ApprovalRequired`: the loop stops
+  BEFORE any side effect, the human answers, the decision is keyed on `call.id`
+  (stable across pause/resume) and the run resumes. *Enregistrer / rejouer*
+  emits `RecordSession` / `ReplaySession` (`Agent(session.provider(...),
+  registry=session.registry())`, `session.close()` after the run; replay
+  needs no key and says so). *Fiabilité (pass^k)* emits `run_k(agent, prompt,
+  k=, check=juge)` with the judge as code.
+- **Options that had shipped without a knob.** Trace: "résumer la trace après
+  le run" → `summarize_trace(file).summary()`. Lancer: an attached image
+  (`ImageAttachment`, base64 + guessed mime, through `run_messages`) and a
+  deadline (`threading.Event` + `Timer` as `cancel_token`, `AgentCancelled`
+  handled). Vérification: `max_corrections_per_run`. Mémoire:
+  `background=True` + `flush()`. `agent.audit_trifecta()` is emitted whenever
+  a tool is `egress` or `untrusted`. `trifecta_guard="approve"` generates the
+  approval flow too (guard set to `"off"`/`"deny"` for the rest of that run,
+  restored after resume).
+- **A diagnostic strip above the code.** `generate()` returns notes: blocks
+  ignored for lack of an Agent, a Lancer next to a Cascade, sub-agents not
+  wired because a pipeline drives, approval handling in place, audit at
+  startup. A block no longer disappears silently. The headless test asserts
+  that no shipped preset carries a warning.
+- **Less to look at.** The Agent block shows the essentials; its eight bounds
+  and the advanced options fold into two groups that open by themselves when a
+  value differs from its default ("1 réglé"). FactMemory options fold the same
+  way. Presets are grouped by intention in the menu (Démarrer, Sécurité &
+  bornes, Mémoire, Multi-agent, Outils qui s'écrivent, Flux & intégration,
+  Observabilité & tests) with consistent labels. A filter box on the palette,
+  a wrap toggle for long code lines, and the header shows the library version
+  the builder targets.
+- **Bugs found on the way.** `Bounds` was emitted only in the plain
+  `from_model` branch: routing or an advanced provider plus a Bornes block
+  referenced an undefined `BORNES`. Multi-line prompts lost their newlines
+  (Python's implicit concatenation adds none). Long single-line prompts and
+  `Bounds(...)` calls now wrap. `Chaîne` / `Parallèle` stages get `max_steps`
+  (or the shared `Bounds`) and the script prints the total tokens — still
+  glue, still no judge (see the note above).
+- **`LIB_VERSION`** in the page must equal `autoagent.__version__`: the test
+  fails the day the library moves without the builder. Three presets exercise
+  the new blocks; 25 in total, all generated and compiled in CI.
+
+### Changed — the builder, third pass: every public capability that fits a block, and the subtleties said out loud
+
+- **Measured inventory, not memory.** A script compared the library's whole
+  public surface (`__all__`, every `Agent` method and kwarg, every class
+  kwarg) with what the page emits. `Agent.__init__` was fully covered; what
+  was not now is: **Évolution logicielle** (`EvolutionRuntime` +
+  `enable_software_evolution`, capabilities as a set, validation command fixed
+  by the host — exercised for real on a temp workspace: 14 tools registered,
+  write, validation, rollback), **promotion by manifest** on the dynamic-tools
+  block (`load_tools(agent, dir, ToolManifest.load(path), sandbox=)`),
+  **reprise sur borne** on Lancer (`TokenBudgetExceeded` / `MaxStepsExceeded`
+  caught once, bound doubled, `resume(borne.state)` — verified with a scripted
+  model), `run(context=…)` for the host dict `tool_policy` reads, the
+  Orchestrator's `describe` / `on_refused` / `on_offtopic` /
+  `phrase_temperature`, the `groq` provider (no default model is invented:
+  the diagnostic asks for one), OTel `semconv="gen_ai"`, `tool_search`
+  threshold and max results, and folded fine-tuning knobs (workspace read /
+  write caps and ignored dirs, `summary_max_tokens`, `max_facts`,
+  `max_context_facts`, MCP `cwd`).
+- **The subtleties, in the diagnostic, when the assembly meets them.**
+  `as_tool` does not share the parent's tools; an untrusted tool without any
+  egress tool (or the reverse) leaves the trifecta guard with nothing to do;
+  a legitimate egress is blocked once tainted (hence `approve`);
+  `parallel_tool_calls` needs thread-safe handlers; `delegate_to` is parallel
+  but not async; memory compaction is skipped on resume; pruning breaks the
+  cache prefix and Gemini's cache is opportunistic; failed cascade tiers are
+  paid; idempotent tools start early only in streaming (and the OpenAI wire
+  holds the last one); the synthesis holdout is never sent; FactMemory has
+  nothing to recall without a prior exchange.
+- **Bug seen live by the author.** A tool ticked "donner aussi aux
+  sous-agents" lost its `untrusted` / `egress` / `idempotent` flags: it was
+  attached with a bare `agent.tool(fn)`. The flags now follow the tool on the
+  agent AND on every sub-agent (`chercheur.tool(etat_parc, idempotent=True)`),
+  and the headless test asserts it on preset 08.
+- Not blockable, on purpose: types and exceptions, provider classes (reached
+  through `from_model`), internals (`validation`, `http`, `logging`,
+  `guards`, `registry`, sandbox constants), `embed_fn` (needs host code — a
+  stub that crashes is not "ready to run"), `input_schema` (defeats schema
+  generation), `resume_stream`, `render_system_prompt`.
+
 ## [0.21.0] - 2026-08-29
 
 ### Changed — persistent HTTP connections: one TLS handshake per host, not per call

@@ -31,7 +31,7 @@ gates, durable runs, fact memory, MCP client, OpenTelemetry export.
    | Observability (trace, checkpoint, OTel, memory compaction) | **fail-open**: log and continue, never break the run |
    | Security (`tool_policy`, workspace, sandbox, approval manifest) | **fail-closed**: a crashing policy DENIES |
    | Tool handlers | exceptions become tool errors the model sees — never a crash |
-5. **Run the tests**: `pytest tests -q` (954 tests, <30 s). Docker
+5. **Run the tests**: `pytest tests -q` (965 tests, <30 s; the 7 `test_constructeur` tests need Node and are skipped without it). Docker
    sandbox tests skip themselves when no daemon. `tests/conftest.py`
    provides `FakeLLMProvider` (records requests in `.calls`).
 6. **Sync the docs with any change** — the recurring failure mode of this
