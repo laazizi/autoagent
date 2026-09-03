@@ -1,3 +1,22 @@
+"""Erreurs de la bibliothèque — et les ATTRIBUTS qu'elles portent, déclarés.
+
+Jusqu'en 0.20, `exc.state`, `exc.spent`, `exc.messages`, `exc.calls` étaient
+posés dynamiquement sur les exceptions par la boucle. Ça marchait, mais aucun
+éditeur ne les complétait, aucun typage ne les vérifiait (27 erreurs mypy), et
+seule la doc savait qu'ils existaient. Ils sont maintenant déclarés ici, avec
+des valeurs par défaut : le constructeur reste `Exception(message)` — un hôte
+qui les levait ou les attrapait ne voit rien changer — et la boucle continue de
+les renseigner après construction. Découvrable, typé, rétrocompatible (0.21.0).
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .agent import RunState
+    from .schema import Message, ToolCall
+
 __all__ = [
     "AgentCancelled",
     "ApprovalRequired",
@@ -16,13 +35,32 @@ class AutoAgentError(Exception):
     """Base error for autoagent."""
 
 
-class AgentCancelled(AutoAgentError):
+class _ResumableError(AutoAgentError):
+    """Une erreur qui porte de quoi REPRENDRE le run (0.21.0).
+
+    Attributes (renseignés par la boucle avant de lever) :
+        state: snapshot `RunState` à donner à `Agent.resume`, ou None si la
+            boucle n'a pas pu en produire (erreur avant le premier tour).
+        messages: la conversation au moment de l'arrêt.
+        step: l'étape à laquelle l'arrêt a eu lieu.
+    """
+
+    def __init__(self, message: str = "", *args: Any) -> None:
+        super().__init__(message, *args)
+        self.state: RunState | None = None
+        self.messages: list[Message] = []
+        self.step: int | None = None
+
+
+class AgentCancelled(_ResumableError):
     """Raised when an agent run is cancelled cooperatively via `cancel_token`.
 
     The lib checks the token at the start of every loop iteration. When the
     token is set, the next iteration raises `AgentCancelled` instead of
     issuing a new provider call. Pre-existing tool calls in flight are not
     interrupted — cancellation happens at the next safe boundary.
+
+    Attributes: ``state`` (resumable snapshot), ``step``.
     """
 
 
@@ -50,11 +88,11 @@ class ProviderError(AutoAgentError):
         self.retryable = retryable
 
 
-class ApprovalRequired(AutoAgentError):
+class ApprovalRequired(_ResumableError):
     """Raised BY a ``tool_policy`` hook to pause the run for human approval.
 
     The agent loop catches it before ANY tool of the turn has executed,
-    attaches a resumable snapshot, and re-raises to the host:
+    attaches a resumable snapshot, and re-raises to the host.
 
     Attributes (attached by the loop):
         state: ``RunState`` snapshot — feed it to ``Agent.resume`` once
@@ -64,6 +102,10 @@ class ApprovalRequired(AutoAgentError):
             the model sees the refusal and re-plans.
         calls: The turn's pending ``ToolCall`` list (nothing executed).
     """
+
+    def __init__(self, message: str = "", *args: Any) -> None:
+        super().__init__(message, *args)
+        self.calls: list[ToolCall] = []
 
 
 class ReplayMismatch(AutoAgentError):
@@ -97,16 +139,26 @@ class ToolValidationError(ToolError):
     """Raised when generated tool code is rejected."""
 
 
-class MaxStepsExceeded(AutoAgentError):
-    """Raised when the agent loop reaches its configured step limit."""
+class MaxStepsExceeded(_ResumableError):
+    """Raised when the agent loop reaches its configured step limit.
+
+    Attributes: ``state`` (resumable — raise ``max_steps`` and call
+    ``Agent.resume``), ``messages``.
+    """
 
 
-class TokenBudgetExceeded(AutoAgentError):
+class TokenBudgetExceeded(_ResumableError):
     """Raised when a run's cumulative token usage reaches ``token_budget``.
 
     Checked BEFORE each provider call (the call that crossed the budget is
     never truncated mid-flight). Only enforceable when the provider reports
     usage — unreported calls count as zero (best effort, never invented).
-    ``messages`` (the conversation so far) and ``spent`` (input+output
-    tokens) are attached as attributes.
+
+    Attributes: ``messages`` (the conversation so far), ``spent``
+    (input+output tokens), ``state`` (resumable — raise the budget and call
+    ``Agent.resume``).
     """
+
+    def __init__(self, message: str = "", *args: Any) -> None:
+        super().__init__(message, *args)
+        self.spent: int = 0
