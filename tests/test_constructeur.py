@@ -81,7 +81,7 @@ class TestChaquePreset:
     def test_tous_les_presets_se_generent(self, generes: list[dict]) -> None:
         rates = [p for p in generes if not p["ok"]]
         assert not rates, "presets en échec : " + "; ".join(f"{p['label']} → {p['erreur']}" for p in rates)
-        assert len(generes) >= 26
+        assert len(generes) >= 27
 
     def test_aucun_placeholder(self, reussis: list[dict]) -> None:
         vides = [p["label"] for p in reussis if Path(p["fichier"]).read_text(encoding="utf-8").lstrip().startswith("# ←")]
@@ -110,6 +110,25 @@ class TestChaquePreset:
             inconnus += [f"{p['label']} : {k}" for k in sorted(_kwargs_agent(src) - connus)]
         assert not inconnus, inconnus
 
+    def test_les_kwargs_des_outils_dynamiques_existent(self, reussis: list[dict]) -> None:
+        """`DynamicToolBuilder(...)`, `SubprocessSandbox(...)`, `PythonRunner(...)` : chaque
+        kwarg émis doit exister dans la VRAIE signature (lots A-C, 0.22.0)."""
+        classes = {"DynamicToolBuilder": autoagent.DynamicToolBuilder, "PythonRunner": autoagent.PythonRunner,
+                   "SubprocessSandbox": importlib.import_module("autoagent.sandbox").SubprocessSandbox,
+                   "DockerSandbox": importlib.import_module("autoagent.sandbox").DockerSandbox}
+        inconnus: list[str] = []
+        vus = 0
+        for p in reussis:
+            src = Path(p["fichier"]).read_text(encoding="utf-8")
+            for node in ast.walk(ast.parse(src)):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in classes:
+                    vus += 1
+                    connus = set(inspect.signature(classes[node.func.id]).parameters)
+                    inconnus += [f"{p['label']} : {node.func.id}({k.arg}=)" for k in node.keywords
+                                 if k.arg and k.arg not in connus]
+        assert vus >= 3, "le test ne regarde plus rien : les constructeurs ont disparu des presets ?"
+        assert not inconnus, inconnus
+
     def test_aucun_nom_de_fil_perime(self, reussis: list[dict]) -> None:
         fautifs: list[str] = []
         for p in reussis:
@@ -130,6 +149,9 @@ ATTENDUS = {
     "casc": ("cascade(", "check=juge"),
     "synth": ("synthesize_tool(", "Example("),
     "evol": ("EvolutionRuntime(", "enable_software_evolution(", "validation_command="),
+    # Outils dynamiques, lots A-C : tout ce que les options émettent doit exister dans la lib.
+    "dynpro": ("allowed_permissions=set()", "max_repairs=2", "persist=True", "PythonRunner(sandbox=bac)",
+               "enable_run_python(", "DockerSandbox("),
     "04": ("except TokenBudgetExceeded", "except MaxStepsExceeded", ".resume(borne.state"),
     "11": ("describe=describe", "on_refused=", "on_offtopic="),
     # Bug vu à l'écran : un outil PARTAGÉ perdait ses drapeaux. Ils doivent suivre

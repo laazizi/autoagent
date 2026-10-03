@@ -77,6 +77,8 @@ class RegisteredTool:
             self._wants_context = "context" in inspect.signature(self.handler).parameters
         except (TypeError, ValueError):  # builtins / exotic callables
             self._wants_context = False
+        if getattr(self.handler, "__autoagent_sandboxed__", False):
+            self._wants_context = False   # code écrit par le modèle : pas d'objets de l'hôte
 
     def execute(self, args: JsonDict, context: JsonDict | None = None) -> ToolResult:
         if self._schema_error is not None:
@@ -251,6 +253,7 @@ def tool(
     permissions: list[str] | None = None,
     untrusted: bool = False,
     egress: bool = False,
+    idempotent: bool = False,
 ):
     def decorator(handler: ToolHandler) -> ToolHandler:
         spec = ToolSpec(
@@ -260,6 +263,9 @@ def tool(
             permissions=permissions or [],
             untrusted=untrusted,
             egress=egress,
+            # Oublié en 0.21.0 : `agent.tool(idempotent=True)` le prenait, le
+            # décorateur autonome `@tool` non (0.22.0).
+            idempotent=idempotent,
         )
         handler.__autoagent_tool_spec__ = spec  # type: ignore[attr-defined]
         return handler

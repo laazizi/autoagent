@@ -107,13 +107,21 @@ class ProjectWorkspace:
             raise WorkspaceError(f"Path is not a file: {path}")
 
         limit = min(max_chars or self.max_read_chars, self.max_read_chars)
-        content = resolved.read_text(encoding="utf-8")
-        truncated = len(content) > limit
+        # Lecture BORNÉE en mémoire (0.22.0) : `read_text()` chargeait le fichier
+        # ENTIER avant de couper à `limit` — un journal de prod de plusieurs Go
+        # saturait la mémoire pour en rendre 50 000 caractères. On lit `limit`
+        # caractères, puis on COMPTE le reste par blocs (même champ `chars`,
+        # même résultat, mémoire constante).
+        with resolved.open(encoding="utf-8") as fh:
+            content = fh.read(limit)
+            total = len(content)
+            while bloc := fh.read(1 << 20):
+                total += len(bloc)
         return {
             "path": path,
-            "content": content[:limit],
-            "truncated": truncated,
-            "chars": len(content),
+            "content": content,
+            "truncated": total > limit,
+            "chars": total,
         }
 
     def write_file(self, path: str, content: str, *, reason: str = "") -> dict[str, Any]:

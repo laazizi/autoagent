@@ -560,6 +560,7 @@ const DEFS = {
       {k:"timeout", l:"timeout (s)", kind:"number", def:"10", w:"half"},
       {k:"image",   l:"image Docker", kind:"text", def:"python:3.11-slim", w:"half"},
       {k:"prefer",  l:"préférer Docker si dispo (sinon subprocess)", kind:"check", def:true},
+      {k:"warm",    l:"sandbox chaud (SubprocessSandbox seulement : un worker persistant par outil)", kind:"check", def:false, hint:"~6 ms/appel au lieu de ~107 ; les variables globales d'un outil survivent d'un appel à l'autre (recyclé tous les 200 appels)."},
     ],
   },
   dynamic: {
@@ -568,6 +569,10 @@ const DEFS = {
       {k:"dir",     l:"dossier des outils générés", kind:"text", def:".autoagent/tools"},
       {k:"timeout", l:"timeout d'exécution (s)", kind:"number", def:"10", w:"half"},
       {k:"maxrun",  l:"max outils générés / run", kind:"number", def:"3", w:"half"},
+      {k:"repairs", l:"reprises max (max_repairs)", kind:"number", def:"0", w:"half", hint:"un refus (JSON, validateur, self-test faux) est renvoyé au constructeur ; 0 = comme avant. Chaque reprise est un appel payé."},
+      {k:"ceil",    l:"permissions que le modèle peut s'accorder (plafond)", kind:"text", def:"", w:"half", hint:"ex. filesystem.*, network — VIDE = aucune. Sans plafond, le modèle choisit lui-même ses droits (réseau compris)."},
+      {k:"persist", l:"bibliothèque persistante (réutiliser les outils d'un run à l'autre)", kind:"check", def:false},
+      {k:"runpy",   l:"ajouter run_python (extrait de code éphémère, jamais gardé)", kind:"check", def:false},
       {k:"manifest", l:"manifest d'approbation (vide = pas de promotion)", kind:"text", def:"", hint:"ex. approved_tools.json — un outil généré tourne en NATIF seulement si son sha256 y est"},
     ],
   },
@@ -740,9 +745,10 @@ const DEFS = {
       {k:"root", l:"dossier du logiciel cible", kind:"text", def:".", w:"half"},
       {k:"exts", l:"extensions modifiables", kind:"text", def:".py, .json", w:"half"},
       {k:"pipeline", l:"fichier des slots de pipeline (vide = pas de slots)", kind:"text", def:"pipeline.json", w:"half", hint:"remplaçables à chaud"},
-      {k:"validation", l:"commande de validation (vide = aucune)", kind:"text", def:"python -m pytest -q", w:"half", hint:"fixée par TOI ; le modèle ne peut pas la remplacer"},
+      {k:"validation", l:"commande de validation (vide = aucune)", kind:"text", def:"python -m pytest -q", w:"half", hint:"fixée par toi, mais elle EXÉCUTE le code écrit par le modèle : à lancer dans un conteneur jetable"},
       {k:"caps", l:"capacités (vide = toutes)", kind:"text", def:"read, write, pipeline, validate", hint:"parmi read, write, host_state, host_call, pipeline, validate"},
       {k:"custom_cmd", l:"autoriser le modèle à choisir la commande de validation (exécution arbitraire — bac à sable seulement)", kind:"check", def:false},
+      {k:"inherit_env", l:"transmettre TOUT mon environnement à la validation (clés API comprises)", kind:"check", def:false, hint:"décoché = inherit_env=False : seules PATH, HOME… passent"},
     ],
   },
   policy: {
@@ -789,7 +795,7 @@ const INFO = {
   tool:{api:"@agent.tool", info:"Transforme une fonction Python en outil appelable par l'agent. Le schéma JSON est généré automatiquement depuis tes annotations de type. Renseigne le nom, les paramètres annotés, la docstring (lue par le modèle) et le corps."},
   workspace:{api:"ProjectWorkspace(root, allowed_write_extensions=…)", info:"Espace d'écriture borné : chemins hors dossier, chemins absolus et extensions interdites sont refusés PAR LE CODE. Coche les outils à exposer (écrire, lire, lister, remplacer, annuler). Chaque écriture est journalisée et réversible."},
   sandbox:{api:"make_sandbox() · SubprocessSandbox · DockerSandbox", info:"Exécute du code non fiable ISOLÉ du système : conteneur Docker jetable (réseau coupé, FS en lecture seule) si Docker est présent, sinon subprocess durci. make_sandbox choisit tout seul. Sert surtout à faire tourner les outils générés dynamiquement."},
-  dynamic:{api:"DynamicToolBuilder + enable_dynamic_tools", info:"Donne à l'agent le pouvoir d'ÉCRIRE ses propres outils Python à la volée : il décrit la capacité voulue, un LLM génère le code, celui-ci est validé (AST) puis exécuté dans le bac à sable. Limite le nombre d'outils générés par run."},
+  dynamic:{api:"DynamicToolBuilder + enable_dynamic_tools", info:"Donne à l'agent le pouvoir d'ÉCRIRE ses propres outils Python à la volée : il décrit la capacité voulue, un LLM génère le code, celui-ci est validé (AST) puis exécuté dans le bac à sable. Limite le nombre d'outils générés par run. Options : reprise des refus (max_repairs), bibliothèque persistante (réutilise les outils d'un run à l'autre), plafond de permissions, run_python (extrait éphémère)."},
   memory:{api:"BufferMemory · SummarizingMemory · FactMemory", info:"Borne le contexte quand la conversation s'allonge. BufferMemory garde les N derniers messages ; SummarizingMemory RÉSUME les vieux tours ; FactMemory extrait des FAITS atomiques tenus à jour (une contradiction remplace le fait périmé, JSON lisible par identité). Options : recall (l'agent lit sa mémoire) et remember (il mémorise volontairement, FactMemory)."},
   trace:{api:"TraceEmitter(file=…)", info:"Enregistre chaque événement (appel LLM, appel d'outil, correction…) dans un fichier JSONL, secrets masqués. Partagée par l'agent ET tous les sous-agents → tu vois tout l'arbre d'exécution dans une seule trace."},
   subagent:{api:"agent.as_tool(name=, description=)", info:"Un agent complet exposé comme OUTIL d'un autre : l'orchestrateur décide quand le solliciter (ordre émergent, piloté par le LLM). Chaque appel démarre une conversation fraîche ; ses échecs deviennent des erreurs d'outil, jamais un crash."},
@@ -814,7 +820,7 @@ const INFO = {
 const ENV = {gemini:"GEMINI_API_KEY", openai:"OPENAI_API_KEY", anthropic:"ANTHROPIC_API_KEY", deepseek:"DEEPSEEK_API_KEY", groq:"GROQ_API_KEY"};
 // Version de la lib que ce constructeur couvre. Le test headless la compare à
 // autoagent.__version__ : le constructeur ne peut plus prendre de retard en silence.
-const LIB_VERSION = "0.21.0";
+const LIB_VERSION = "0.22.0";
 // Modèle par défaut de chaque fournisseur : changer le provider sans
 // changer le modèle produisait `from_model("deepseek","gemini-…")`.
 const MODELE_DEFAUT = {gemini:"gemini-3.7-flash", openai:"gpt-4o-mini",
@@ -997,6 +1003,10 @@ function generate(){
     for(const r of regles) if(r.err) note("warn", `Politique : condition JSON invalide, ignorée → ${r.err}`);
     if(polApprove || trifApprove) note("ok", "ApprovalRequired est géré : la boucle s'arrête AVANT l'effet de bord et demande à l'humain.");
     if(tools.some(x=>x.f.egress||x.f.untrusted)) note("ok", "audit_trifecta() au démarrage : lint des outils egress / untrusted.");
+    if(sb && sb.f.warm && sb.f.kind!=="SubprocessSandbox")
+      note("info", "« sandbox chaud » est ignoré : il ne s'applique qu'au type SubprocessSandbox (Docker lance un conteneur par appel).");
+    if(dyn && dyn.f.runpy && !(sb && sb.f.kind==="DockerSandbox"))
+      note("warn", "run_python exécute du code écrit par le modèle : sans DockerSandbox, la liste d'interdits AST n'est PAS une frontière. Mets l'outil sous une politique d'outils.");
     if(replay && (dyn || mcps.length)) note("info", "En replay, aucun outil ne tourne : MCP / outils dynamiques ne servent qu'à l'enregistrement.");
     if(recB && codeMode==="integration") note("info", "Enregistrement : pense à fermer la session (session.close()) côté app.");
     // Les subtilités de la lib, dites AU MOMENT où l'assemblage les rencontre.
@@ -1027,6 +1037,8 @@ function generate(){
     if(repriseBorne) note("ok", "Reprise sur borne : max_steps / token_budget doublés UNE fois, le run reprend du snapshot. La limite reste du code.");
     if(evoB && !String(evoB.f.validation||"").trim()) note("info", "Évolution sans commande de validation : l'agent ne peut pas vérifier ses changements avant de conclure.");
     if(evoB && evoB.f.custom_cmd) note("warn", "Le modèle peut choisir la commande de validation : c'est une exécution arbitraire. À réserver à un bac à sable.");
+    if(evoB && String(evoB.f.validation||"").trim()) note("info", "La validation exécute le code que le modèle vient d'écrire (un test, un conftest.py) avec tes droits : lance l'évolution dans un conteneur jetable.");
+    if(evoB && evoB.f.inherit_env) note("warn", "La validation reçoit TOUT ton environnement : un test écrit par le modèle peut lire tes clés API et les renvoyer dans sa sortie.");
     if(manifest) note("ok", "Promotion par manifest : un outil généré ne tourne en natif que si son sha256 est approuvé ; sinon bac à sable.");
   }
   if(boundsB) names.add("Bounds");
@@ -1065,7 +1077,7 @@ function generate(){
   // L'amorce est une liste de Message posée par l'hôte avant la question.
   const amorce = mem ? (mem.f.amorce||"").trim() : "";
   if(amorce) names.add("Message");
-  if(dyn){ names.add("DynamicToolBuilder"); names.add("create_provider"); names.add("ModelConfig"); }
+  if(dyn){ names.add("DynamicToolBuilder"); names.add("create_provider"); names.add("ModelConfig"); if(dyn.f.runpy) names.add("PythonRunner"); }
   if(adv) names.add("ModelConfig");
   if(routing){ names.add("RoutingProvider"); names.add("create_provider"); names.add("ModelConfig"); }
   if(orchB){ names.add("Orchestrator"); names.add("Step"); names.add("create_provider"); names.add("ModelConfig"); }
@@ -1158,7 +1170,7 @@ function generate(){
       sbVar = (sb.f.var||"bac").trim();
       const to = num(sb.f.timeout,10);
       L.push(`# Bac à sable : exécute le code non fiable isolé du système.`);
-      if(sb.f.kind==="SubprocessSandbox")      L.push(`${sbVar} = SubprocessSandbox(timeout=${to})`);
+      if(sb.f.kind==="SubprocessSandbox")      L.push(`${sbVar} = SubprocessSandbox(timeout=${to}${sb.f.warm?", warm=True":""})`);
       else if(sb.f.kind==="DockerSandbox")     L.push(`${sbVar} = DockerSandbox(image=${pyStr(sb.f.image||"python:3.11-slim")}, timeout=${to})`);
       else L.push(`${sbVar} = make_sandbox(prefer_docker=${sb.f.prefer?"True":"False"}, timeout=${to}, image=${pyStr(sb.f.image||"python:3.11-slim")})`);
       L.push(``);
@@ -1198,6 +1210,12 @@ function generate(){
       L.push(`    create_provider(ModelConfig(${pyStr(a.prov)}, ${pyStr(a.model)})),`);
       const barg = [`tools_dir=${pyStr(dyn.f.dir||".autoagent/tools")}`];
       if(sbVar) barg.push(`sandbox=${sbVar}`); else barg.push(`timeout=${num(dyn.f.timeout,10)}`);
+      // Plafond de permissions : TOUJOURS écrit. Vide = set() (aucune permission accordée) ;
+      // sans lui, le modèle choisit lui-même ses droits (réseau compris).
+      const plafond = String(dyn.f.ceil||"").split(",").map(x=>x.trim()).filter(Boolean);
+      barg.push(`allowed_permissions=${plafond.length ? "{"+plafond.map(pyStr).join(", ")+"}" : "set()"}`);
+      if(num(dyn.f.repairs,0) > 0) barg.push(`max_repairs=${num(dyn.f.repairs,0)}`);
+      if(dyn.f.persist) barg.push(`persist=True`);
       L.push(`    ${barg.join(", ")})`);
       L.push(``);
     }
@@ -1349,6 +1367,11 @@ function generate(){
     }
     if(dyn){
       L.push(`${av}.enable_dynamic_tools(builder)   # débloque l'outil « create_python_tool »`);
+      if(dyn.f.runpy){
+        L.push(`# run_python : le modèle exécute un extrait ÉPHÉMÈRE (validé, sandboxé, jamais gardé).`);
+        L.push(`# L'outil le plus puissant offert au modèle : mets-le sous tool_policy, et sous Docker.`);
+        L.push(`${av}.enable_run_python(PythonRunner(${sbVar ? "sandbox="+sbVar : ""}), max_runs_per_run=10)`);
+      }
       L.push(``);
       if(manifest){
         L.push(`# Promotion par manifest : un outil généré ne tourne en NATIF que si le sha256 de sa`);
@@ -1367,11 +1390,13 @@ function generate(){
       if(String(e.pipeline||"").trim()) ek.push(`pipeline_path=${pyStr(e.pipeline.trim())}`);
       if(String(e.validation||"").trim()) ek.push(`validation_command=${pyStr(e.validation.trim())}`);
       if(e.custom_cmd) ek.push(`allow_custom_validation_command=True`);
+      if(!e.inherit_env) ek.push(`inherit_env=False`);
       ek.push(`allowed_write_extensions=${setExt(e.exts||".py")}`);
       const caps = String(e.caps||"").split(",").map(s=>s.trim()).filter(Boolean);
-      L.push(`# Évolution logicielle : l'agent modifie CE logiciel sous garde — dossier borné,`);
-      L.push(`# extensions autorisées, validation en code, rollback de chaque changement. La`);
-      L.push(`# commande de validation est fixée par l'hôte : le modèle ne peut pas la remplacer.`);
+      L.push(`# Évolution logicielle : l'agent modifie CE logiciel — dossier borné, extensions`);
+      L.push(`# autorisées, rollback de chaque changement. ATTENTION : la commande de validation`);
+      L.push(`# est fixée par l'hôte, mais elle EXÉCUTE le code que le modèle vient d'écrire, avec`);
+      L.push(`# tes droits. À lancer dans un conteneur jetable.`);
       L.push(`runtime = EvolutionRuntime(`);
       for(const k of ek) L.push(`    ${k},`);
       L.push(`)`);
@@ -2246,6 +2271,12 @@ const PRESETS = [
     mk("sandbox",{var:"bac",kind:"make_sandbox (auto)",timeout:"10",prefer:true}),
     mk("dynamic",{dir:"outils_generes",timeout:"10",maxrun:"2"}),
     mk("run",{prompt:"Crée un outil qui teste si un entier est premier, puis dis-moi si 7919 est premier."}),
+  ]},
+  {id:"dynpro", grp:"Outils qui s'écrivent", label:"Outils dynamiques, version pro (reprise, bibliothèque, run_python)", make:()=>[
+    mk("agent",{var:"agent",system:"Tu résous des problèmes en créant les outils Python qui te manquent, ou en exécutant un extrait de code pour un calcul ponctuel.",steps:"8",budget:"60000"}),
+    mk("sandbox",{var:"bac",kind:"DockerSandbox",timeout:"10",image:"python:3.11-slim"}),
+    mk("dynamic",{dir:"outils_generes",timeout:"10",maxrun:"3",repairs:"2",ceil:"",persist:true,runpy:true}),
+    mk("run",{prompt:"Crée un outil qui calcule la distance de haversine entre deux points (rayon 6371 km), puis donne-moi la distance Paris (48.8566, 2.3522) – Lyon (45.7640, 4.8357)."}),
   ]},
   {id:"08", grp:"Multi-agent", label:"08 · Multi-agents (as_tool)", make:()=>[
     mk("agent",{var:"superviseur",system:"Pour répondre : demande les chiffres au chercheur, puis fais rédiger le bulletin par le rédacteur, et rends son texte.",steps:"6"}),

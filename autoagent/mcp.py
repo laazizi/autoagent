@@ -47,7 +47,8 @@ from collections import deque
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .errors import MCPError, ToolError
-from .logging import get_logger
+from .logging import get_logger, warn_once
+from .sandbox import safe_environment
 from .schema import JsonDict, ToolSpec
 
 __all__ = ["MCPClient", "MCP_PROTOCOL_VERSION"]
@@ -76,12 +77,17 @@ class MCPClient:
         command: The server command — a list (recommended: exact argv) or
             a string (split with shlex; prefer the list form on Windows,
             backslash paths do not survive POSIX splitting).
-        env: Extra environment variables, MERGED over ``os.environ``
-            (an MCP server usually needs its own API key here).
+        env: Extra environment variables, MERGED over the inherited
+            environment (an MCP server usually needs its own API key here).
         cwd: Working directory for the server process.
         timeout: Default seconds to wait for each response (handshake,
             tools/list, tools/call). Per-call override on ``call_tool``.
         client_name: Advertised in the MCP ``initialize`` handshake.
+        inherit_env: ``True`` (historical default) — the server inherits
+            the WHOLE host environment, API keys and database passwords
+            included. ``False`` — only the safe system variables the
+            official MCP SDK passes (``PATH``, ``HOME``…), plus ``env``
+            (0.22.0). Recommended for any third-party server.
     """
 
     def __init__(
@@ -92,11 +98,16 @@ class MCPClient:
         cwd: str | None = None,
         timeout: float = 60.0,
         client_name: str = "autoagent",
+        inherit_env: bool | None = None,
     ) -> None:
         if isinstance(command, str):
             command = shlex.split(command)
         self.command = list(command)
         self.env = dict(env) if env else None
+        # None = pas de choix explicite : comportement HISTORIQUE (tout hériter),
+        # pour ne casser aucun serveur en production — mais le journal le dit.
+        self._inherit_env_explicit = inherit_env is not None
+        self.inherit_env = True if inherit_env is None else inherit_env
         self.cwd = cwd
         self.timeout = timeout
         self.client_name = client_name
@@ -123,8 +134,16 @@ class MCPClient:
         if self._proc is not None:
             return self
         env = None
-        if self.env is not None:
-            env = {**os.environ, **self.env}
+        if not self.inherit_env:
+            env = safe_environment(self.env)       # même règle que le SDK MCP officiel
+        else:
+            if not self._inherit_env_explicit:
+                warn_once(_log, "mcp.inherit_env",
+                          "MCPClient: the server inherits the WHOLE host environment (API keys, "
+                          "database passwords). Pass inherit_env=False (+ env={...} for what it "
+                          "needs), or inherit_env=True to make the choice explicit.")
+            if self.env is not None:
+                env = {**os.environ, **self.env}
         try:
             self._proc = subprocess.Popen(
                 self.command,
@@ -293,7 +312,7 @@ class MCPClient:
         your ``tool_policy`` can gate on. Recommended for any third-party
         server whose content you don't control (web fetchers, mail readers).
         """
-        add = getattr(agent, "add_tool", None) or getattr(agent, "add_function")
+        add = getattr(agent, "add_tool", None) or agent.add_function
         names: list[str] = []
         for handler in self.tools(
             include=include, exclude=exclude, prefix=prefix, untrusted=untrusted

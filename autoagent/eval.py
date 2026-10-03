@@ -11,8 +11,9 @@ prédicat de l'HÔTE si le résultat est bon, et rapporte la dispersion. Deux ch
 délibérés :
 
 * **Le juge est déterministe, fourni par l'hôte.** Pas de LLM-as-judge : sur les
-  échecs d'agent, les juges LLM plafonnent sous 55 % de justesse (accord au niveau
-  du hasard sur l'évaluation par sous-chaîne). Un vérificateur *sound* — un schéma,
+  échecs d'agent, l'attribution automatique par LLM reste faible : sur Who&When, la
+  meilleure méthode désigne l'agent fautif dans 53,5 % des cas et l'étape fautive
+  dans 14,2 % (Zhang et al., arXiv:2505.00212). Un vérificateur *sound* — un schéma,
   un diff de fichiers, une commande qui passe — vaut mieux qu'un avis probabiliste.
 * **Zéro dépendance, synchrone.** Combinable avec `ReplaySession` : rejouer k fois
   un fixture enregistré donne une non-régression de fiabilité gratuite, sans clé

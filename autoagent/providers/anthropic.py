@@ -1,13 +1,20 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Iterator
 from typing import Any
 
 from autoagent.http import post_json, post_sse
-from autoagent.schema import LLMRequest, LLMResponse, Message, StreamChunk, TokenUsage, ToolCall
+from autoagent.schema import (
+    LLMRequest,
+    LLMResponse,
+    Message,
+    StreamChunk,
+    TokenUsage,
+    ToolCall,
+    normalize_finish_reason,
+)
 
-from .base import LLMProvider
+from .base import LLMProvider, parse_tool_arguments, synthetic_call_id
 
 
 def _usage_from(u: Any) -> TokenUsage | None:
@@ -117,7 +124,7 @@ class AnthropicProvider(LLMProvider):
             elif block_type == "tool_use":
                 tool_calls.append(
                     ToolCall(
-                        id=block.get("id") or f"tool_call_{index}",
+                        id=block.get("id") or synthetic_call_id("tool_call", index),
                         name=block.get("name") or "",
                         arguments=block.get("input") or {},
                     )
@@ -128,6 +135,7 @@ class AnthropicProvider(LLMProvider):
             raw=raw,
             model=raw.get("model"),
             usage=_usage_from(raw.get("usage")),
+            finish_reason=normalize_finish_reason("anthropic", raw.get("stop_reason")),
         )
 
     def stream(self, request: LLMRequest) -> Iterator[StreamChunk]:
@@ -153,14 +161,16 @@ class AnthropicProvider(LLMProvider):
         model: str | None = None
         usage_start: dict[str, Any] | None = None   # bloc `usage` du message_start
         usage_out: int | None = None
+        raison_brute: str | None = None
         emis: set[int] = set()
 
         def _assemble(block: dict[str, Any]) -> ToolCall:
-            raw_json = block["json"].strip()
-            try:
-                args = json.loads(raw_json) if raw_json else {}
-            except json.JSONDecodeError:
-                args = {}
+            # JSON COUPÉ (max_tokens atteint en plein appel) : `parse_tool_arguments`
+            # garde le texte brut dans `{"_raw": ...}`. Rendre `{}` faisait partir
+            # l'outil avec ses valeurs par défaut — un `purger(filtre="*")` sur des
+            # arguments perdus (0.22.0). La validation de schéma le refuse et le
+            # modèle voit pourquoi. Seuls les échappements invalides sont réparés.
+            args = parse_tool_arguments(block["json"].strip())
             return ToolCall(id=block["id"], name=block["name"], arguments=args)
 
         for event in post_sse(
@@ -183,12 +193,13 @@ class AnthropicProvider(LLMProvider):
                 out = (event.get("usage") or {}).get("output_tokens")
                 if out is not None:
                     usage_out = out
+                raison_brute = (event.get("delta") or {}).get("stop_reason") or raison_brute
             elif etype == "content_block_start":
                 index = event.get("index", 0)
                 block = event.get("content_block") or {}
                 if block.get("type") == "tool_use":
                     tool_blocks[index] = {
-                        "id": block.get("id") or f"tool_call_{index}",
+                        "id": block.get("id") or synthetic_call_id("tool_call", index),
                         "name": block.get("name") or "",
                         "json": "",
                     }
@@ -232,6 +243,7 @@ class AnthropicProvider(LLMProvider):
                 raw={"stream": True, "model": model,
                      "usage": {**(usage_start or {}), "output_tokens": usage_out}},
                 usage=usage,
+                finish_reason=normalize_finish_reason("anthropic", raison_brute),
             ),
         )
 

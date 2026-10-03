@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from typing import Any
@@ -20,6 +22,98 @@ def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
         else:
             base[key] = value
     return base
+
+
+def synthetic_call_id(prefix: str, index: int) -> str:
+    """Identifiant d'appel d'outil quand le fournisseur n'en donne pas (0.22.0).
+
+    Gemini n'en renvoie jamais, OpenAI-compatibles et Anthropic presque
+    toujours. L'ancien repli `f"{prefix}_{index}"` repartait de zéro à CHAQUE
+    réponse : le premier appel de chaque tour s'appelait `gemini_tool_call_0`.
+    Or tout ce qui se souvient d'un appel le fait par son id — la décision
+    humaine d'une approbation (la lib recommande d'y mémoriser le verdict, l'id
+    étant stable à travers la pause), le rejeu, l'exécution anticipée. Deux
+    appels différents portant le même id, c'est une approbation qui vaut pour
+    un autre envoi. Le suffixe aléatoire rend l'id unique dans le run ; le
+    préfixe et l'index restent lisibles dans une trace.
+    """
+    return f"{prefix}_{index}_{uuid.uuid4().hex[:8]}"
+
+
+_ECHAPPEMENTS_JSON = frozenset('"\\/bfnrt')
+_QUATRE_HEX = frozenset("0123456789abcdefABCDEF")
+
+
+def repair_json_escapes(text: str) -> str:
+    """Double le antislash de chaque échappement INVALIDE à l'intérieur d'une chaîne JSON.
+
+    Un modèle qui écrit du code (`re.compile("^\\d+$")`) dans un argument JSON
+    met souvent `\\d` au lieu de `\\\\d` : `json.loads` refuse (« Invalid \\escape »)
+    et l'appel d'outil partait en `{"_raw": ...}`. L'intention est sans
+    ambiguïté — un antislash littéral suivi de `d` — et c'est exactement le
+    texte source que le modèle voulait écrire. Seuls les échappements invalides
+    sont touchés ; `\\n`, `\\"`, `\\\\`, `\\uXXXX` valides passent tels quels. Ne
+    répare PAS un JSON coupé : l'appel garde alors son `_raw` et la validation
+    de schéma le refuse (c'est voulu, voir `_assemble`).
+    """
+    sortie: list[str] = []
+    dans_chaine = False
+    i, n = 0, len(text)
+    while i < n:
+        car = text[i]
+        if not dans_chaine:
+            sortie.append(car)
+            dans_chaine = car == '"'
+            i += 1
+        elif car == '"':
+            sortie.append(car)
+            dans_chaine = False
+            i += 1
+        elif car != "\\" or i + 1 >= n:        # caractère ordinaire, ou antislash final (texte coupé)
+            sortie.append(car)
+            i += 1
+        elif text[i + 1] in _ECHAPPEMENTS_JSON:
+            sortie.append(text[i:i + 2])
+            i += 2
+        elif text[i + 1] == "u" and len(text) >= i + 6 and all(c in _QUATRE_HEX for c in text[i + 2:i + 6]):
+            sortie.append(text[i:i + 6])
+            i += 6
+        else:                                  # invalide : l'antislash devient littéral
+            sortie.append("\\\\")
+            i += 1
+    return "".join(sortie)
+
+
+def loads_tolerant(text: str) -> Any:
+    """`json.loads`, puis — SEULEMENT si le texte est refusé — une seconde chance
+    avec les échappements invalides réparés et les caractères de contrôle bruts
+    (un vrai retour à la ligne dans une chaîne) acceptés. Un JSON valide n'est
+    jamais modifié ; un JSON irréparable relève l'erreur ORIGINALE."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as erreur:
+        try:
+            return json.loads(repair_json_escapes(text), strict=False)
+        except json.JSONDecodeError:
+            raise erreur from None
+
+
+def parse_tool_arguments(raw: Any) -> Any:
+    """Arguments d'un appel d'outil tels que le fournisseur les a écrits.
+
+    Déjà un objet → rendu tel quel ; vide → `{}` ; texte JSON → l'objet, après
+    réparation éventuelle des échappements ; illisible → `{"_raw": texte}` (la
+    validation de schéma le refuse et le modèle voit pourquoi — jamais `{}`, qui
+    ferait partir l'outil avec ses valeurs par défaut sur des arguments perdus).
+    """
+    if not isinstance(raw, str):
+        return {} if raw is None else raw
+    if not raw.strip():
+        return {}
+    try:
+        return loads_tolerant(raw)
+    except json.JSONDecodeError:
+        return {"_raw": raw}
 
 
 class LLMProvider(ABC):

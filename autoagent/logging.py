@@ -31,6 +31,26 @@ _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
         re.IGNORECASE,
     ),
     re.compile(r"(\bkey=)[A-Za-z0-9._\-]{8,}"),
+    # ── 0.22.0 : les formats qui passaient EN CLAIR ──────────────────────────
+    # Les motifs ci-dessus exigent une ÉTIQUETTE (« api_key = », « Bearer »). Un
+    # secret nu — une clé recopiée par le modèle dans un argument, une chaîne de
+    # connexion lue dans un fichier de config — traversait la trace tel quel.
+    # Clés reconnaissables à leur FORME (OpenAI/Anthropic `sk-`, Groq `gsk_`,
+    # Google `AIza`, AWS `AKIA`, GitHub, GitLab, Slack) :
+    re.compile(r"()\b(?:sk-(?:proj-|ant-|svcacct-|admin-)?|gsk_|ghp_|gho_|github_pat_|glpat-|xox[abpr]-)"
+               r"[A-Za-z0-9_\-]{16,}"),
+    re.compile(r"()\bAIza[0-9A-Za-z_\-]{30,}"),
+    re.compile(r"()\bAKIA[0-9A-Z]{16}\b"),
+    # Mot de passe dans une URL : postgres://admin:SECRET@hôte — on garde
+    # l'utilisateur et l'hôte (utiles au debug), pas le mot de passe.
+    re.compile(r"([a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:/@]+:)[^\s@/]+(?=@)"),
+    # Étiquettes usuelles d'un secret, hors `api_key` déjà couvert.
+    re.compile(
+        r"(\b(?:password|passwd|pwd|secret|client_secret|api_secret|access_token|refresh_token"
+        r"|auth_token|token)['\"]?\s*[:=]\s*['\"]?)[^\s'\",;&]{4,}",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(Basic\s+)[A-Za-z0-9+/=]{8,}", re.IGNORECASE),
 )
 _REDACTED = "***REDACTED***"
 
@@ -87,10 +107,27 @@ def get_logger(name: str | None = None) -> logging.Logger:
     return logger
 
 
+_DEJA_AVERTI: set[str] = set()
+
+
+def warn_once(logger: logging.Logger, key: str, message: str) -> None:
+    """Un avertissement UNE fois par processus et par ``key`` (0.22.0).
+
+    Sert aux réglages historiques risqués qu'on ne bascule pas pour ne pas
+    casser la production (MCP qui hérite de tout l'environnement, validation
+    qui voit les clés, outils générés sans plafond de permissions) : le journal
+    le dit, sans inonder un service qui tourne depuis des semaines.
+    """
+    if key in _DEJA_AVERTI:
+        return
+    _DEJA_AVERTI.add(key)
+    logger.warning(message)
+
+
 def redact(value: Any) -> str:
     """Public helper for one-off redaction (e.g. when building an error
     message that may embed a header value)."""
     return _redact(str(value))
 
 
-__all__ = ["SecretRedactingFilter", "get_logger", "redact"]
+__all__ = ["SecretRedactingFilter", "get_logger", "redact", "warn_once"]

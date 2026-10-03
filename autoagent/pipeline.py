@@ -18,6 +18,11 @@ class PipelineError(ToolError):
 class PipelineManager:
     workspace: ProjectWorkspace
     path: str = "pipeline.json"
+    # Préfixes de modules qu'un slot peut désigner (0.22.0). Le modèle écrit
+    # `{"module": ..., "callable": ...}` et c'est TON application qui l'importe
+    # et l'appelle : sans liste, `subprocess`/`os` + `run`/`system` passaient.
+    # `None` (défaut historique) = pas de contrôle ; ex. ("plugins.", "monapp.etapes.").
+    allowed_module_prefixes: tuple[str, ...] | None = None
 
     def list_slots(self) -> dict[str, Any]:
         spec = self.load()
@@ -47,6 +52,13 @@ class PipelineManager:
             raise PipelineError("slot cannot be empty")
         if not module:
             raise PipelineError("module cannot be empty")
+        if self.allowed_module_prefixes is not None and not any(
+            module == p.rstrip(".") or module.startswith(p) for p in self.allowed_module_prefixes
+        ):
+            raise PipelineError(
+                f"Module `{module}` is not allowed in a pipeline slot. "
+                f"Allowed prefixes: {list(self.allowed_module_prefixes)}"
+            )
         spec = self.load()
         spec.setdefault("name", "pipeline")
         slots = spec.setdefault("slots", {})

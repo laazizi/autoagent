@@ -29,14 +29,15 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.util
 import json
 import sys
+import types
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from ._fichiers import atomic_write_text
 from .errors import ToolError, ToolValidationError
 from .sandbox import (
     extract_tool_metadata,
@@ -113,11 +114,9 @@ class ToolManifest:
         self.save()
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps({"approved": self.entries}, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        # Atomique (0.22.0) : un manifest tronqué par une écriture interrompue
+        # faisait échouer `load` (« Corrupt manifest ») et bloquait tout démarrage.
+        atomic_write_text(self.path, json.dumps({"approved": self.entries}, indent=2, ensure_ascii=False) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -180,12 +179,21 @@ def reject_tool(file_path: str | Path, *, rejected_dir: str | Path | None = None
 # ---------------------------------------------------------------------------
 
 
-def _import_native(path: Path) -> Any:
-    spec = importlib.util.spec_from_file_location(f"autoagent_approved_{path.stem}", str(path))
-    if spec is None or spec.loader is None:
-        raise ToolError(f"Cannot import approved tool: {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+def _import_native(path: Path, code: str) -> Any:
+    """Exécute EXACTEMENT le source dont l'empreinte vient d'être vérifiée (0.22.0).
+
+    L'ancienne version relisait le fichier via `importlib` : entre la lecture
+    hachée et l'import, le fichier pouvait changer (TOCTOU), et `importlib`
+    pouvait servir un `.pyc` périmé d'une autre version (même taille, même
+    seconde — le bug vu en CI sur le bac à sable). Compiler la chaîne hachée
+    ferme les deux trous : ce qui tourne en natif est ce qui a été approuvé.
+    """
+    module = types.ModuleType(f"autoagent_approved_{path.stem}")
+    module.__file__ = str(path)
+    try:
+        exec(compile(code, str(path), "exec"), module.__dict__)
+    except SyntaxError as exc:
+        raise ToolError(f"Cannot import approved tool {path.name}: {exc}") from exc
     if not hasattr(module, "run"):
         raise ToolError(f"Approved tool {path.name} defines no run(args, context)")
     return module
@@ -272,7 +280,7 @@ def load_tools(
         digest = sha256_of(code)
         if manifest.contains(digest):
             handler = _make_native_handler(
-                _import_native(file).run, host_context, sandbox_host_functions
+                _import_native(file, code).run, host_context, sandbox_host_functions
             )
             mode = "native"
         else:

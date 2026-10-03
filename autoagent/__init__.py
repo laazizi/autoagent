@@ -13,7 +13,7 @@ calls are stateless and can be issued concurrently.
 
 from __future__ import annotations
 
-__version__ = "0.21.0"
+__version__ = "0.22.0"
 
 from .agent import (
     Agent,
@@ -28,7 +28,7 @@ from .agent import (
 )
 from .bounds import Bounds
 from .cascade import CascadeResult, TierAttempt, cascade
-from .dynamic import DynamicToolBuilder, ToolBuildRequest
+from .dynamic import DynamicToolBuilder, PythonRunner, ToolBuildRequest
 from .errors import (
     AgentCancelled,
     ApprovalRequired,
@@ -141,6 +141,7 @@ __all__ = [
     "PostTurnHook",
     "ProjectWorkspace",
     "ProviderError",
+    "PythonRunner",
     "RecordSession",
     "RecordingProvider",
     "RecordingRegistry",

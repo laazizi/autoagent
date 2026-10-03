@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from .bounds import Bounds
-from .dynamic import DynamicToolBuilder, ToolBuildRequest
+from .dynamic import DynamicToolBuilder, PythonRunner, ToolBuildRequest, _safe_tool_name
 from .errors import (
     AgentCancelled,
     ApprovalRequired,
@@ -28,6 +28,7 @@ from .memory import Memory
 from .providers import create_provider
 from .providers.base import LLMProvider
 from .registry import ToolRegistry
+from .sandbox import discard_generated_tool as _discard_generated
 from .schema import (
     UNTRUSTED_CLOSE,
     UNTRUSTED_OPEN,
@@ -39,6 +40,7 @@ from .schema import (
     TokenUsage,
     ToolCall,
     ToolSpec,
+    frame_untrusted,
     is_tainted,
 )
 from .trace import TraceEmitter, truncate_preview
@@ -70,6 +72,10 @@ class AgentResult:
     # Total tokens du run (somme des usages rapportés par le provider).
     # None quand aucun appel n'a rapporté d'usage. Added in 0.10.0.
     usage: TokenUsage | None = None
+    # Raison d'arrêt de la DERNIÈRE réponse du modèle (0.22.0) : "stop" en temps
+    # normal ; "content_filter", "length" ou "malformed" disent qu'une sortie
+    # vide ou courte n'est PAS une vraie réponse. Voir `LLMResponse.finish_reason`.
+    finish_reason: str | None = None
 
 
 @dataclass
@@ -399,7 +405,7 @@ def _tool_message(call: ToolCall, tool_result: Any, *, untrusted: bool = False,
     if max_chars is not None:
         content, _ = _truncate_tool_result(content, max_chars)
     if untrusted:
-        content = f"{UNTRUSTED_OPEN}\n{content}\n{UNTRUSTED_CLOSE}"
+        content = frame_untrusted(content)
     return Message(
         role="tool",
         name=call.name,
@@ -622,6 +628,11 @@ class Agent:
             self.prune_batch = max(1, int(self.prune_batch))
         self.dynamic_builder: DynamicToolBuilder | None = None
         self._dynamic_tools_built_this_run = 0
+        self._python_runs_this_run = 0
+        # Noms des outils ÉCRITS PAR LE MODÈLE : eux seuls peuvent être remplacés
+        # par un nouvel outil généré (re-créer pour corriger). Un outil de l'hôte,
+        # jamais — voir `enable_dynamic_tools` (0.22.0).
+        self._dynamic_tool_names: set[str] = set()
         # Divulgation progressive (opt-in via enable_tool_search) : désactivée,
         # donc `_visible_specs` renvoie tout — comportement historique.
         self._tool_search = False
@@ -757,8 +768,23 @@ class Agent:
         visible = [s for s in specs if s.name == _FIND_TOOLS_NAME or s.name in keep]
         return visible
 
-    def enable_dynamic_tools(self, builder: DynamicToolBuilder) -> None:
+    def enable_dynamic_tools(
+        self,
+        builder: DynamicToolBuilder,
+        *,
+        host_functions: dict[str, Callable[..., Any]] | None = None,
+    ) -> None:
+        """Active le méta-outil `create_python_tool`.
+
+        ``host_functions`` (0.22.0) : callbacks de l'hôte appelables par les outils
+        générés via ``context["call_host"]`` (pont du bac à sable). Raccourci pour
+        ``builder.host_functions`` — voir `DynamicToolBuilder`. Liste blanche, et
+        chaque fonction tourne chez l'hôte sur des arguments choisis par le modèle.
+        """
+        if host_functions is not None:
+            builder.host_functions = dict(host_functions) or None
         self.dynamic_builder = builder
+        canal = _CanalDepense()
 
         def create_python_tool(
             capability: str,
@@ -772,15 +798,32 @@ class Agent:
                     f"(max_dynamic_tools_per_run={self.max_dynamic_tools_per_run}). "
                     "Reuse an existing tool or finish the task with what is available."
                 )
-            generated = builder.build(
-                ToolBuildRequest(
-                    capability=capability,
-                    tool_name=tool_name,
-                    input_schema=input_schema,
-                    permissions=permissions or [],
+            if tool_name:
+                self._refuse_host_tool_name(_safe_tool_name(tool_name))
+            try:
+                generated = builder.build(
+                    ToolBuildRequest(
+                        capability=capability,
+                        tool_name=tool_name,
+                        input_schema=input_schema,
+                        permissions=permissions or [],
+                    )
                 )
-            )
+            finally:
+                # L'appel au modèle constructeur est PAYÉ, que l'outil soit accepté
+                # ou refusé (self-test faux, JSON illisible…). Sans ce canal, ces
+                # jetons étaient invisibles à `token_budget` : mesuré +39 à +44 %
+                # de dépense réelle sur une tâche qui construit des outils.
+                canal.poser(getattr(builder, "last_build_usage", None))
+            # Le nom final peut venir du modèle constructeur : on revérifie, et
+            # un outil refusé ne reste pas chargeable sur le disque.
+            try:
+                self._refuse_host_tool_name(generated.spec.name)
+            except ToolError:
+                _discard_generated(generated)
+                raise
             self.registry.replace(generated.spec, generated)
+            self._dynamic_tool_names.add(generated.spec.name)
             self._dynamic_tools_built_this_run += 1
             return {
                 "registered": True,
@@ -792,10 +835,74 @@ class Agent:
                 },
             }
 
+        create_python_tool.__autoagent_usage_channel__ = canal  # type: ignore[attr-defined]
         self.registry.replace(
             spec=_create_python_tool_spec(),
             handler=create_python_tool,
         )
+        if getattr(builder, "persist", False):
+            self._charger_bibliotheque(builder)
+
+    def enable_run_python(
+        self,
+        runner: PythonRunner | None = None,
+        *,
+        max_runs_per_run: int = 10,
+    ) -> None:
+        """Ajoute l'outil `run_python` (0.22.0, opt-in) : le modèle exécute un extrait
+        de code ÉPHÉMÈRE — validé par l'AST, sandboxé, jamais gardé. Pour du code à
+        réutiliser, c'est `create_python_tool`. Sans permission (ni réseau ni fichiers)
+        sauf celles que l'hôte accorde dans le `PythonRunner`. `max_runs_per_run` borne
+        les appels par run (les échecs comptent). C'est l'outil le plus puissant que la
+        bibliothèque offre au modèle : mets-le sous `tool_policy`, et sous Docker pour
+        du code que tu ne maîtrises pas.
+        """
+        runner = runner or PythonRunner()
+        self.python_runner = runner
+        self.max_python_runs_per_run = max(1, int(max_runs_per_run))
+
+        def run_python(code: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
+            if self._python_runs_this_run >= self.max_python_runs_per_run:
+                raise ToolError(
+                    "run_python budget exhausted for this run "
+                    f"(max_runs_per_run={self.max_python_runs_per_run}). "
+                    "Finish the task with what you have."
+                )
+            self._python_runs_this_run += 1
+            return runner(code, args)
+
+        self.registry.replace(spec=_run_python_spec(runner.describe_host_functions()), handler=run_python)
+
+    def _charger_bibliotheque(self, builder: DynamicToolBuilder) -> None:
+        """Remet dans le registre les outils générés ACCEPTÉS lors de runs précédents
+        (`DynamicToolBuilder(persist=True)`, 0.22.0) — le modèle les voit comme les
+        autres et ne repaie pas le constructeur. Un outil ne remplace jamais un outil
+        de l'hôte ; les noms sont marqués dynamiques (recréables, jamais prioritaires).
+        Ils ne comptent pas dans `max_dynamic_tools_per_run` : rien n'est construit."""
+        for generated in builder.load_library():
+            nom = generated.spec.name
+            try:
+                self._refuse_host_tool_name(nom)
+            except ToolError:
+                _log.warning("library tool %r skipped: the name belongs to a host tool", nom)
+                continue
+            self.registry.replace(generated.spec, generated)
+            self._dynamic_tool_names.add(nom)
+
+    def _refuse_host_tool_name(self, name: str) -> None:
+        """Un outil écrit par le modèle ne remplace JAMAIS un outil de l'hôte (0.22.0).
+
+        `registry.replace` écrasait sans condition : le modèle (ou une injection
+        qui le pilote) créait un outil nommé `envoyer_mail`, et l'outil de l'hôte
+        disparaissait — remplacé par du code généré, sans le drapeau `egress` de
+        l'original, donc hors de portée de la garde trifecta. Seul un outil
+        lui-même généré peut être recréé sous le même nom.
+        """
+        if name in self.registry and name not in self._dynamic_tool_names:
+            raise ToolError(
+                f"The name `{name}` is already used by a tool of the host application "
+                "and cannot be replaced by a generated tool. Choose another name."
+            )
 
     def enable_evolution(
         self,
@@ -1047,13 +1154,30 @@ class Agent:
         """
         agent_self = self
 
+        canal = _CanalDepense()
+
         def handler(request: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
             # La dépense du sous-agent est REMISE À ZÉRO avant le run : ce qui
             # reste ici après un run raté ne doit pas être facturé au parent au
             # tour suivant.
-            handler.__autoagent_usage__ = None  # type: ignore[attr-defined]
-            result = agent_self.run(request, context=context)
-            payload: dict[str, Any] = {"output": result.output, "steps": result.steps}
+            canal.poser(None)
+            try:
+                result = agent_self.run(request, context=context)
+            except Exception as exc:
+                # Un sous-agent qui ÉCHOUE a dépensé aussi (0.22.0) : 5 étapes
+                # avant MaxStepsExceeded, c'est 5 appels payés. Rien ne remontait,
+                # et le parent pouvait relancer en boucle sous un `token_budget`
+                # aveugle. Les arrêts reprenables portent la dépense dans `.state`.
+                canal.poser(_depense_d_un_echec(exc))
+                raise
+            sortie = result.output
+            if is_tainted(result.messages):
+                # Le sous-agent a lu du contenu externe : sa réponse peut le
+                # citer. Sans ce cadre, déléguer LAVAIT la teinte — le parent
+                # redevenait « propre » et la garde trifecta laissait sortir
+                # l'envoi (0.22.0 ; `delegate_to` le faisait déjà).
+                sortie = frame_untrusted(sortie)
+            payload: dict[str, Any] = {"output": sortie, "steps": result.steps}
             if result.usage is not None:
                 payload["tokens"] = result.usage.total_tokens
             # Canal de retour vers la comptabilité du PARENT (0.19.0). Le chiffre
@@ -1061,10 +1185,10 @@ class Agent:
             # celui-ci est pour le CODE. Sans lui, un superviseur qui délègue
             # dépensait sans que `token_budget` ne voie rien passer — un plafond
             # qu'il suffisait de contourner en déléguant.
-            handler.__autoagent_usage__ = result.usage  # type: ignore[attr-defined]
+            canal.poser(result.usage)
             return payload
 
-        handler.__autoagent_usage__ = None  # type: ignore[attr-defined]
+        handler.__autoagent_usage_channel__ = canal  # type: ignore[attr-defined]
         handler.__name__ = name
         handler.__autoagent_tool_spec__ = ToolSpec(  # type: ignore[attr-defined]
             name=name,
@@ -1147,6 +1271,7 @@ class Agent:
                     messages=event.messages,
                     steps=event.steps,
                     usage=event.usage,
+                    finish_reason=event.finish_reason,
                 )
         raise AutoAgentError("agent loop ended without a result")  # pragma: no cover
 
@@ -1190,6 +1315,7 @@ class Agent:
                     messages=event.messages,
                     steps=event.steps,
                     usage=event.usage,
+                    finish_reason=event.finish_reason,
                 )
         raise AutoAgentError("agent loop ended without a result")  # pragma: no cover
 
@@ -1212,32 +1338,36 @@ class Agent:
                 checkpoint=checkpoint,
                 resume_from=state,
             )
-        except AgentCancelled as exc:
-            yield StreamEvent(type="error", error="cancelled", steps=getattr(exc, "step", 0))
-        except ApprovalRequired as exc:
-            state = getattr(exc, "state", None)
-            yield StreamEvent(
-                type="error",
-                error=f"approval_required: {exc}",
-                messages=getattr(state, "messages", []),
-                steps=getattr(state, "step", 0),
-                state=state,
-            )
-        except MaxStepsExceeded as exc:
-            yield StreamEvent(
-                type="error",
-                error=f"max_steps={self.max_steps} exceeded",
-                messages=getattr(exc, "messages", []),
-                steps=self.max_steps,
-            )
-        except TokenBudgetExceeded as exc:
-            yield StreamEvent(
+        except Exception as exc:
+            yield self._error_event(exc)
+
+    def _error_event(self, exc: Exception) -> StreamEvent:
+        """L'événement ``error`` terminal du streaming, pour UNE exception.
+
+        Les quatre arrêts reprenables (approbation, annulation, plafond
+        d'étapes, budget) portent un ``.state`` ; avant 0.22.0 seule la pause
+        d'approbation le transmettait — un hôte en streaming ne pouvait donc
+        pas reprendre après un budget épuisé, alors que le même run en
+        non-streaming le pouvait. ``state`` est désormais sur les quatre.
+        (Un seul endroit au lieu de deux blocs `except` recopiés.)
+        """
+        state = getattr(exc, "state", None)
+        if isinstance(exc, AgentCancelled):
+            return StreamEvent(type="error", error="cancelled", steps=getattr(exc, "step", 0),
+                               messages=getattr(state, "messages", []), state=state)
+        if isinstance(exc, ApprovalRequired):
+            return StreamEvent(type="error", error=f"approval_required: {exc}",
+                               messages=getattr(state, "messages", []),
+                               steps=getattr(state, "step", 0), state=state)
+        if isinstance(exc, MaxStepsExceeded):
+            return StreamEvent(type="error", error=f"max_steps={self.max_steps} exceeded",
+                               messages=getattr(exc, "messages", []), steps=self.max_steps, state=state)
+        if isinstance(exc, TokenBudgetExceeded):
+            return StreamEvent(
                 type="error",
                 error=f"token_budget={self.token_budget} exceeded (spent={getattr(exc, 'spent', '?')})",
-                messages=getattr(exc, "messages", []),
-            )
-        except Exception as exc:
-            yield StreamEvent(type="error", error=f"{type(exc).__name__}: {exc}")
+                messages=getattr(exc, "messages", []), steps=getattr(state, "step", 0), state=state)
+        return StreamEvent(type="error", error=f"{type(exc).__name__}: {exc}")
 
     def run_stream(
         self,
@@ -1288,32 +1418,8 @@ class Agent:
                 streaming=True,
                 checkpoint=checkpoint,
             )
-        except AgentCancelled as exc:
-            yield StreamEvent(type="error", error="cancelled", steps=getattr(exc, "step", 0))
-        except ApprovalRequired as exc:
-            state = getattr(exc, "state", None)
-            yield StreamEvent(
-                type="error",
-                error=f"approval_required: {exc}",
-                messages=getattr(state, "messages", []),
-                steps=getattr(state, "step", 0),
-                state=state,
-            )
-        except MaxStepsExceeded as exc:
-            yield StreamEvent(
-                type="error",
-                error=f"max_steps={self.max_steps} exceeded",
-                messages=getattr(exc, "messages", []),
-                steps=self.max_steps,
-            )
-        except TokenBudgetExceeded as exc:
-            yield StreamEvent(
-                type="error",
-                error=f"token_budget={self.token_budget} exceeded (spent={getattr(exc, 'spent', '?')})",
-                messages=getattr(exc, "messages", []),
-            )
         except Exception as exc:
-            yield StreamEvent(type="error", error=f"{type(exc).__name__}: {exc}")
+            yield self._error_event(exc)
 
     def _run_loop(
         self,
@@ -1351,6 +1457,7 @@ class Agent:
             except Exception:
                 _log.exception("memory.compact raised; using messages unchanged")
         self._dynamic_tools_built_this_run = 0
+        self._python_runs_this_run = 0
         # Divulgation progressive : les outils déjà révélés sont RE-DÉRIVÉS du
         # transcript, pas gardés en mémoire d'instance. Un `resume` après une
         # pause d'approbation retrouve donc ce que le modèle avait chargé, sans
@@ -1374,6 +1481,7 @@ class Agent:
         saw_cached = bool(resume_from and resume_from.cached_tokens)
         have_usage = resume_from.have_usage if resume_from else False
         start_step = (resume_from.step if resume_from else 0) + 1
+        relance_faite = False    # une seule relance par run après un appel d'outil mal formé
         # La compaction mémoire (résumé / extraction de faits) appelle SON
         # propre LLM. On compte ce coût dans le budget et l'usage rapporté —
         # sinon `token_budget` sous-estimait la dépense réelle (0.17).
@@ -1422,8 +1530,10 @@ class Agent:
             # `pending=True` : l'appel n'est pas encore dans le transcript ; la
             # garde anti-boucle le compte quand même, pour rendre le MÊME verdict
             # que la vérification réelle du tour (0.21.0).
-            refus = guards.builtin([call], step, req_span, pending=True)
-            refus.update(guards.policy([call], step, req_span))
+            # `dry=True` (0.22.0) : aucune trace, aucun compteur, aucune pause —
+            # le tour rendra le verdict officiel, une seule fois.
+            refus = guards.builtin([call], step, req_span, pending=True, dry=True)
+            refus.update(guards.policy([call], step, req_span, dry=True))
             if refus:
                 return
             if not en_avance_pool:
@@ -1533,12 +1643,12 @@ class Agent:
                 else:
                     result = self.registry.execute(call, context=context)
                 duration_ms = int((time.monotonic() - started_at) * 1000)
-                handler = self.registry.handler_for(call.name)
-                delegue = getattr(handler, "__autoagent_usage__", None)
-                if delegue is not None and handler is not None:
-                    # Consommé : un deuxième appel du même outil ne doit pas
-                    # refacturer la dépense du premier.
-                    handler.__autoagent_usage__ = None
+                # Consommé (prendre = lire et vider) : un deuxième appel du même
+                # outil ne doit pas refacturer la dépense du premier. Le canal
+                # est PAR THREAD : en `parallel_tool_calls`, deux appels du même
+                # spécialiste ne s'écrasent plus leur dépense (0.22.0).
+                canal = getattr(self.registry.handler_for(call.name), "__autoagent_usage_channel__", None)
+                delegue = canal.prendre() if canal is not None else None
                 return result, duration_ms, delegue
 
             if self.parallel_tool_calls and len(calls) > 1:
@@ -1735,6 +1845,7 @@ class Agent:
                         "has_reasoning": response.reasoning_content is not None,
                         "input_tokens": response.usage.input_tokens if response.usage else None,
                         "output_tokens": response.usage.output_tokens if response.usage else None,
+                        "finish_reason": response.finish_reason,
                     },
                     parent_id=req_span,
                 )
@@ -1745,6 +1856,20 @@ class Agent:
                     if response.usage.cached_tokens is not None:
                         spent_cached += response.usage.cached_tokens
                         saw_cached = True
+                vide = not response.tool_calls and not (response.content or "").strip()
+                if vide and response.finish_reason == "malformed" and not relance_faite:
+                    # Appel d'outil que le fournisseur n'a pas su former
+                    # (MALFORMED_FUNCTION_CALL chez Gemini) : la réponse arrive
+                    # VIDE et finissait le run en « succès » (0.22.0). C'est un
+                    # raté passager du modèle — on redemande UNE fois, l'étape
+                    # est consommée (max_steps tient), la trace le dit.
+                    relance_faite = True
+                    self._emit("llm_retry", {"step": step, "finish_reason": response.finish_reason},
+                               parent_id=req_span)
+                    continue
+                if vide and response.finish_reason in ("content_filter", "length", "malformed"):
+                    _log.warning("empty model answer ends the run (finish_reason=%s) — check "
+                                 "result.finish_reason before using the output", response.finish_reason)
                 working_messages.append(
                     Message(
                         role="assistant",
@@ -1774,6 +1899,7 @@ class Agent:
                             "status": "ok",
                             "steps": step,
                             "output_preview": truncate_preview(response.content),
+                            "finish_reason": response.finish_reason,
                         }),
                         parent_id=run_span,
                     )
@@ -1782,6 +1908,7 @@ class Agent:
                         output=response.content,
                         messages=working_messages,
                         steps=step,
+                        finish_reason=response.finish_reason,
                         usage=(
                             TokenUsage(input_tokens=spent_in, output_tokens=spent_out,
                                        cached_tokens=spent_cached if saw_cached
@@ -1949,6 +2076,43 @@ class Agent:
         return correction
 
 
+class _CanalDepense:
+    """Canal de retour de la dépense d'un SOUS-AGENT vers la comptabilité du parent.
+
+    Par THREAD (0.22.0) : l'ancien canal était un attribut de la fonction-outil,
+    partagé — avec `parallel_tool_calls`, deux appels du même spécialiste dans un
+    tour écrivaient au même endroit et l'une des deux dépenses se perdait. Le
+    handler et la lecture (`_timed`) tournent dans le même thread : chacun lit
+    exactement ce que son propre appel a posé.
+    """
+
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    def poser(self, usage: TokenUsage | None) -> None:
+        self._local.usage = usage
+
+    def prendre(self) -> TokenUsage | None:
+        usage = getattr(self._local, "usage", None)
+        self._local.usage = None
+        return usage
+
+
+def _depense_d_un_echec(exc: BaseException) -> TokenUsage | None:
+    """La dépense d'un run qui a ÉCHOUÉ, quand l'exception la porte.
+
+    Les arrêts reprenables (`MaxStepsExceeded`, `TokenBudgetExceeded`,
+    `AgentCancelled`, `ApprovalRequired`) attachent un `RunState` avec les
+    jetons déjà dépensés. Une erreur de fournisseur en plein run n'en porte pas :
+    cette part reste inconnue — on ne l'invente pas.
+    """
+    state = getattr(exc, "state", None)
+    if state is None or not getattr(state, "have_usage", False):
+        return None
+    return TokenUsage(input_tokens=state.input_tokens, output_tokens=state.output_tokens,
+                      cached_tokens=state.cached_tokens or None)
+
+
 def _create_python_tool_spec():
     from .schema import ToolSpec
 
@@ -1980,6 +2144,36 @@ def _create_python_tool_spec():
                 },
             },
             "required": ["capability"],
+            "additionalProperties": False,
+        },
+        permissions=[],
+    )
+
+
+def _run_python_spec(host_functions_text: str = ""):
+    from .schema import ToolSpec
+
+    return ToolSpec(
+        name="run_python",
+        description=(
+            "Run a small self-contained Python snippet in a sandbox and get its result. "
+            "The code must define `def run(args, context):` returning JSON-serializable data. "
+            "No network, no files, no shell. Nothing is kept after the call: use "
+            "create_python_tool for a reusable tool." + host_functions_text
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Python source defining def run(args, context): ...",
+                },
+                "args": {
+                    "type": "object",
+                    "description": "Optional JSON object handed to run() as `args`.",
+                },
+            },
+            "required": ["code"],
             "additionalProperties": False,
         },
         permissions=[],
@@ -2043,13 +2237,14 @@ def delegate_to(
         try:
             resultat = agent.run(demande, context=context)
         except Exception as exc:                       # remonte au LLM, pas au parent
-            return {"specialist": cible, "error": f"{type(exc).__name__}: {exc}"}, None
+            # …mais sa DÉPENSE remonte au parent (0.22.0), comme pour `as_tool`.
+            return {"specialist": cible, "error": f"{type(exc).__name__}: {exc}"}, _depense_d_un_echec(exc)
         sortie = resultat.output
         if is_tainted(resultat.messages):
             # Le spécialiste a lu du contenu externe : sa sortie peut le citer.
             # Sans ce cadre, déléguer LAVERAIT la teinte — le run parent
             # redeviendrait « propre » et la garde trifecta se désarmerait.
-            sortie = "\n".join([UNTRUSTED_OPEN, sortie, UNTRUSTED_CLOSE])
+            sortie = frame_untrusted(sortie)
         reponse: dict[str, Any] = {
             "specialist": cible,
             "output": sortie,
@@ -2059,9 +2254,11 @@ def delegate_to(
             reponse["tokens"] = resultat.usage.total_tokens
         return reponse, resultat.usage
 
+    canal = _CanalDepense()
+
     def handler(requests: list[dict[str, Any]],
                 context: dict[str, Any] | None = None) -> dict[str, Any]:
-        handler.__autoagent_usage__ = None             # type: ignore[attr-defined]
+        canal.poser(None)
         if not isinstance(requests, list) or not requests:
             return {"responses": [], "error": "`requests` must be a non-empty list."}
 
@@ -2112,12 +2309,11 @@ def delegate_to(
                 cache += usage.cached_tokens
                 vu_cache = True
         if vu:
-            handler.__autoagent_usage__ = TokenUsage(   # type: ignore[attr-defined]
-                input_tokens=entree, output_tokens=sortie,
-                cached_tokens=cache if vu_cache else None)
+            canal.poser(TokenUsage(input_tokens=entree, output_tokens=sortie,
+                                   cached_tokens=cache if vu_cache else None))
         return {"responses": reponses, "tokens": entree + sortie if vu else None}
 
-    handler.__autoagent_usage__ = None                 # type: ignore[attr-defined]
+    handler.__autoagent_usage_channel__ = canal        # type: ignore[attr-defined]
     handler.__name__ = name
     handler.__autoagent_tool_spec__ = ToolSpec(        # type: ignore[attr-defined]
         name=name,

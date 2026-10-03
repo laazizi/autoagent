@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 import shutil
@@ -8,7 +9,8 @@ import subprocess
 import sys
 import threading
 import uuid
-from dataclasses import dataclass
+import weakref
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -18,6 +20,7 @@ from .schema import JsonDict, ToolSpec
 __all__ = [
     "ALWAYS_BANNED_CALLS",
     "ALWAYS_BANNED_MODULES",
+    "ATTRIBUTE_BANNED_CALLS",
     "DANGEROUS_NAMES",
     "DockerSandbox",
     "FILESYSTEM_MODULES",
@@ -25,10 +28,12 @@ __all__ = [
     "NETWORK_MODULES",
     "PROCESS_SPAWN_CALLS",
     "SubprocessSandbox",
+    "discard_generated_tool",
     "docker_available",
     "extract_tool_metadata",
     "load_generated_tool",
     "make_sandbox",
+    "safe_environment",
     "validate_generated_tool_code",
 ]
 
@@ -125,16 +130,196 @@ except Exception as exc:
 """
 
 
+# ---------------------------------------------------------------------------
+# Warm worker (0.22.0) — one persistent Python process per tool, so the ~115 ms
+# interpreter start-up is paid once, not at every call. Opt-in
+# (`SubprocessSandbox(warm=True)`). Line-delimited JSON over the child's stdio:
+#   host→child : {"code":..., "path":...}               (once, at spawn)
+#   child→host : {"t":"ready"} | {"t":"init_error",...}
+#   host→child : {"args":{...},"context":{...}}         (one line per call)
+#   child→host : {"t":"result","ok":...,"result":...}
+# ---------------------------------------------------------------------------
+
+_WARM_RUNNER_CODE = r"""
+import contextlib
+import io
+import json
+import sys
+import traceback
+import types
+
+_REAL_STDOUT = sys.stdout  # saved before run() redirects stdout to a buffer
+
+
+def _emit(obj):
+    _REAL_STDOUT.write(json.dumps(obj, default=repr) + "\n")
+    _REAL_STDOUT.flush()
+
+
+init = json.loads(sys.stdin.readline() or "{}")
+module = types.ModuleType("generated_tool")
+try:
+    exec(compile(init.get("code", ""), init.get("path", "generated_tool"), "exec"), module.__dict__)
+    if not callable(getattr(module, "run", None)):
+        raise RuntimeError("generated tool defines no run(args, context)")
+    _emit({"t": "ready"})
+except Exception as exc:
+    _emit({"t": "init_error", "error": "%s: %s" % (type(exc).__name__, exc)})
+    sys.exit(0)
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    request = json.loads(line)
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result = module.run(request.get("args", {}), request.get("context", {}))
+        _emit({"t": "result", "ok": True, "result": result, "stdout": buf.getvalue()})
+    except Exception as exc:
+        _emit({
+            "t": "result",
+            "ok": False,
+            "error": "%s: %s" % (type(exc).__name__, exc),
+            "traceback": traceback.format_exc(limit=8),
+        })
+"""
+
+
+class _WarmWorker:
+    """Un processus Python persistant qui sert les appels d'UN outil, un à la fois.
+
+    Recyclé après ``max_calls`` appels (l'état des variables globales de l'outil
+    survit d'un appel à l'autre dans un même worker : on borne cette durée), et
+    TUÉ puis relancé au dépassement du délai — un outil qui boucle ne bloque
+    jamais le suivant. Environnement épuré comme en mode normal."""
+
+    def __init__(self, path: Path, code: str, sha: str, timeout: float, max_calls: int) -> None:
+        self.path, self.code, self.sha = path, code, sha
+        self.timeout, self.max_calls = timeout, max_calls
+        self.calls = 0
+        self.proc: subprocess.Popen[str] | None = None
+        self.verrou = threading.Lock()
+        self._stderr: list[str] = []
+
+    # -- cycle de vie -------------------------------------------------------
+
+    def _lire_ligne(self, proc: subprocess.Popen[str]) -> str:
+        """Une ligne du worker, sous délai : au dépassement le processus est tué."""
+        minuteur = threading.Timer(self.timeout, proc.kill)
+        minuteur.start()
+        try:
+            assert proc.stdout is not None
+            return proc.stdout.readline()
+        finally:
+            minuteur.cancel()
+
+    def _demarrer(self) -> None:
+        proc = subprocess.Popen(
+            [sys.executable, "-X", "utf8", "-I", "-S", "-B", "-u", "-c", _WARM_RUNNER_CODE],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", bufsize=1,
+            env=_child_env(), cwd=str(self.path.parent),
+        )
+        self._stderr = []
+        threading.Thread(target=lambda: self._stderr.extend(proc.stderr or []), daemon=True).start()
+        self.proc, self.calls = proc, 0
+        try:
+            assert proc.stdin is not None
+            proc.stdin.write(json.dumps({"code": self.code, "path": str(self.path)}, ensure_ascii=False) + "\n")
+            proc.stdin.flush()
+            ligne = self._lire_ligne(proc)
+            msg = json.loads(ligne) if ligne.strip() else {}
+        except (OSError, ValueError) as exc:
+            self.arreter()
+            raise ToolError(f"Warm worker failed to start: {exc}") from exc
+        if msg.get("t") != "ready":
+            erreur = msg.get("error") or f"no handshake. stderr={''.join(self._stderr)[:300]!r}"
+            self.arreter()
+            raise ToolError(f"Generated tool failed to load: {erreur}")
+
+    def arreter(self) -> None:
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        for flux in (proc.stdout, proc.stderr):
+            try:
+                if flux:
+                    flux.close()
+            except OSError:
+                pass
+
+    # -- un appel -----------------------------------------------------------
+
+    def appeler(self, args: JsonDict, context: JsonDict) -> JsonDict:
+        with self.verrou:
+            if self.proc is None or self.proc.poll() is not None or self.calls >= self.max_calls:
+                self.arreter()
+                self._demarrer()
+            proc = self.proc
+            assert proc is not None and proc.stdin is not None
+            requete = json.dumps({"args": args, "context": context}, ensure_ascii=False)
+            try:
+                proc.stdin.write(requete + "\n")
+                proc.stdin.flush()
+            except OSError as exc:
+                self.arreter()
+                raise ToolError(f"Warm worker is gone ({exc}); the next call starts a fresh one") from exc
+            ligne = self._lire_ligne(proc)
+            self.calls += 1
+            if not ligne:
+                # Délai dépassé (processus tué) ou mort : le suivant repart à neuf.
+                self.arreter()
+                raise ToolError(
+                    f"Generated tool timed out after {self.timeout}s (or ended without a result). "
+                    f"stderr={''.join(self._stderr)[:300]!r}"
+                )
+            try:
+                msg = json.loads(ligne)
+            except json.JSONDecodeError as exc:
+                self.arreter()
+                raise ToolError(f"Sandbox protocol error on line {ligne[:200]!r}") from exc
+            return {k: v for k, v in msg.items() if k != "t"}
+
+
+def _fermer_workers(workers: dict[str, _WarmWorker]) -> None:
+    for worker in list(workers.values()):
+        worker.arreter()
+    workers.clear()
+
+
 def _drive_bridge(
     cmd: list[str],
     init_payload: dict[str, Any],
     host_functions: dict[str, Callable[..., Any]],
     timeout: float,
-    on_timeout: Callable[[], None] | None = None,
+    on_timeout: Callable[[], Any] | None = None,
+    *,
+    env: dict[str, str] | None = None,
+    cwd: str | None = None,
 ) -> JsonDict:
     """Run the interactive runner and service host_function calls until the
     tool returns. Each call name MUST be in ``host_functions`` or it is
-    refused — so a tool can only reach the callbacks the host whitelisted."""
+    refused — so a tool can only reach the callbacks the host whitelisted.
+
+    ``env``/``cwd`` : le mode pont du `SubprocessSandbox` héritait de TOUT
+    l'environnement de l'hôte (clés API comprises) et de son répertoire courant,
+    alors que le mode normal les retire déjà (0.22.0). Le chemin Docker passe
+    ``env=None`` : c'est la CLI docker qui en a besoin, le conteneur, lui, ne
+    reçoit que ses `-e` explicites."""
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
@@ -143,6 +328,8 @@ def _drive_bridge(
         text=True,
         encoding="utf-8",
         bufsize=1,
+        env=env,
+        cwd=cwd,
     )
     stderr_chunks: list[str] = []
     drainer = threading.Thread(target=lambda: stderr_chunks.extend(proc.stderr or []), daemon=True)
@@ -153,7 +340,7 @@ def _drive_bridge(
         timed_out["value"] = True
         try:
             proc.kill()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         if on_timeout:
             on_timeout()
@@ -185,7 +372,7 @@ def _drive_bridge(
                 else:
                     try:
                         resp = {"ok": True, "result": fn(**(msg.get("args") or {}))}
-                    except Exception as exc:  # noqa: BLE001
+                    except Exception as exc:
                         resp = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
                 proc.stdin.write(json.dumps(resp, ensure_ascii=False, default=repr) + "\n")
                 proc.stdin.flush()
@@ -199,14 +386,23 @@ def _drive_bridge(
             if proc.stdin:
                 proc.stdin.close()
             proc.wait(timeout=5)
-        except Exception:  # noqa: BLE001
+        except Exception:
             try:
                 proc.kill()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
 
 
 ALWAYS_BANNED_CALLS = {"eval", "exec", "compile", "__import__", "input", "breakpoint"}
+
+# Les mêmes noms, mais atteints par ATTRIBUT (``x.compile(...)``). ``compile``
+# en est RETIRÉ : ``re.compile`` est l'usage le plus courant d'un outil légitime
+# (regex précompilée) et était refusé à tort (0.22.0). Le ``compile`` NU reste
+# interdit (il est toujours dans ALWAYS_BANNED_CALLS, testé sur un ``ast.Name``),
+# et l'accès au vrai ``compile`` du runtime passe par ``builtins`` /
+# ``__builtins__``, tous deux bannis — l'attribut ``.compile`` d'un autre objet
+# n'est donc pas une porte vers l'exécution de code.
+ATTRIBUTE_BANNED_CALLS = ALWAYS_BANNED_CALLS - {"compile"}
 
 # Process-spawning / OS-exec call names. Reachable through ``os.*`` / ``posix.*``
 # (which also bypass the subprocess ban) and via attribute access on arbitrary
@@ -229,6 +425,9 @@ PROCESS_SPAWN_CALLS = {
 ALWAYS_BANNED_MODULES = {
     "subprocess", "ctypes", "multiprocessing", "signal", "importlib",
     "os", "posix", "nt", "sys", "pty",
+    # ``import builtins`` rendait ``builtins.exec`` / ``.eval`` / ``.__import__``
+    # alors que ``exec`` nu était refusé — contournement trivial (0.22.0).
+    "builtins",
 }
 NETWORK_MODULES = {"socket", "urllib", "http", "ftplib", "smtplib", "imaplib", "poplib", "requests"}
 FILESYSTEM_MODULES = {"pathlib", "glob", "shutil", "tempfile"}
@@ -269,7 +468,65 @@ DANGEROUS_NAMES = {
 
 @dataclass
 class SubprocessSandbox:
+    """Exécute un outil généré dans un sous-processus Python ``-I -S``, env épuré.
+
+    ``warm=True`` (0.22.0, opt-in) : UN worker persistant par outil au lieu d'un
+    processus par appel — le démarrage de l'interpréteur (~115 ms mesurés) n'est
+    payé qu'une fois. Contreparties, dites : les variables GLOBALES d'un outil
+    survivent d'un appel à l'autre dans un même worker (borné par
+    ``warm_max_calls`` : le worker est recyclé ensuite) ; les appels d'un même
+    outil sont sérialisés ; avec ``host_functions`` (pont) on garde le processus
+    par appel. Un dépassement de délai TUE le worker, le suivant repart à neuf.
+    ``warm_max_workers`` plafonne les processus vivants (le plus ancien est fermé).
+    Appelle ``close()`` (ou utilise ``with``) pour fermer les workers ; sinon ils
+    sont fermés à la sortie du processus.
+    """
+
     timeout: float = 10.0
+    warm: bool = False
+    warm_max_calls: int = 200
+    warm_max_workers: int = 8
+    _workers: dict[str, _WarmWorker] = field(default_factory=dict, init=False, repr=False, compare=False)
+    _verrou: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        # Fermeture garantie à la sortie, sans référencer `self` (sinon il ne
+        # serait jamais ramassé) : on ne passe que le dictionnaire des workers.
+        weakref.finalize(self, _fermer_workers, self._workers)
+
+    def close(self) -> None:
+        """Ferme tous les workers chauds (sans effet hors ``warm=True``)."""
+        with self._verrou:
+            _fermer_workers(self._workers)
+
+    def __enter__(self) -> "SubprocessSandbox":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def _run_warm(self, path: Path, args: JsonDict, context: JsonDict) -> JsonDict:
+        code = path.read_text(encoding="utf-8")
+        sha = hashlib.sha256(code.encode("utf-8")).hexdigest()
+        cle = str(path)
+        a_fermer: list[_WarmWorker] = []
+        with self._verrou:
+            # Retrait PUIS réinsertion dans la même section critique : aucun autre
+            # thread ne voit l'outil « absent » et n'en crée un second ; réinséré, le
+            # plus récemment utilisé passe en queue (l'éviction prend la tête).
+            worker = self._workers.pop(cle, None)
+            if worker is not None and worker.sha != sha:
+                a_fermer.append(worker)            # fichier réécrit : on ne sert pas l'ancien code
+                worker = None
+            if worker is None:
+                while len(self._workers) >= max(1, self.warm_max_workers):
+                    a_fermer.append(self._workers.pop(next(iter(self._workers))))
+                worker = _WarmWorker(path, code, sha, self.timeout, max(1, self.warm_max_calls))
+            self._workers[cle] = worker
+        for ancien in a_fermer:                    # hors du verrou global ; attend l'appel en cours
+            with ancien.verrou:
+                ancien.arreter()
+        return worker.appeler(args, context)
 
     def run_python_tool(
         self,
@@ -290,8 +547,11 @@ class SubprocessSandbox:
             code = path.read_text(encoding="utf-8")
             cmd = [sys.executable, "-X", "utf8", "-I", "-S", "-u", "-c", _BRIDGE_RUNNER_CODE]
             return _drive_bridge(
-                cmd, {"code": code, "args": args, "context": context or {}}, host_functions, self.timeout
+                cmd, {"code": code, "args": args, "context": context or {}}, host_functions, self.timeout,
+                env=_child_env(), cwd=str(path.parent),
             )
+        if self.warm:
+            return self._run_warm(path, args, context or {})
         payload = json.dumps({"args": args, "context": context or {}}, ensure_ascii=False)
         try:
             completed = subprocess.run(
@@ -325,6 +585,21 @@ class GeneratedPythonTool:
     spec: ToolSpec
     file_path: Path
     sandbox: "SubprocessSandbox | DockerSandbox"
+    # Crochet d'observation (0.22.0) : `observer(nom, ok, erreur)` après CHAQUE
+    # appel — la bibliothèque persistante y compte les appels et les erreurs.
+    # Observabilité = fail-open : un crochet qui plante ne casse jamais l'appel.
+    observer: "Callable[[str, bool, str | None], None] | None" = None
+    # Fonctions de l'hôte rendues appelables depuis l'outil (pont, 0.22.0) ; un
+    # `host_functions=` passé à l'appel est prioritaire.
+    host_functions: "dict[str, Callable[..., Any]] | None" = None
+
+    # Lu par le registre : un outil écrit par le modèle ne reçoit PAS le `context`
+    # du run (0.22.0). Il partait tel quel dans le bac à sable — l'id utilisateur,
+    # un jeton, un handle de base — et un handle non sérialisable faisait échouer
+    # TOUS les outils générés (`TypeError: not JSON serializable`). C'est le
+    # modèle de confiance déjà écrit dans `approval.py` : en bac à sable, aucun
+    # objet de l'hôte ; l'accès passe par les `host_functions` en liste blanche.
+    __autoagent_sandboxed__ = True
 
     def __call__(
         self,
@@ -334,16 +609,29 @@ class GeneratedPythonTool:
         **kwargs: Any,
     ) -> Any:
         allow_network = "network" in (self.spec.permissions or [])
-        result = self.sandbox.run_python_tool(
-            self.file_path,
-            kwargs,
-            context=context,
-            allow_network=allow_network,
-            host_functions=host_functions,
-        )
-        if not result.get("ok"):
-            raise ToolError(result.get("error") or "Generated tool failed")
+        try:
+            result = self.sandbox.run_python_tool(
+                self.file_path,
+                kwargs,
+                context=context,
+                allow_network=allow_network,
+                host_functions=host_functions if host_functions is not None else self.host_functions,
+            )
+            if not result.get("ok"):
+                raise ToolError(result.get("error") or "Generated tool failed")
+        except Exception as exc:
+            self._observer_dit(False, f"{type(exc).__name__}: {exc}")
+            raise
+        self._observer_dit(True, None)
         return result.get("result")
+
+    def _observer_dit(self, ok: bool, erreur: str | None) -> None:
+        if self.observer is None:
+            return
+        try:
+            self.observer(self.spec.name, ok, erreur)
+        except Exception:                                   # fail-open
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +691,32 @@ def _child_env() -> dict[str, str]:
     return {var: os.environ[var] for var in keep if var in os.environ}
 
 
+# Variables qu'un processus tiers peut hériter sans risque : la liste EXACTE du
+# SDK MCP officiel (`mcp.client.stdio.DEFAULT_INHERITED_ENV_VARS`). Tout le
+# reste — clés API, mots de passe de base, jetons — n'a rien à faire chez un
+# serveur MCP tiers ni dans une commande qui exécute du code écrit par le modèle.
+_SAFE_INHERITED_ENV = (
+    ("APPDATA", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "PATH", "PATHEXT",
+     "PROCESSOR_ARCHITECTURE", "SYSTEMDRIVE", "SYSTEMROOT", "TEMP", "USERNAME", "USERPROFILE")
+    if os.name == "nt"
+    else ("HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER")
+)
+
+
+def safe_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """L'environnement minimal hérité, plus ``extra`` (0.22.0).
+
+    Même règle que le SDK MCP officiel : on ne garde que les variables
+    système inoffensives, en écartant les fonctions bash exportées (valeurs
+    commençant par ``()``), puis on ajoute ce que l'hôte passe EXPLICITEMENT.
+    """
+    env = {k: v for k in _SAFE_INHERITED_ENV
+           if (v := os.environ.get(k)) is not None and not v.startswith("()")}
+    if extra:
+        env.update(extra)
+    return env
+
+
 def docker_available() -> bool:
     """True if a working Docker daemon running LINUX containers is
     reachable (cached once). Lets the host fall back to SubprocessSandbox
@@ -424,7 +738,7 @@ def docker_available() -> bool:
                     done.returncode == 0
                     and done.stdout.strip().lower() == b"linux"
                 )
-            except Exception:  # noqa: BLE001
+            except Exception:
                 _DOCKER_STATE["available"] = False
     return _DOCKER_STATE["available"]
 
@@ -526,6 +840,26 @@ class DockerSandbox:
         return parsed
 
 
+def discard_generated_tool(tool: GeneratedPythonTool | Path) -> None:
+    """Un outil refusé ne doit pas rester chargeable : on le retire du disque —
+    son bytecode aussi, sinon un essai suivant de même nom, même taille et même
+    seconde exécuterait le code REFUSÉ (vu en CI). Partagé par la synthèse et
+    `create_python_tool` (0.22.0).
+
+    Accepte un ``GeneratedPythonTool`` OU un ``Path`` : un outil peut être refusé
+    AVANT d'être chargé (self-tests qui plantent, chargement qui échoue), où seul
+    le chemin existe (0.22.0)."""
+    path = tool if isinstance(tool, Path) else tool.file_path
+    try:
+        path.unlink(missing_ok=True)
+        cache = path.parent / "__pycache__"
+        if cache.is_dir():
+            for pyc in cache.glob(f"{path.stem}.*.pyc"):
+                pyc.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def make_sandbox(
     *, prefer_docker: bool = True, timeout: float = 10.0, image: str = "python:3.11-slim"
 ) -> "SubprocessSandbox | DockerSandbox":
@@ -591,6 +925,21 @@ def validate_generated_tool_code(code: str, permissions: list[str] | None = None
             raise ToolValidationError(f"Reference to dangerous identifier is not allowed: {node.id}")
         if isinstance(node, ast.Attribute) and node.attr in DANGEROUS_NAMES:
             raise ToolValidationError(f"Reference to dangerous attribute is not allowed: {node.attr}")
+        # Un module interdit à l'IMPORT restait joignable par ATTRIBUT : presque
+        # tout module de la stdlib importe `os` et l'expose (`logging.os`,
+        # `platform.os`, `random._os`…). `logging.os.remove(...)` effaçait un
+        # fichier sans aucune permission, alors que `import os` était refusé
+        # (0.22.0). Même règle pour les modules réseau / fichiers sans la
+        # permission correspondante. Le validateur reste une liste d'interdits —
+        # la vraie frontière est le DockerSandbox.
+        if isinstance(node, ast.Attribute):
+            attr = node.attr.lstrip("_")
+            if attr in ALWAYS_BANNED_MODULES:
+                raise ToolValidationError(f"Access to module `{node.attr}` through an attribute is not allowed")
+            if not allow_network and attr in NETWORK_MODULES:
+                raise ToolValidationError(f"Network module `{node.attr}` requires 'network' permission")
+            if not allow_filesystem and attr in FILESYSTEM_MODULES:
+                raise ToolValidationError(f"Filesystem module `{node.attr}` requires a filesystem.* permission")
 
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             module_names = _imported_module_names(node)
@@ -606,7 +955,12 @@ def validate_generated_tool_code(code: str, permissions: list[str] | None = None
                     )
         elif isinstance(node, ast.Call):
             call_name = _call_name(node.func)
-            if call_name in ALWAYS_BANNED_CALLS:
+            # Un appel NU (``compile(...)``) : toute la liste s'applique. Un appel
+            # par ATTRIBUT (``re.compile(...)``) : ``compile`` est toléré, le reste
+            # non. _call_name ne distingue pas les deux ; on teste le type du nœud.
+            if isinstance(node.func, ast.Name) and call_name in ALWAYS_BANNED_CALLS:
+                raise ToolValidationError(f"Call is not allowed: {call_name}")
+            if isinstance(node.func, ast.Attribute) and call_name in ATTRIBUTE_BANNED_CALLS:
                 raise ToolValidationError(f"Call is not allowed: {call_name}")
             if call_name == "open" and not allow_filesystem:
                 raise ToolValidationError("open() requires a filesystem.* permission")

@@ -96,6 +96,12 @@ class TurnGuards:
         # les compter aussi — sinon deux appels identiques d'un même tour
         # partiraient tous deux en avance pour être refusés ensuite.
         self._pending: dict[str, int] = {}
+        # Verdicts de la politique de l'hôte rendus pendant l'exécution
+        # anticipée, par call.id (0.22.0). La politique est un callable de
+        # l'HÔTE, parfois à effet de bord (quota, compteur, journal d'audit) :
+        # l'appeler deux fois pour le même appel — en avance, puis au tour —
+        # comptait double. Une décision par appel, réutilisée par le tour.
+        self._verdicts: dict[str, str | None] = {}
 
     # ── anti-boucle ──────────────────────────────────────────────────────────
 
@@ -112,7 +118,8 @@ class TurnGuards:
         self._seen_len = len(self.messages)
 
     def loop_guard(
-        self, calls: list[ToolCall], step: int, req_span: str | None, *, pending: bool = False
+        self, calls: list[ToolCall], step: int, req_span: str | None, *, pending: bool = False,
+        dry: bool = False,
     ) -> dict[str, ToolResult]:
         """Refuse a tool call the model has already made IDENTICALLY N times.
 
@@ -158,16 +165,19 @@ class TurnGuards:
                     f"report what you have."
                 ),
             )
-            agent._emit(
-                "loop_guard_would_block" if agent.shadow_guards else "loop_guard_block",
-                {"step": step, "name": call.name, "call_id": call.id, "repeats": seen},
-                parent_id=req_span,
-            )
+            if not dry:   # la vérification anticipée ne trace pas : le tour le fera, une fois
+                agent._emit(
+                    "loop_guard_would_block" if agent.shadow_guards else "loop_guard_block",
+                    {"step": step, "name": call.name, "call_id": call.id, "repeats": seen},
+                    parent_id=req_span,
+                )
         return overrides
 
     # ── trifecta ─────────────────────────────────────────────────────────────
 
-    def trifecta(self, calls: list[ToolCall], step: int, req_span: str | None) -> dict[str, ToolResult]:
+    def trifecta(
+        self, calls: list[ToolCall], step: int, req_span: str | None, *, dry: bool = False
+    ) -> dict[str, ToolResult]:
         """Block an EGRESS tool once the run has ingested untrusted content.
 
         The lethal trifecta made concrete: private data + untrusted content +
@@ -188,6 +198,13 @@ class TurnGuards:
             return overrides                      # rien d'externe n'est entré
         for call in calls:
             if not agent._is_egress(call):
+                continue
+            if dry:
+                # Vérification anticipée : JAMAIS de pause ici. L'appel n'est pas
+                # encore au transcript — un snapshot pris maintenant le perdrait
+                # et la reprise ne retrouverait rien à approuver. On s'abstient
+                # de lancer ; le tour, lui, mettra en pause avec le bon snapshot.
+                overrides[call.id] = ToolResult(ok=False, error="EgressBlocked")
                 continue
             if agent.trifecta_guard == "approve":
                 pause = ApprovalRequired(
@@ -220,13 +237,21 @@ class TurnGuards:
 
     # ── politique de l'hôte ──────────────────────────────────────────────────
 
-    def policy(self, calls: list[ToolCall], step: int, req_span: str | None) -> dict[str, ToolResult]:
+    def policy(
+        self, calls: list[ToolCall], step: int, req_span: str | None, *, dry: bool = False
+    ) -> dict[str, ToolResult]:
         """Consult tool_policy for the WHOLE turn before any side effect.
 
         Returns {call_id: denial ToolResult} for denied calls. Raises
         ApprovalRequired (with a resumable snapshot attached) BEFORE
         anything of the turn has executed — a pause must never land
         after a side effect.
+
+        ``dry=True`` (exécution anticipée, 0.22.0) : aucune trace, aucune pause
+        — une demande d'approbation empêche seulement le lancement anticipé, et
+        le tour la reposera avec le bon snapshot. Un verdict rendu (autorise ou
+        refuse) est MÉMORISÉ par call.id et réutilisé par le tour : la
+        politique de l'hôte n'est appelée qu'une fois par appel.
         """
         from .agent import ToolPolicyContext  # import paresseux : évite le cycle
 
@@ -236,6 +261,11 @@ class TurnGuards:
             return overrides
         tainted = self.taint[0] or is_tainted(self.messages)  # état AVANT le tour
         for call in calls:
+            if not dry and call.id in self._verdicts:
+                verdict = self._verdicts.pop(call.id)       # décidé pendant le flux
+                if verdict is not None:
+                    self._deny(overrides, call, step, req_span, verdict)
+                continue
             spec = next((s for s in agent.registry.specs() if s.name == call.name), None)
             policy_ctx = ToolPolicyContext(
                 call=call, spec=spec, step=step,
@@ -246,6 +276,9 @@ class TurnGuards:
             try:
                 verdict = agent.tool_policy(policy_ctx)
             except ApprovalRequired as pause:
+                if dry:
+                    overrides[call.id] = ToolResult(ok=False, error="ApprovalRequired")
+                    continue
                 pause.state = self.snapshot(step)  # LLM call done, zero tools executed
                 pause.calls = list(calls)
                 agent._emit(
@@ -265,30 +298,45 @@ class TurnGuards:
                 # checkpoint callbacks, which fail-open.
                 _log.exception("tool_policy raised; denying %r (fail-closed)", call.name)
                 verdict = f"policy error: {type(exc).__name__}: {exc}"
+            if verdict is not None and not isinstance(verdict, str):
+                verdict = "policy returned an unsupported verdict type"
+            if dry:
+                self._verdicts[call.id] = verdict     # le tour réutilisera CETTE décision
+                if verdict is not None:
+                    overrides[call.id] = ToolResult(ok=False, error=f"ToolPolicyDenied: {verdict}")
+                continue
             if verdict is None:
                 continue
-            if not isinstance(verdict, str):
-                verdict = "policy returned an unsupported verdict type"
-            overrides[call.id] = ToolResult(ok=False, error=f"ToolPolicyDenied: {verdict}")
-            agent._emit(
-                "tool_policy_deny",
-                {"name": call.name, "call_id": call.id, "step": step,
-                 "reason": truncate_preview(verdict)},
-                parent_id=req_span,
-            )
+            self._deny(overrides, call, step, req_span, verdict)
         return overrides
+
+    def _deny(self, overrides: dict[str, ToolResult], call: ToolCall, step: int,
+              req_span: str | None, verdict: str) -> None:
+        overrides[call.id] = ToolResult(ok=False, error=f"ToolPolicyDenied: {verdict}")
+        self.agent._emit(
+            "tool_policy_deny",
+            {"name": call.name, "call_id": call.id, "step": step,
+             "reason": truncate_preview(verdict)},
+            parent_id=req_span,
+        )
 
     # ── composition ──────────────────────────────────────────────────────────
 
     def builtin(
-        self, calls: list[ToolCall], step: int, req_span: str | None, *, pending: bool = False
+        self, calls: list[ToolCall], step: int, req_span: str | None, *, pending: bool = False,
+        dry: bool = False,
     ) -> dict[str, ToolResult]:
         """Anti-boucle + trifecta, avec le MODE TÉMOIN : le verdict est calculé et
         tracé (`*_would_block`) mais pas appliqué — le radar photographie sans
-        verbaliser (§30). Le compteur du témoin est incrémenté ici."""
-        integres = self.loop_guard(calls, step, req_span, pending=pending)
-        integres.update(self.trifecta(calls, step, req_span))
+        verbaliser (§30). Le compteur du témoin est incrémenté ici.
+
+        ``dry=True`` (exécution anticipée) : même verdict, mais ni trace ni
+        compteur du témoin — sinon chaque refus était compté et tracé DEUX fois
+        (en avance, puis au tour). Prouvé : 4 refus tracés pour 2 (0.22.0)."""
+        integres = self.loop_guard(calls, step, req_span, pending=pending, dry=dry)
+        integres.update(self.trifecta(calls, step, req_span, dry=dry))
         if self.agent.shadow_guards and integres:
-            self.temoin[0] += len(integres)
+            if not dry:
+                self.temoin[0] += len(integres)
             return {}
         return integres

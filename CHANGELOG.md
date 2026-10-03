@@ -7,8 +7,285 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-10-03
+
+**0.22.0 is two things.** (1) An audit of the whole codebase for security and
+robustness: every item below was PROVEN on 0.21.0 by a script, fixed, and pinned
+by a test that fails on 0.21.0 and passes now. No default behaviour changes for
+correct use — the three fixes that would change a default ship as opt-in.
+(2) Dynamic tools, measured on a real model: failed tool creations went from
+13 of 33 to 0 of 20 and real spend per task fell 29 % (sections below, with
+their limits).
+
+**Upgrade notes.** Nothing to change. Three things you may notice:
+- ONE-TIME log warnings where a historical risky default is used without an
+  explicit choice: `MCPClient` inheriting the whole host environment
+  (`inherit_env`), `EvolutionRuntime` validation seeing API keys, and
+  `DynamicToolBuilder` granting itself permissions with no ceiling
+  (`allowed_permissions`) or running on a `SubprocessSandbox` (an AST
+  denylist, not an isolation boundary). Pass the explicit option to silence them.
+- The generated-tool validator now accepts `re.compile(...)` and refuses
+  `import builtins`; self-test floats are compared with a relative tolerance of
+  1e-6 (`self_test_rel_tol=0` restores strict equality).
+- New opt-in options, all off by default: `DynamicToolBuilder(max_repairs,
+  persist, host_functions, ...)`, `SubprocessSandbox(warm=True)`,
+  `agent.enable_run_python()`, `ReplaySession(check_prompts=True)`.
+
+### Security — audit of the whole codebase (lot 1)
+
+Every item below was PROVEN on 0.21.0 by a script without network or key, and
+has a test in `tests/test_audit_securite.py`. Run against the published 0.21.0
+wheel, that file gives 25 failures (the attacks) and 11 passes (the
+counter-proofs: normal use unchanged). **No default behaviour changes for
+correct use** — the three fixes that would change a default ship as opt-in.
+
+- **A human approval applied to ANOTHER call.** Gemini returns no call id;
+  the fallback `gemini_tool_call_{n}` restarted at 0 on every response, so the
+  first call of every turn had the same id. The library recommends keying an
+  approval decision on `call.id` (stable across the pause) — approving the
+  mail to `moi@example.com` at turn 1 approved the mail to `evil@example.com` at
+  turn 2. Synthetic ids are now unique per run (`synthetic_call_id`: readable
+  prefix + index + random suffix), for Gemini and for the OpenAI-compatible
+  and Anthropic fallbacks.
+- **Replay returned the wrong tool result** for the same reason: fixtures kept
+  one event per id (the last). They now keep a queue per id, consumed in
+  order — fixtures recorded before this fix replay correctly too.
+- **`as_tool` laundered the taint.** A sub-agent that read untrusted content
+  returned it unframed; the parent run stayed "clean" and `trifecta_guard`
+  let the egress call through (proven: the mail was sent). The output of a
+  tainted sub-run is now framed, as `delegate_to` already did.
+- **External content could close its own "untrusted" frame** by containing
+  the closing marker (any case or spacing) followed by fake instructions. The
+  code guards never depended on it; the framing shown to the model did.
+  `frame_untrusted()` neutralises forged markers before framing.
+- **A generated tool replaced a host tool of the same name** (`registry.replace`
+  overwrote unconditionally): `create_python_tool("envoyer_mail")` silently
+  swapped the host's egress tool for model-written code without the `egress`
+  flag. A generated tool may now only replace another generated tool; the
+  refused file is removed from disk.
+- **The AST validator was bypassed through attributes**: `import os` was
+  refused but `logging.os.remove(...)` was not (proven: a file outside the
+  tools dir was deleted with no filesystem permission). Banned modules — and
+  network / filesystem modules without the permission — are now refused as
+  attributes too (`logging.os`, `random._os`, `zipfile.pathlib`…). The
+  validator remains a denylist; the real boundary is `DockerSandbox`.
+- **The bridge mode of `SubprocessSandbox` passed the host's whole
+  environment** (API keys included) and working directory to the generated
+  tool, while the plain mode already stripped them. Both now strip.
+- **The run `context` was shipped into model-written code**: a generated tool
+  registered on an agent received the host's `context` dict (user id, tokens),
+  and a non-JSON handle in it made EVERY generated tool fail. Sandboxed tools
+  no longer receive the host context — the trust model `approval.py` already
+  documented.
+- **Native promotion executed the file, not the approved source**: after the
+  hash check, the tool was re-read through `importlib` (swap window, stale
+  `.pyc`). It now compiles exactly the hashed string.
+- **Secret redaction let real-world secrets through**: it required a label
+  (`api_key=`, `Bearer`). Bare `sk-…`/`gsk_…`/`AIza…`/`AKIA…`/GitHub/GitLab/
+  Slack tokens, passwords in URLs (`postgres://admin:PASSWORD@host`),
+  `password=`/`token=`/`secret=` and `Basic` auth are now masked; `max_tokens`,
+  `token_budget`, API URLs stay intact (tested).
+
+### Fixed — audit lots 2 and 3: data, robustness, accounting
+
+Tests in `tests/test_audit_robustesse.py`; against the published 0.21.0
+wheel: 29 failures + 4 errors (the defects, and the warnings that did not
+exist), 5 passes (counter-proofs). No default changed.
+
+- **FactMemory could lose every fact.** An interrupted write left a truncated
+  JSON; at restart it was treated as empty and the first save overwrote it
+  (proven: 5 facts → simulated crash → 1). Writes are now atomic (temp file +
+  `os.replace`, `autoagent._fichiers`), for the fact store, its vector sidecar
+  and the approval manifest; an unreadable store is moved aside to
+  `<name>.corrompu-<date>` instead of being overwritten.
+- **SummarizingMemory mixed two conversations** on the same instance: caller
+  B got caller A's summary (names, case numbers) and B's first messages were
+  never summarised nor shown. It now detects a different conversation by
+  prefix fingerprint, as `FactMemory` already did, and starts over (archive
+  included, so `recall` no longer returns A's messages to B).
+- **One optional parameter broke every Gemini request.** `limite: int | None`
+  produced `"type": ["integer", "null"]`; Gemini answered HTTP 400 "Proto field
+  is not repeating" (proven with a real call). The Gemini wire now gets the
+  OpenAPI form (`"type": "integer", "nullable": true`, `anyOf` for several
+  types); OpenAI/Anthropic still get the original JSON Schema. NOT verified
+  against the live API (credits exhausted when written).
+- **A blocked answer looked like a success.** No provider read the stop
+  reason: a Gemini safety block or a malformed function call ended the run
+  with an empty output and status ok. `LLMResponse.finish_reason`,
+  `AgentResult.finish_reason`, the `done` event and the trace now carry a
+  normalised reason (`stop`, `tool_calls`, `length`, `content_filter`,
+  `malformed`, `other`); a malformed call is retried ONCE (traced
+  `llm_retry`, the step is consumed); an empty answer with an abnormal reason
+  is logged.
+- **Anthropic: truncated tool arguments became `{}`**, so the tool ran with its
+  defaults. They now become `{"_raw": …}` like OpenAI — the schema rejects
+  them and the model sees why. OpenAI: a body without `choices` raises a
+  readable `ProviderError` instead of a `KeyError`.
+- **Streaming dropped the resumable state**: the `error` event of
+  `MaxStepsExceeded` / `TokenBudgetExceeded` / `AgentCancelled` had no
+  `state`, so a streaming host could not resume (only approval pauses had
+  it). All four carry it now; the two copied `except` blocks became one.
+- **Early (idempotent) execution checked the guards twice**: refusals traced
+  twice, shadow-mode counter doubled, host `tool_policy` called twice per call,
+  and an `approve` verdict paused the run BEFORE the call entered the
+  transcript — the resume could not find the call to approve. The early check
+  is now silent (`dry=True`): no trace, no counter, no pause; a verdict the
+  host policy returns during the stream is reused by the turn (one call).
+- **Orchestrator**: the text of an exception raised by `record()` was handed
+  to the model speaking to the respondent (a database error could be read
+  out); a neutral message is used and the detail goes to the log. A crashing
+  `describe` no longer cancels a successful record; a crashing `accept_extra`
+  counts as "not accepted". Interpretation failures now log their cause.
+- **A failing sub-agent cost nothing to its parent**: `as_tool` and
+  `delegate_to` only reported the spend of successful runs, so `token_budget`
+  could be bypassed by delegating to an agent that fails (proven: 770 tokens
+  spent, 220 counted). The spend carried by resumable exceptions is now
+  reported. The report channel is per thread: two parallel calls of the same
+  specialist no longer overwrite each other's spend (proven: 320 counted
+  instead of 420).
+- **FactMemory background consolidation was never billed** (proven: 4 800
+  tokens paid, 0 reported): its cost is queued and reported at the next
+  `compact()`, so it reaches `token_budget`. `forget_matching` is billed the
+  same way.
+- `ProjectWorkspace.read_file` reads at most `limit` characters and counts the
+  rest by chunks (same result, constant memory — a multi-GB log no longer
+  fills RAM). `@tool(idempotent=True)` (the standalone decorator had been
+  forgotten).
+
+### Fixed — dynamic tools, measured (lot A): 13 failed creations out of 33 → 0 out of 20
+
+Measured on DeepSeek, 4 tasks × 5 runs per configuration, same script on the
+published 0.21.0 and on this tree: **39 % of tool creations failed**, and the
+builder model's tokens were **invisible to `token_budget`** (43 % on top of
+what it saw). Causes found, in order of weight:
+
+- `re.compile(...)` was refused (the name `compile` was banned even as an
+  attribute): 7 of the 13 failures. Only the bare `compile()` stays banned
+  (`ATTRIBUTE_BANNED_CALLS`). `import builtins` — which gave back `exec` — is
+  now refused too.
+- The builder prompt's self-test example (`expect_equals: {"ok": true}`) was
+  copied verbatim by models, and a wrong self-test rejects the whole tool. The
+  prompt now describes the format with placeholders and allows an empty list.
+- Self-tests compared floats with `==`: a haversine tool returned
+  `10007.543398010288` where the model expected `…286` (one bit) and was
+  rejected — 10 failures out of 15 attempts, with correct code and a correct
+  expectation. Numbers are now compared with a relative tolerance
+  (`self_test_rel_tol=1e-6`, recursive; `0` restores strict equality).
+- Invalid JSON escapes (`\d` of a regex inside a tool-call argument or inside
+  the builder's `code` field) made the call arrive as `{"_raw": …}`.
+  `parse_tool_arguments` / `loads_tolerant` / `repair_json_escapes`
+  (`providers/base.py`, shared by OpenAI, Anthropic and the builder) now give
+  those a second chance — only after strict parsing failed, only by turning an
+  invalid escape into a literal backslash. **Truncated JSON is still refused**
+  (`{"_raw": …}`, never `{}`) — pinned by test.
+- A tool that failed its load or its self-tests stayed on disk (loadable at the
+  next start): `discard_generated_tool` now accepts a path and `build()` uses it.
+- `create_python_tool` now reports the builder call's tokens through the usage
+  channel (`DynamicToolBuilder.last_build_usage`, per thread): `result.usage`
+  and `token_budget` include them — even when the tool is refused, the call
+  was paid. Real spend per task: **−29 %** (5 773 → 4 097 tokens), because
+  failed creations are no longer replayed.
+- Malformed builder answers (`tool` not an object, no `name`, `permissions` as
+  a string, `input_schema` not an object, malformed self-tests) are now readable
+  `ToolValidationError`s instead of `AttributeError`/`KeyError`/`TypeError`.
+- `DynamicToolBuilder` warns once when it runs on a `SubprocessSandbox`: its AST
+  validator is a denylist, not a boundary (a dozen one-line bypasses reach `os`
+  there). Docker is the boundary.
+
+A regression of my own was caught by this measurement before release: the first
+rewording of the prompt ("the exact value") made the model write *expressions*
+(`6371 * (math.pi / 2)`) where JSON needs a number — 9 builder answers out of 20
+were unreadable, and the retry message ("Expecting ',' delimiter") told the model
+nothing, so it repeated the fault (up to 16 000 tokens burnt). The prompt now
+requires plain literals and the repair message names the cause: 0 unreadable
+answers out of 20. DeepSeek's leaked tool-call markup after a complete JSON object
+is absorbed by the existing balanced-object extraction (pinned by a test on the
+real captured shape).
+
+Limits of this measurement: one model, 20 runs per configuration, simple
+computational tasks. `max_repairs=2` changed nothing on it (0 failures without).
+
+### Added — dynamic tools, lots B and C (all opt-in, defaults unchanged)
+
+- `DynamicToolBuilder(max_repairs=N)`: a refused tool (unreadable JSON, code
+  refused by the validator, wrong self-test, crash during the test) goes back
+  to the builder with the exact reason; the builder knows whether the code or
+  the expectation was wrong. Each repair is a paid call, counted in
+  `last_build_usage`. A refusal by the host's permission ceiling is never retried.
+- `DynamicToolBuilder(persist=True)`: persistent library — `tools_dir/catalogue.json`
+  (atomic, quarantined if unreadable) with sha256, date, calls, errors per tool;
+  `enable_dynamic_tools` reloads accepted tools so the builder is not paid again
+  at every run. Reloaded only if the file still matches its sha256, the AST
+  validator still accepts it, its permissions fit the CURRENT ceiling, and its
+  name is not a host tool's. `retire_after_errors` consecutive errors retire a
+  tool from reloading; `builder.retire()`, `builder.catalogue()`.
+- `DynamicToolBuilder(host_functions=…)` / `agent.enable_dynamic_tools(builder,
+  host_functions=…)`: generated tools call whitelisted host callbacks through
+  the existing bridge (`context["call_host"]`); the builder model is told their
+  names, signatures and first docstring line. Self-tests run WITHOUT them (the
+  build never has a side effect on the host).
+- `agent.enable_run_python()` / `PythonRunner`: an ephemeral snippet the model
+  writes, validated by the AST, run in a temporary directory that is removed,
+  never registered. No permission unless the HOST grants it; per-run cap, failures
+  included. The most powerful tool the library offers the model: put it under
+  `tool_policy`, and under Docker for code you do not control.
+- `PythonRunner(host_functions=…)`: the model can write ONE program that calls
+  whitelisted host functions several times (`context["call_host"]`) instead of
+  emitting one tool call per turn; the `run_python` description lists their
+  names, signatures and first docstring line. These calls do NOT go through the
+  agent's `tool_policy` / trifecta / approval — expose only functions you would
+  let the model call unconditionally.
+- `SubprocessSandbox(warm=True)`: one persistent worker per tool instead of one
+  process per call — **107 ms → 6.2 ms per call** on the same tool (×17). Said
+  honestly: a tool's module globals survive between calls inside a worker
+  (bounded by `warm_max_calls`), calls to one tool are serialised, a timeout KILLS
+  the worker and the next call starts a fresh one, a rewritten file is never served
+  by the old worker. `close()` / `with`.
+
+### Added — opt-in safeguards (lots 2–3)
+
+- `PipelineManager(allowed_module_prefixes=…)` /
+  `EvolutionRuntime(pipeline_modules=…)`: a pipeline slot written by the model
+  may only name allowed modules (your application imports and calls it).
+- `ReplaySession(check_prompts=True)`: compares a full digest of each request
+  (all messages including the system prompt, tool schemas). The light
+  signature let a changed system prompt replay green. Off by default (a prompt
+  with today's date would fail); fixtures recorded before keep replaying.
+- `warn_once`: the three historical risky defaults (MCP server inheriting the
+  host environment, validation command seeing the API keys, generated tools
+  granting themselves permissions with no ceiling) keep their behaviour but
+  log ONE warning per process when the risk materialises and the host made no
+  explicit choice (`inherit_env=None` now means "historical, not chosen").
+
+### Added — the safe option for three defaults (opt-in, default unchanged)
+
+- `MCPClient(inherit_env=False)`: the server gets only the safe system
+  variables (the exact list of the official MCP SDK, `PATH`, `HOME`…) plus
+  `env=`. With the default `True`, a third-party server still inherits every
+  host secret — proven.
+- `EvolutionRuntime(inherit_env=False, validation_env=…)`: the validation
+  command runs the code the model just wrote (a test, a `conftest.py`) and
+  returns its output to the model — with the default, the host's API keys are
+  readable there (proven). `max_validation_timeout` (600 s) now caps the
+  timeout the model asks for.
+- `DynamicToolBuilder(allowed_permissions=…)`: a ceiling set by the host. The
+  permissions of a generated tool (`network`, `filesystem.*`) were chosen by
+  the model itself, and `DockerSandbox` lifted `--network none` accordingly.
+  `None` (default) keeps the old behaviour.
+- The visual builder no longer claims the validation command is safe because
+  the host fixes it: it warns that it executes model-written code.
+
 ### Fixed
 
+- **An unsourced figure in the docs was replaced by a sourced one.** README,
+  `eval.py` and the dev-doc (§25.4) said "LLM judges cap under 55 % accuracy
+  (chance-level agreement for substring evaluation)" — introduced in 0.18.0 with
+  no citation, and no source could be found for it. What can be sourced:
+  on the Who&When benchmark the best automated failure-attribution method
+  names the responsible agent 53.5 % of the time and the failing step 14.2 %
+  (Zhang et al., arXiv:2505.00212, read on the abstract page). The unsourced
+  parenthetical is dropped. The 0.18.0 entry below is history and is left as it
+  was published.
 - **A rejected generated tool's bytecode could run in its successor's place.**
   The `SubprocessSandbox` runner loaded the tool file through `importlib`,
   hence through `__pycache__`, and Python validates a `.pyc` on (source mtime
@@ -1430,7 +1707,8 @@ underscored or imported from a submodule path is internal and may change.
 - CI invariants: `ruff check`, `ruff format --check`, `mypy autoagent/`,
   and `pytest` are all green.
 
-[Unreleased]: https://github.com/laazizi/autoagent/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/laazizi/autoagent/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/laazizi/autoagent/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/laazizi/autoagent/releases/tag/v0.21.0
 [0.20.1]: https://github.com/laazizi/autoagent/releases/tag/v0.20.1
 [0.20.0]: https://github.com/laazizi/autoagent/releases/tag/v0.20.0

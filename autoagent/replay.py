@@ -34,6 +34,7 @@ boucle — uniquement les points d'extension publics `provider=` / `registry=`.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 from collections.abc import Iterator
@@ -72,7 +73,29 @@ def _signature(request: LLMRequest, do_redact: bool) -> dict[str, Any]:
         "messages": len(request.messages),
         "last_user": last_user,
         "tools": sorted(t.name for t in request.tools),
+        "digest": _empreinte(request),
     }
+
+
+def _empreinte(request: LLMRequest) -> str:
+    """Empreinte COMPLÈTE d'une requête (0.22.0) : rôles et contenus de TOUS les
+    messages — prompt système compris — et schémas d'outils.
+
+    La signature légère ne regardait que le nombre de messages, le début du
+    dernier message utilisateur et les NOMS d'outils : un prompt système modifié
+    ou une description d'outil réécrite rejouait au vert — la régression la plus
+    courante passait la CI. L'empreinte est un hachage : rien du prompt n'est
+    écrit dans le fixture. Les ids d'appels en sont exclus (aléatoires depuis
+    0.22.0). Vérifiée seulement avec ``ReplaySession(check_prompts=True)`` —
+    un prompt qui contient la date du jour la ferait échouer à chaque rejeu.
+    """
+    contenu = {
+        "messages": [[m.role, m.content, [[c.name, c.arguments] for c in (m.tool_calls or [])]]
+                     for m in request.messages],
+        "tools": [[t.name, t.description, t.input_schema] for t in request.tools],
+    }
+    texte = json.dumps(contenu, ensure_ascii=False, sort_keys=True, default=repr)
+    return hashlib.sha256(texte.encode("utf-8")).hexdigest()[:16]
 
 
 def _maybe_redact(obj: Any, do_redact: bool) -> Any:
@@ -212,10 +235,15 @@ class _Player:
     provider sont séquentiels dans la boucle), outils par CALL_ID (robuste aux
     tool calls parallèles). Une divergence lève ``ReplayMismatch``."""
 
-    def __init__(self, path: str | Path, *, strict: bool = True) -> None:
+    def __init__(self, path: str | Path, *, strict: bool = True, check_prompts: bool = False) -> None:
         self.strict = strict
+        self.check_prompts = check_prompts
         self._llm: dict[str, list[dict[str, Any]]] = {}   # canal -> événements ordonnés
-        self._tools: dict[str, dict[str, Any]] = {}
+        # Une FILE par id, pas un seul événement : les fixtures enregistrées avant
+        # 0.22.0 avec Gemini portent le même id à chaque tour (`gemini_tool_call_0`).
+        # Un dict simple gardait le DERNIER — le tour 1 rejouait le résultat du
+        # tour 5. Consommées dans l'ordre d'enregistrement, elles rejouent juste.
+        self._tools: dict[str, list[dict[str, Any]]] = {}
         for line in Path(path).read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line:
@@ -224,7 +252,7 @@ class _Player:
             if event.get("kind") == "llm":
                 self._llm.setdefault(event.get("channel", "agent"), []).append(event)
             elif event.get("kind") == "tool":
-                self._tools[event["call_id"]] = event
+                self._tools.setdefault(event["call_id"], []).append(event)
         self._cursors: dict[str, int] = {}
         self._lock = threading.Lock()
         agent_evts = self._llm.get("agent", [])
@@ -252,10 +280,18 @@ class _Player:
                     f"enregistré {recorded}, obtenu {actual}. "
                     "Le comportement de l'agent a changé depuis l'enregistrement."
                 )
+            # Fixtures d'avant 0.22.0 : pas d'empreinte, on ne peut pas comparer.
+            if self.check_prompts and recorded.get("digest") and recorded["digest"] != actual["digest"]:
+                raise ReplayMismatch(
+                    f"divergence à l'appel LLM #{cursor} : le CONTENU des messages (prompt "
+                    "système compris) ou des schémas d'outils a changé depuis l'enregistrement."
+                )
         return LLMResponse.from_dict(event["response"])
 
     def tool(self, call: ToolCall) -> ToolResult:
-        event = self._tools.get(call.id)
+        with self._lock:
+            file = self._tools.get(call.id)
+            event = file.pop(0) if file else None
         if event is None:
             raise ReplayMismatch(
                 f"l'outil « {call.name} » (id {call.id}) n'a pas d'enregistrement "
@@ -307,10 +343,15 @@ class ReplaySession:
 
     ``strict`` (défaut True) : lève ``ReplayMismatch`` dès qu'une requête dévie
     de la trajectoire enregistrée. ``strict=False`` = positionnel best-effort.
+
+    ``check_prompts`` (0.22.0, défaut False) : compare aussi l'EMPREINTE complète
+    de chaque requête — un prompt système ou une description d'outil modifiés
+    sont alors détectés, ce que la signature légère laissait passer. Désactivé
+    par défaut : un prompt qui dépend de la date ou de l'heure échouerait.
     """
 
-    def __init__(self, path: str | Path, *, strict: bool = True) -> None:
-        self._player = _Player(path, strict=strict)
+    def __init__(self, path: str | Path, *, strict: bool = True, check_prompts: bool = False) -> None:
+        self._player = _Player(path, strict=strict, check_prompts=check_prompts)
 
     def provider(self, channel: str = "agent") -> ReplayProvider:
         return ReplayProvider(self._player, channel)

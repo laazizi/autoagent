@@ -107,7 +107,7 @@ someone else's abstraction stack instead of your own code.
 | **Policy as data** | `ToolPolicySpec.from_dict({...}).compile()` returns a callable with the existing `tool_policy` signature — so a policy becomes JSON you can version in git, read as a diff and test offline, without touching production code. Precedence is by action (`deny` > `approve` > `allow`), validation is strict at boot, and containment is monotonic: `narrow()` applies freely, `expand()` raises `ApprovalRequired` |
 | **Hybrid recall** | `FactMemory.recall()` ranks with **BM25** (IDF + length saturation, pure arithmetic — no dependency) and fuses it with cosine similarity via **RRF** when an `embed_fn` is present. The two signals fail on opposite queries: cosine loses exact matches (contract numbers, SIREN, plates), lexical loses synonyms. Stores without embeddings get the BM25 quality for free |
 | **Forgetting in plain language** | `forget_matching("forget everything about my previous employer")` moves the decision to *mutation* time, which is where write-time-only memories fail: prefix collisions, compound facts, identifier variants. Returns the deleted facts as erasure proof; **fail-closed** (an LLM error or a malformed answer deletes nothing); the exposed tool is a dry run by default |
-| **Reliability, measured** | `autoagent.eval.run_k()` reports `pass^k`, not just `pass@1` — because `pass^k ≈ p^k`, a 90 % agent is a 43 % agent over 8 tasks (0.9^8). The judge is a **deterministic host predicate**, never an LLM: on agent failures, LLM judges cap under 55 % accuracy |
+| **Reliability, measured** | `autoagent.eval.run_k()` reports `pass^k`, not just `pass@1` — because `pass^k ≈ p^k`, a 90 % agent is a 43 % agent over 8 tasks (0.9^8). The judge is a **deterministic host predicate**, never an LLM: judging agent failures with an LLM is still weak — on the Who&When benchmark the best automated method named the responsible agent 53.5 % of the time and the failing step 14.2 % (Zhang et al., arXiv:2505.00212) |
 | **Prompt caching, measured** | An agent resends the whole transcript every turn — the system prompt and every tool schema go out again at each step. `TokenUsage.cached_tokens` and `cache_hit_ratio` report the share the provider served from its cache, normalised across the four wire shapes (Anthropic counts it *beside* the input, everyone else *inside* it). `ModelConfig(cache_prompt=True)` adds the explicit marker Anthropic alone requires. The others cache on their own, and behaviour differs per provider — measure it: Gemini was **opportunistic** (the same 7 026-token prefix was served from cache on one call and not the next; a 9 366-token prefix missed where a 14 046-token one hit), DeepSeek was **deterministic** (measured zero on call 1, then 7 552 / 7 571 = 100 %). Report the saving as observed; never promise it |
 | **Context bounds** | `max_tool_result_chars` truncates an oversized tool result **middle-out** (head keeps the payload's shape, tail keeps the totals and the trailing `CRITICAL`) with a marker that tells the model to narrow its query — one unbounded tool otherwise blows the context window and burns the whole budget. The marker counts against the bound: a bound that can be exceeded is not a bound |
 | **Context lifetime** | `prune_tool_results_after=N` bounds how LONG a tool result stays in the transcript, not just how wide it is. Everything is re-sent at every step, and the history is never in the provider's cached prefix, so a 3 000-character result read at step 1 is paid again at steps 2, 3, 4… Past the N most recent, a result keeps its role and `tool_call_id` — the conversation stays well-formed — and loses only its payload, **in the view sent to the provider**: the returned transcript, the trace and any checkpoint keep the full text. Measured on demo 28: 16 360 → 7 592 input tokens (−54 %), same answer. The marker states the result was VALID, or the model re-plans around a failure that never happened; untrusted framing is carried over, so pruning can never un-taint a run. `prune_batch=K` prunes in batches so the view stays byte-stable between batches and the provider's prompt cache is not broken every turn — at the price of delayed pruning, stated in the demo |
@@ -399,6 +399,25 @@ agent.run("Read ./access.log and give me the top 5 most-hit URLs.")
 #   (Docker when available, hardened subprocess otherwise)
 # → promotion to native execution requires a HUMAN adding its hash
 #   to the tool manifest. Convenience without the YOLO.
+```
+
+Measured on DeepSeek (4 tasks × 5 runs, same script on 0.21.0 and on 0.22.0): tool
+creations that failed went from **13 of 33 to 0 of 20**, and the builder model's
+tokens — invisible to `token_budget` before (+43 %) — are now counted. Opt-in
+extras, all off by default:
+
+```python
+builder = DynamicToolBuilder(
+    coder_provider, tools_dir="./tools_dyn",
+    sandbox=DockerSandbox(),               # the AST denylist is NOT a boundary; Docker is
+    allowed_permissions=set(),             # the model may not grant itself network/files
+    max_repairs=2,                         # a refused tool goes back to the builder, with the reason
+    persist=True,                          # accepted tools are reloaded next run — no re-paying the builder
+    host_functions={"lookup": lookup},     # whitelisted host callbacks: context["call_host"]("lookup", {...})
+)
+agent.enable_dynamic_tools(builder)
+agent.enable_run_python()                  # ephemeral snippet: validated, sandboxed, never kept
+# SubprocessSandbox(warm=True): one persistent worker per tool — ~6 ms/call instead of ~107
 ```
 
 ### Host-driven flows the LLM cannot derail

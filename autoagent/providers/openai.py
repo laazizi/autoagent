@@ -4,6 +4,7 @@ import json
 from collections.abc import Iterator
 from typing import Any
 
+from autoagent.errors import ProviderError
 from autoagent.http import post_json, post_sse
 from autoagent.schema import (
     LLMRequest,
@@ -13,9 +14,10 @@ from autoagent.schema import (
     StreamChunk,
     TokenUsage,
     ToolCall,
+    normalize_finish_reason,
 )
 
-from .base import LLMProvider
+from .base import LLMProvider, parse_tool_arguments, synthetic_call_id
 
 
 def _uses_max_completion_tokens(model: str) -> bool:
@@ -85,7 +87,12 @@ class OpenAICompatibleProvider(LLMProvider):
             headers=self._headers(),
             timeout=self.config.timeout,
         )
-        message = raw["choices"][0]["message"]
+        choices = raw.get("choices") or []
+        if not choices:
+            # Corps inattendu (filtrage en amont, passerelle qui reformule) : une
+            # erreur LISIBLE plutôt qu'un KeyError qui ne dit rien (0.22.0).
+            raise ProviderError(f"Provider returned no choices: {str(raw)[:300]}")
+        message = choices[0].get("message") or {}
         return LLMResponse(
             content=message.get("content") or "",
             tool_calls=self._parse_tool_calls(message.get("tool_calls") or []),
@@ -93,6 +100,7 @@ class OpenAICompatibleProvider(LLMProvider):
             model=raw.get("model"),
             reasoning_content=message.get("reasoning_content"),
             usage=_usage_from(raw.get("usage")),
+            finish_reason=normalize_finish_reason("openai", choices[0].get("finish_reason")),
         )
 
     def stream(self, request: LLMRequest) -> Iterator[StreamChunk]:
@@ -116,15 +124,13 @@ class OpenAICompatibleProvider(LLMProvider):
         tool_deltas: dict[int, dict[str, Any]] = {}
         model: str | None = None
         usage_raw: dict[str, Any] | None = None
+        raison_brute: str | None = None
         emis: set[int] = set()
 
         def _assemble(index: int, slot: dict[str, Any]) -> ToolCall:
-            raw_args = slot["arguments"].strip()
-            try:
-                args = json.loads(raw_args) if raw_args else {}
-            except json.JSONDecodeError:
-                args = {"_raw": raw_args}
-            return ToolCall(id=slot["id"] or f"tool_call_{index}", name=slot["name"], arguments=args)
+            args = parse_tool_arguments(slot["arguments"].strip())
+            return ToolCall(id=slot["id"] or synthetic_call_id("tool_call", index),
+                            name=slot["name"], arguments=args)
 
         for event in post_sse(
             f"{self.base_url}/chat/completions",
@@ -138,6 +144,7 @@ class OpenAICompatibleProvider(LLMProvider):
             choices = event.get("choices") or []
             if not choices:
                 continue
+            raison_brute = choices[0].get("finish_reason") or raison_brute
             delta = choices[0].get("delta") or {}
             fragment = delta.get("content")
             if fragment:
@@ -177,6 +184,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 reasoning_content="".join(reasoning_parts) or None,
                 raw={"stream": True, "model": model, "usage": usage_raw},
                 usage=_usage_from(usage_raw),
+                finish_reason=normalize_finish_reason("openai", raison_brute),
             ),
         )
 
@@ -223,14 +231,10 @@ class OpenAICompatibleProvider(LLMProvider):
         parsed: list[ToolCall] = []
         for index, call in enumerate(tool_calls):
             function = call.get("function") or {}
-            raw_args = function.get("arguments") or "{}"
-            try:
-                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-            except json.JSONDecodeError:
-                args = {"_raw": raw_args}
+            args = parse_tool_arguments(function.get("arguments") or "{}")
             parsed.append(
                 ToolCall(
-                    id=call.get("id") or f"tool_call_{index}",
+                    id=call.get("id") or synthetic_call_id("tool_call", index),
                     name=function.get("name") or "",
                     arguments=args,
                 )

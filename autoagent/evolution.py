@@ -9,8 +9,10 @@ from typing import Any
 
 from .agent import Agent
 from .errors import ToolError
+from .logging import get_logger, warn_once
 from .pipeline import PipelineManager
 from .registry import schema_from_callable
+from .sandbox import safe_environment
 from .workspace import ProjectWorkspace
 
 __all__ = [
@@ -19,6 +21,8 @@ __all__ = [
     "EvolutionRuntime",
     "enable_software_evolution",
 ]
+
+_log = get_logger("evolution")
 
 EVOLUTION_SYSTEM_PROMPT = """
 
@@ -80,16 +84,38 @@ class EvolutionRuntime:
         allowed_write_extensions: set[str] | None = None,
         state_reader: Callable[[], Any] | None = None,
         max_write_chars: int = 200000,
+        inherit_env: bool | None = None,
+        validation_env: dict[str, str] | None = None,
+        max_validation_timeout: int = 600,
+        pipeline_modules: tuple[str, ...] | None = None,
     ) -> None:
+        """Voir la docstring de la classe.
+
+        ``inherit_env`` / ``validation_env`` (0.22.0) : la commande de
+        validation est fixée par l'hôte, mais elle EXÉCUTE le code que le modèle
+        vient d'écrire (un `conftest.py`, un test) — et le faisait avec tout
+        l'environnement de l'hôte, clés API comprises, avant de renvoyer sa
+        sortie au modèle. ``inherit_env=False`` ne transmet que les variables
+        système inoffensives plus ``validation_env``. Le défaut ``True`` garde
+        le comportement historique. ``max_validation_timeout`` plafonne le délai
+        que le modèle peut demander.
+        """
         self.workspace = ProjectWorkspace(
             workspace_root,
             allowed_write_extensions=allowed_write_extensions,
             max_write_chars=max_write_chars,
         )
-        self.pipeline = PipelineManager(self.workspace, pipeline_path or "pipeline.json")
+        # `pipeline_modules` (0.22.0) : préfixes de modules autorisés dans un slot
+        # (ex. ("plugins.",)) — c'est ton application qui importera ce module.
+        self.pipeline = PipelineManager(self.workspace, pipeline_path or "pipeline.json",
+                                        allowed_module_prefixes=pipeline_modules)
         self.validation_command = validation_command
         self.allow_custom_validation_command = allow_custom_validation_command
         self.state_reader = state_reader
+        self._inherit_env_explicit = inherit_env is not None
+        self.inherit_env = True if inherit_env is None else inherit_env   # None = historique + avertissement
+        self.validation_env = dict(validation_env or {})
+        self.max_validation_timeout = max_validation_timeout
         self.host_functions: dict[str, Callable[..., Any]] = {}
 
     def register_host_function(self, name: str, func: Callable[..., Any]) -> None:
@@ -370,6 +396,14 @@ class EvolutionRuntime:
 
     def run_validation(self, command: str | None = None, timeout: int = 60) -> dict[str, Any]:
         selected_command = self._validation_command(command)
+        timeout = max(1, min(int(timeout), self.max_validation_timeout))   # le modèle choisit, l'hôte plafonne
+        env = None if self.inherit_env else safe_environment(self.validation_env)
+        if self.inherit_env and not self._inherit_env_explicit:
+            warn_once(_log, "evolution.inherit_env",
+                      "EvolutionRuntime: the validation command runs model-written code with the "
+                      "WHOLE host environment (API keys included) and returns its output to the "
+                      "model. Pass inherit_env=False (+ validation_env={...}), or inherit_env=True "
+                      "to make the choice explicit.")
         try:
             completed = subprocess.run(
                 selected_command,
@@ -378,6 +412,7 @@ class EvolutionRuntime:
                 capture_output=True,
                 timeout=timeout,
                 check=False,
+                env=env,
             )
         except subprocess.TimeoutExpired:
             return {"ok": False, "timeout": True, "error": f"validation timed out after {timeout}s"}

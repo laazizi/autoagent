@@ -3,7 +3,7 @@
 > Référence technique complète pour intégrer, étendre et tester `autoagent` dans un projet Python.
 > **Public visé** : devs qui vont écrire des tools, brancher l'agent sur leur app, ou éventuellement contribuer à la lib.
 
-**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-08-29 · **Couvre autoagent** : 0.21.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
+**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-10-03 · **Couvre autoagent** : 0.22.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
 
 ---
 
@@ -55,6 +55,7 @@
 34. [`cascade` — le petit modèle d'abord, le gros si ton juge dit non](#34-cascade--le-petit-modèle-dabord-le-gros-si-ton-juge-dit-non) *(0.21.0)*
 35. [`summarize_trace` — l'efficacité lue dans la trace](#35-summarize_trace--lefficacité-lue-dans-la-trace) *(0.21.0)*
 36. [Usage et performance : connexions persistantes, `Bounds`, `guards.py`, exceptions typées](#36-usage-et-performance--connexions-persistantes-bounds-guardspy-exceptions-typées) *(0.21.0)*
+37. [0.22.0 — audit de sécurité et de robustesse, outils dynamiques mesurés](#37-0220--audit-de-sécurité-et-de-robustesse-outils-dynamiques-mesurés) *(0.22.0)*
 
 ---
 
@@ -1481,7 +1482,9 @@ L'agent décide qu'il a besoin d'un compteur, appelle `create_python_tool(name="
 4. Code reçu → parsing AST :
    - refus si eval/exec/__import__/getattr suspect
    - refus si import d'un module hors allowlist selon permissions
-5. Code passé → écrit dans tools_dir/<name>.py
+   (0.22.0) un refus du validateur, un JSON illisible ou un self-test faux est RENVOYÉ au
+   constructeur jusqu'à `max_repairs` fois (défaut 0) ; un refus de PERMISSION n'est jamais repris
+5. Code passé → écrit dans tools_dir/<name>.py (retiré du disque s'il échoue au chargement ou aux self-tests)
 6. Wrapper créé : execute_in_sandbox(<name>.py, args) → subprocess
 7. Tool enregistré dans registry → visible au prochain tour LLM
 8. Le LLM appelle alors create_python_tool reste OU le nouveau tool directement
@@ -1496,10 +1499,11 @@ passe), pas une allowlist. Constantes dans `autoagent/sandbox.py` :
 
 | Catégorie | Contenu refusé |
 |---|---|
-| `ALWAYS_BANNED_CALLS` | `eval`, `exec`, `compile`, `__import__`, `input`, `breakpoint` |
+| `ALWAYS_BANNED_CALLS` (appel **nu**) | `eval`, `exec`, `compile`, `__import__`, `input`, `breakpoint` |
+| `ATTRIBUTE_BANNED_CALLS` (appel par **attribut**, `x.eval(…)`) | les mêmes **sauf `compile`** : `re.compile(…)` est accepté (0.22.0 — c'était 6 des 10 échecs de création mesurés) ; le `compile()` nu reste refusé |
 | Appels shell | `system`, `popen` |
 | `PROCESS_SPAWN_CALLS` | `fork`, `forkpty`, `kill`, `startfile`, `putenv`, `execl*`, `execv*`, `spawn*`, `posix_spawn*` |
-| `ALWAYS_BANNED_MODULES` (quelles que soient les permissions) | `subprocess`, `ctypes`, `multiprocessing`, `signal`, `importlib`, `os`, `posix`, `nt`, `sys`, `pty` |
+| `ALWAYS_BANNED_MODULES` (quelles que soient les permissions) | `subprocess`, `ctypes`, `multiprocessing`, `signal`, `importlib`, `os`, `posix`, `nt`, `sys`, `pty`, `builtins` (0.22.0 : `import builtins` redonnait `exec`) |
 | `DANGEROUS_NAMES` (référencés par `Name` **ou** attribut) | `__builtins__`, `globals`, `locals`, `vars`, `getattr`, `setattr`, `delattr`, `importlib`, et les dunders d'introspection `__class__`, `__bases__`, `__subclasses__`, `__mro__`, `__globals__`, `__dict__`, `__code__`… |
 
 Le blocage des dunders d'introspection ferme l'évasion CPython classique
@@ -1512,7 +1516,11 @@ Le blocage des dunders d'introspection ferme l'évasion CPython classique
 | `"filesystem.*"` (p.ex. `filesystem.read`) | `FILESYSTEM_MODULES` : `pathlib`, `glob`, `shutil`, `tempfile`, et l'appel `open()` |
 
 > ⚠️ La denylist AST **durcit** mais n'est pas une frontière à elle seule (Python est trop
-> dynamique). La vraie isolation vient du `DockerSandbox` (§11.4).
+> dynamique). La vraie isolation vient du `DockerSandbox` (§11.4). Vérifié en 0.22.0 : une
+> quinzaine de contournements d'une ligne passent la denylist et atteignent `os` dans le
+> `SubprocessSandbox` ; en refermer un à un est un jeu perdu d'avance, c'est pourquoi
+> `DynamicToolBuilder` et `PythonRunner` **avertissent une fois** quand le bac à sable n'est pas
+> Docker. Ne confie à `SubprocessSandbox` que du code issu d'un modèle que tu gouvernes.
 
 ### 11.4 Deux sandboxes — `SubprocessSandbox` vs `DockerSandbox`
 
@@ -1525,6 +1533,18 @@ et sont interchangeables derrière `make_sandbox()`.
 résultat JSON sur stdout.
 > ⚠️ Un simple subprocess **ne peut PAS isoler le réseau** — `allow_network` n'est accepté que
 > pour parité de signature ; seule la denylist AST joue. C'est du durcissement, pas une frontière.
+
+**`SubprocessSandbox(warm=True)`** (0.22.0, opt-in) — un **worker persistant par outil** au lieu
+d'un processus par appel : le démarrage de l'interpréteur n'est payé qu'une fois. Mesuré sur le
+même outil : **107 ms/appel à froid, 6,2 ms à chaud** (×17, démarrage du worker compris). Les
+contreparties, dites : (1) les variables **globales** de l'outil survivent d'un appel à l'autre
+dans un même worker (compteur 1, 2, 3… au lieu de 1, 1, 1) — borné par `warm_max_calls=200`
+(le worker est recyclé ensuite) ; (2) les appels d'un même outil sont **sérialisés** ;
+(3) avec `host_functions` (pont) on garde un processus par appel ; (4) un fichier réécrit n'est
+jamais servi par l'ancien worker (empreinte sha256) ; (5) un dépassement de délai **tue** le worker,
+le suivant repart à neuf ; `warm_max_workers=8` plafonne les processus vivants (le plus ancien est
+fermé). Ferme-les avec `sandbox.close()` ou `with SubprocessSandbox(warm=True) as bac:` (sinon,
+à la sortie du processus). Environnement épuré comme en mode normal. Docker : sans effet.
 
 **`DockerSandbox(image="python:3.11-slim", timeout=10.0, memory="256m", cpus="1.0", pids_limit=128)`**
 — la VRAIE frontière (isolation OS). Par appel :
@@ -1582,6 +1602,16 @@ C'est le mécanisme qu'on a éprouvé en interne sur des applications complètes
 (host functions `http_get`, `ask_user`, `connecter_service`, `sql_query`… —
 applications restées dans le dépôt de travail interne, hors de ce repo publié).
 
+**Pour les outils que le modèle crée lui-même** (0.22.0) : `DynamicToolBuilder(host_functions={…})`
+ou `agent.enable_dynamic_tools(builder, host_functions={…})`. Le modèle constructeur voit les
+**noms, signatures et première ligne de docstring** et sait appeler
+`context["call_host"]("nom", {...})`. Trois précisions de sécurité : (1) liste blanche — un nom
+absent est refusé ; (2) chaque fonction s'exécute **dans le processus de l'hôte, avec ses droits,
+sur des arguments choisis par le modèle** — valide-les comme n'importe quelle entrée ;
+(3) les **self-tests tournent sans ces fonctions** : le build n'a aucun effet de bord sur l'hôte,
+donc le prompt demande une liste de self-tests vide à un outil qui s'en sert. Défaut : `None`,
+rien n'est exposé.
+
 ### 11.6 Promotion humaine sandbox → natif — `autoagent/approval.py`
 
 Cycle de confiance :
@@ -1638,12 +1668,115 @@ python -m autoagent.approval reject  ./dynamic_tools/foo.py [--to ./rejected]
 | Même `agent.run()` | Tool reste dans le registry pour les tours suivants ✅ gratuit |
 | Différents `agent.run()`, même instance d'Agent | Tool reste dans le registry ✅ gratuit |
 | Restart process Python | Tools écrits sur disque ; rechargés au démarrage par **`load_tools()`** (§11.6) qui choisit natif/sandbox par hash |
+| Restart, **bibliothèque persistante** (0.22.0, `persist=True`) | `enable_dynamic_tools` recharge les outils déjà acceptés : le constructeur n'est pas repayé |
+
+**Bibliothèque persistante** — `DynamicToolBuilder(provider, tools_dir=…, persist=True)`. Chaque
+outil accepté est inscrit dans `tools_dir/catalogue.json` (écriture atomique, fichier illisible
+mis de côté en `.corrompu-<date>`) : `sha256` du fichier, date, description, permissions,
+`calls`, `errors`, `consecutive_errors`, `retired`. Au démarrage, `enable_dynamic_tools` appelle
+`builder.load_library()` et ne recharge un outil **que si** : il n'est pas retiré ; son fichier
+existe et son sha256 est celui noté à la validation (un fichier modifié depuis n'est **pas**
+rechargé, jamais « re-validé en silence ») ; l'AST l'accepte encore ; ses permissions tiennent
+sous le plafond `allowed_permissions` **actuel** ; son nom n'est pas celui d'un outil de l'hôte.
+Les fichiers sans entrée au catalogue (provenance inconnue) sont ignorés. Les outils rechargés
+sont marqués dynamiques et **ne comptent pas** dans `max_dynamic_tools_per_run` (rien n'est construit).
+`retire_after_errors=3` erreurs de suite retirent l'outil du *rechargement* (le run en cours
+n'est pas perturbé) ; `builder.retire(nom, raison)` le fait à la main ; `builder.catalogue()`
+rend une copie à afficher. Honnêteté : le sha256 protège de la dérive et des écritures partielles,
+**pas** de quelqu'un qui peut écrire dans `tools_dir` (il pourrait aussi réécrire le catalogue) —
+pour cela, l'approbation par manifeste (§11.6). Un seul processus écrivain par `tools_dir`.
+Défaut `False` : rien n'est écrit, rien n'est rechargé.
 
 ### 11.8 Limites
 
 - **`max_dynamic_tools_per_run` (défaut 3)** : au-delà, refusé pour éviter l'inflation
 - **Pas de pip install** : seuls les modules stdlib autorisés sont disponibles dans le sandbox
 - **Pas de retour binaire** : le résultat doit être JSON. Pour traiter des images, l'agent doit encoder en base64
+- **Un seul outil par nom** : reconstruire le même nom remplace le fichier et remet ses compteurs à zéro
+- **`SubprocessSandbox` n'est pas une frontière** (§11.3) : pour du code non maîtrisé, Docker
+
+### 11.9 Ce que 0.22.0 a mesuré et corrigé — et les options qui en découlent
+
+Mesuré sur DeepSeek (`deepseek-chat`), 4 tâches (Luhn, jours ouvrés, haversine, plaques SIV) × 5
+répétitions = 20 runs par configuration, même script, mêmes énoncés :
+
+| | 0.21.0 | 0.22.0 (défauts) | + `max_repairs=2` |
+|---|---:|---:|---:|
+| créations d'outil tentées | 33 | 20 | 20 |
+| créations en échec | **13 (39 %)** | **0 (0 %)** | 0 (0 %) |
+| tâches correctes | 20/20 | 20/20 | 20/20 |
+| jetons du constructeur (réels) | 34 620 | 23 378 | 23 810 |
+| jetons vus par `token_budget` | 80 835 | 81 935 | 82 291 |
+| dépense réelle totale | 115 455 | 81 935 | 82 291 |
+
+La 0.21.0 **cachait 43 %** de dépense à `token_budget` (le constructeur) ; elle est maintenant
+comptée — y compris quand l'outil est refusé, l'appel étant payé. La dépense réelle par tâche
+baisse de **29 %** (5 773 → 4 097 jetons) parce que les créations ratées ne sont plus rejouées.
+Limites de cette mesure, à lire : un seul modèle, 20 runs par configuration, des tâches de calcul
+simples ; `max_repairs=2` n'a rien changé ici (0 échec sans lui) — c'est un filet pour des
+capacités plus dures, **non démontré** sur ce banc. Les causes trouvées, une à une :
+
+1. **`re.compile` refusé** (le nom `compile` était interdit même par attribut) : 7 des 13 échecs.
+2. **L'exemple de self-test du prompt** (`expect_equals: {"ok": true}`) **recopié tel quel** par
+   les modèles : le prompt décrit maintenant le format (`<…>`), sans valeur à recopier.
+3. **Comparaison exacte des flottants** dans les self-tests : un outil de haversine rendait
+   `10007.543398010288` quand le modèle attendait `…286` — un bit — et était rejeté (10 échecs
+   sur 15 tentatives, code et attendu pourtant justes). `self_test_rel_tol=1e-6` (récursif ;
+   `0` = égalité stricte d'avant) ; le prompt le dit au modèle.
+4. **Une régression que la mesure a attrapée** : ma première reformulation du prompt (« la valeur
+   exacte ») poussait le modèle à écrire des **expressions** à la place de nombres
+   (`"distance_km": 6371 * (math.pi / 2)`) — JSON invalide dans **9 réponses sur 20**, et à
+   chaque reprise « Expecting ',' delimiter » ne lui disait rien (jusqu'à 16 000 jetons brûlés).
+   Corrigé : le prompt exige des littéraux, et la reprise **nomme la cause**. Résultat : 0 réponse
+   illisible sur 20 (comme la 0.21.0).
+5. **Échappements JSON invalides** (`\d` d'une regex dans `code`) : `providers/base.py`
+   `parse_tool_arguments` / `loads_tolerant` / `repair_json_escapes`, partagés par OpenAI,
+   Anthropic et le constructeur — appliqués **seulement** si le parse strict échoue, et un
+   JSON **coupé** reste refusé (`{"_raw": …}`, jamais `{}`).
+6. **Déchets après le JSON** (balisage interne `DSML` de DeepSeek) : déjà absorbés par
+   l'extraction du premier objet équilibré — épinglé par un test sur la forme réelle capturée.
+7. Un outil refusé **restait sur le disque** : `discard_generated_tool` (accepte aussi un chemin).
+
+Options ajoutées, **toutes avec un défaut qui ne change rien** : `DynamicToolBuilder(max_repairs=0,
+persist=False, retire_after_errors=3, self_test_rel_tol=1e-6, host_functions=None)`,
+`SubprocessSandbox(warm=False)`, `agent.enable_run_python()`.
+
+**`run_python`** (opt-in) — `agent.enable_run_python(PythonRunner(...), max_runs_per_run=10)` ajoute
+un outil où le modèle exécute un **extrait éphémère** (`def run(args, context): …`) : validé par
+l'AST, exécuté dans un dossier temporaire supprimé ensuite, jamais enregistré. Aucune permission
+(ni réseau ni fichiers) sauf celles que **l'hôte** accorde dans `PythonRunner(permissions=…)`.
+Les échecs comptent dans le plafond par run. C'est l'outil le plus puissant que la bibliothèque
+offre au modèle : mets-le sous `tool_policy`, et sous Docker pour du code que tu ne maîtrises pas
+(avertissement unique sinon). Pour du code à **réutiliser**, c'est `create_python_tool`.
+
+`PythonRunner(host_functions={…})` (0.22.0) laisse l'extrait appeler des fonctions de l'hôte
+(`context["call_host"]("nom", {...})`) : le modèle écrit **un programme** qui boucle sur plusieurs
+appels au lieu d'émettre un appel d'outil par tour ; la description de `run_python` en liste les
+noms, signatures et première ligne de docstring. ⚠️ Ces appels **ne passent pas** par `tool_policy`,
+la garde trifecta ni l'approbation (le pont est une porte latérale) : n'expose que ce que tu
+laisserais appeler sans condition.
+
+*Mesuré* (DeepSeek, 9 runs par cas, mêmes tâches : lire ~40 comptages de capteurs puis agréger ;
+outils classiques à appels parallèles permis **contre** un seul `run_python` + pont) :
+
+| | Outils classiques | Code (`run_python` + pont) |
+|---|---:|---:|
+| **Petits résultats** (1 nombre par lecture) : justes | 9/9 | 9/9 |
+| jetons moyens | 11 507 | 10 241 |
+| **Gros résultats** (96 valeurs par lecture, agrégat à calculer) : justes | **0/9** | **8/9** (9/9 après clarification, voir ci-dessous) |
+| jetons moyens | 52 971 | 14 329 (8 216 après clarification) |
+
+Lecture honnête : (1) sur de petits résultats, **aucun gain** — les appels d'outils parallèles
+font déjà le travail en 3 à 6 étapes ; (2) sur de gros résultats intermédiaires, le gain est réel,
+mais il vient pour l'essentiel de ce que **le modèle ne sait pas additionner 36 × 96 nombres de
+tête** : un outil `somme_par_colonne` écrit à la main aurait aussi réglé le cas — le code évite
+d'en écrire un par besoin ; (3) l'ordre de grandeur est plus modeste que « de 150 000 à 2 000
+jetons (98,7 %) », chiffre d'un exemple illustratif d'Anthropic (« Code execution with MCP »,
+4 nov. 2025) sans protocole de mesure publié ; (4) la première description faisait croire que
+`call_host` renvoie `{"result": …}` : 11 erreurs `KeyError: 'result'`. Une phrase corrigée
+(« renvoie EXACTEMENT la valeur de la fonction ») a fait passer de 14 329 à 8 216 jetons — réglage
+fait **après** avoir vu les erreurs sur les mêmes tâches, donc optimiste. Un seul modèle, des tâches
+jouets : une direction à valider, pas un résultat général.
 
 ---
 
@@ -1973,8 +2106,10 @@ autoagent/
 ├── workspace.py             # ProjectWorkspace (écritures bornées, anti-traversée, rollback)
 ├── pipeline.py              # PipelineManager (slots pipeline.json)
 ├── evolution.py             # EvolutionRuntime, EVOLUTION_CAPABILITIES
-├── dynamic.py               # DynamicToolBuilder, ToolBuildRequest (l'agent écrit ses outils)
-├── sandbox.py               # SubprocessSandbox, DockerSandbox, make_sandbox, pont host-function
+├── dynamic.py               # DynamicToolBuilder, ToolBuildRequest (l'agent écrit ses outils) ;
+│                            # 0.22.0 — reprise des refus, bibliothèque persistante, host_functions,
+│                            # PythonRunner (§11.7, §11.9)
+├── sandbox.py               # SubprocessSandbox (+ warm 0.22.0), DockerSandbox, make_sandbox, pont host-function
 ├── approval.py              # ToolManifest (allowlist par hash) + promotion humaine + CLI
 ├── orchestrator.py          # 0.9.0 — Orchestrator, Step, TurnEvent (flux piloté par l'hôte, §15)
 ├── http.py                  # post_json / post_sse (urllib + retry/backoff, Retry-After)
@@ -1993,7 +2128,8 @@ autoagent/
 ├── eval.py                  # 0.18.0 — run_k : fiabilité pass^k, juge déterministe (§25.4)
 └── providers/
     ├── __init__.py          # create_provider (fabrique par nom)
-    ├── base.py              # LLMProvider (ABC) + deep-merge de config.extra_body
+    ├── base.py              # LLMProvider (ABC) + deep-merge de config.extra_body ;
+    │                        # 0.22.0 — synthetic_call_id, parse_tool_arguments / loads_tolerant
     ├── openai.py            # OpenAI-compatible : DeepSeek/Groq/Kimi/Ollama via base_url
     ├── anthropic.py         # blocs image, tool_choice, JSON best-effort
     ├── gemini.py            # inline_data, thought_signature (Gemini 3),
@@ -2019,6 +2155,7 @@ from autoagent import (
     EVOLUTION_CAPABILITIES,
     DynamicToolBuilder,
     ToolBuildRequest,
+    PythonRunner,           # 0.22.0 — run_python éphémère (enable_run_python)
     PipelineManager,
     tool,
     create_provider,
@@ -3049,8 +3186,9 @@ l'estimation `p^k` (l'effondrement que `pass@1` masque), la dispersion des étap
 et toutes les erreurs.
 
 Deux choix délibérés : le juge est **déterministe et fourni par l'hôte** (pas de
-LLM-as-judge — sur les échecs d'agent ils plafonnent sous 55 % de justesse, accord
-au niveau du hasard en évaluation par sous-chaîne) ; et **aucune parallélisation**
+LLM-as-judge — l'attribution automatique des échecs par LLM reste faible : sur Who&When,
+la meilleure méthode désigne l'agent fautif dans 53,5 % des cas et l'étape fautive dans
+14,2 %, Zhang et al., arXiv:2505.00212) ; et **aucune parallélisation**
 (un agent a des effets de bord, l'ordre doit rester reproductible). Un run qui
 plante **est** un échec de fiabilité ; un juge qui plante est rapporté, jamais
 avalé. Combiné à `ReplaySession`, ça donne une non-régression de fiabilité
@@ -3979,6 +4117,57 @@ le réseau (d'où le §36.1). Le validateur interne (§31) est **2,3× plus rapi
 que `jsonschema`. L'élagage de la vue reste O(n) par étape par construction — il
 relit le transcript pour produire la vue — et c'est acceptable tant que les
 appels réseau se comptent en centaines de millisecondes.
+
+## 37. 0.22.0 — audit de sécurité et de robustesse, outils dynamiques mesurés
+
+Chaque point a été **prouvé sur la 0.21.0 par un script** (sans réseau ni clé), corrigé,
+puis figé par un test qui échoue sur la 0.21.0 et passe ici (`tests/test_audit_securite.py`,
+`tests/test_audit_robustesse.py`, `tests/test_dynamic_lot_*.py`). Aucun défaut ne change pour un
+usage correct : les trois correctifs qui en auraient changé un sont livrés en **option**, avec un
+avertissement unique tant que l'hôte n'a pas choisi. Le détail est dans le `CHANGELOG.md`.
+
+### 37.1 Sécurité
+
+- **Une approbation humaine valait pour un AUTRE appel** : Gemini ne renvoie pas d'id d'appel et le
+  repli `gemini_tool_call_{n}` repartait de zéro à chaque réponse. Les ids sont désormais uniques par
+  run (`providers.base.synthetic_call_id`) ; le rejeu garde une file par id.
+- **`as_tool` et `delegate_to` lavaient la teinte** : la sortie d'un sous-agent qui a lu du contenu
+  externe est maintenant encadrée (`schema.frame_untrusted`, marqueurs forgés neutralisés).
+- **Outils générés** : un module interdit à l'import l'est aussi par attribut (`logging.os`…) ;
+  l'environnement du sous-processus est épuré (`sandbox._child_env`, `safe_environment`) ; un outil
+  généré ne reçoit plus le `context` du run (`__autoagent_sandboxed__`) ; il ne remplace jamais un outil
+  de l'hôte ; `re.compile` est accepté, `import builtins` refusé (§11.3).
+- **Options sûres (défaut inchangé + `warn_once`)** : `MCPClient(inherit_env=False)`,
+  `EvolutionRuntime(inherit_env=False, validation_env=, max_validation_timeout=)`,
+  `DynamicToolBuilder(allowed_permissions=)`, `PipelineManager(allowed_module_prefixes=)`.
+- La rédaction des secrets couvre les formats courants (clés `sk-`, `gsk_`, `AIza`, `AKIA`, jetons
+  GitHub/GitLab/Slack, mots de passe dans une URL, `Basic`).
+
+### 37.2 Robustesse
+
+- **Écritures d'état atomiques + quarantaine** (`_fichiers.py`) : un fichier de faits, de vecteurs ou de
+  manifeste n'est jamais laissé tronqué ni écrasé quand il est illisible.
+- `SummarizingMemory` reconnaît une autre conversation (empreinte) ; la traduction Gemini des champs
+  optionnels ; `finish_reason` normalisé (`AgentResult.finish_reason`) avec une reprise sur sortie
+  « malformed » ; `state` reprenable sur toutes les erreurs en streaming.
+- **Comptabilité** : un canal de dépense par thread remonte au parent le coût d'un sous-agent
+  — même quand il échoue —, du constructeur d'outils (`last_build_usage`) et de la compaction de
+  `FactMemory` ; `token_budget` les voit.
+- `ReplaySession(check_prompts=True)` compare une empreinte complète de chaque requête.
+
+### 37.3 Outils dynamiques
+
+Mesurés sur un vrai modèle, corrigés, étendus : voir **§11.9** (échecs de création 13/33 → 0/20,
+dépense réelle −29 %, bibliothèque persistante, reprise des refus, fonctions de l'hôte, `run_python`,
+bac à sable chaud).
+
+### 37.4 Ce qui reste, dit
+
+La rédaction par motifs n'est pas protégée contre les expressions régulières pathologiques ; un pool
+partagé pour `delegate_to` (risque d'interblocage) n'a pas été fait ; les noms d'outils MCP contenant un
+point n'ont pas été vérifiés ; la correction Gemini sur les champs optionnels n'est **pas vérifiée en
+réel** (crédits épuisés au moment de l'audit) ; la liste d'interdits qui filtre le code généré **n'est
+pas une frontière** — Docker l'est.
 
 ---
 *Doc maintenue par l'équipe Alyce R&D. Pour questions, ouvrir une issue sur le repo interne ou taper l'auteur sur Slack.*

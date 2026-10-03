@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING, Any
 
 from .dynamic import DynamicToolBuilder, ToolBuildRequest
 from .errors import ToolError, ToolValidationError
-from .sandbox import GeneratedPythonTool
+from .sandbox import GeneratedPythonTool, discard_generated_tool
 from .schema import LLMRequest, LLMResponse, TokenUsage
 
 if TYPE_CHECKING:
@@ -274,14 +274,5 @@ def synthesize_tool(
 
 
 def _discard(tool: GeneratedPythonTool) -> None:
-    """Un outil refusé ne doit pas rester chargeable : on le retire du disque —
-    son bytecode aussi, sinon un essai suivant de même nom, même taille et même
-    seconde exécuterait le code REFUSÉ (vu en CI)."""
-    try:
-        tool.file_path.unlink(missing_ok=True)
-        cache = tool.file_path.parent / "__pycache__"
-        if cache.is_dir():
-            for pyc in cache.glob(f"{tool.file_path.stem}.*.pyc"):
-                pyc.unlink(missing_ok=True)
-    except OSError:
-        pass
+    """Retire un outil refusé du disque (voir `sandbox.discard_generated_tool`)."""
+    discard_generated_tool(tool)

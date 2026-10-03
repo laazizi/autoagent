@@ -5,9 +5,17 @@ from typing import Any
 from urllib.parse import quote
 
 from autoagent.http import post_json, post_sse
-from autoagent.schema import LLMRequest, LLMResponse, Message, StreamChunk, TokenUsage, ToolCall
+from autoagent.schema import (
+    LLMRequest,
+    LLMResponse,
+    Message,
+    StreamChunk,
+    TokenUsage,
+    ToolCall,
+    normalize_finish_reason,
+)
 
-from .base import LLMProvider
+from .base import LLMProvider, synthetic_call_id
 
 
 def _usage_from(meta: Any) -> TokenUsage | None:
@@ -20,6 +28,16 @@ def _usage_from(meta: Any) -> TokenUsage | None:
         # Gemini met en cache implicitement et compte la part servie ainsi.
         cached_tokens=meta.get("cachedContentTokenCount"),
     )
+
+
+def _finish_reason(raw: dict[str, Any], candidate: dict[str, Any], has_tool_calls: bool) -> str | None:
+    """Raison d'arrêt Gemini, normalisée. Un prompt bloqué en ENTRÉE n'a aucun
+    candidat : la raison est alors dans `promptFeedback.blockReason`."""
+    if candidate.get("finishReason"):
+        return normalize_finish_reason("gemini", candidate["finishReason"], has_tool_calls=has_tool_calls)
+    if (raw.get("promptFeedback") or {}).get("blockReason"):
+        return "content_filter"
+    return None
 
 
 def _gemini_fix_arrays(node: Any) -> Any:
@@ -115,7 +133,9 @@ class GeminiProvider(LLMProvider):
                 signature = call.get("thoughtSignature") or part.get("thoughtSignature")
                 tool_calls.append(
                     ToolCall(
-                        id=f"gemini_tool_call_{len(tool_calls)}",
+                        # Gemini ne donne pas d'id (sauf l'API Live) : on en
+                        # fabrique un UNIQUE — voir `synthetic_call_id`.
+                        id=call.get("id") or synthetic_call_id("gemini_tool_call", len(tool_calls)),
                         name=call.get("name") or "",
                         arguments=call.get("args") or {},
                         thought_signature=signature,
@@ -142,6 +162,7 @@ class GeminiProvider(LLMProvider):
             raw=raw,
             model=self.config.model,
             usage=_usage_from(raw.get("usageMetadata")),
+            finish_reason=_finish_reason(raw, candidate, bool(tool_calls)),
         )
 
     def stream(self, request: LLMRequest) -> Iterator[StreamChunk]:
@@ -156,6 +177,7 @@ class GeminiProvider(LLMProvider):
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
         usage_meta: dict[str, Any] | None = None
+        raison: str | None = None
 
         for event in post_sse(
             f"{self._url('streamGenerateContent')}?alt=sse",
@@ -167,6 +189,7 @@ class GeminiProvider(LLMProvider):
             content = candidate.get("content") or {}
             if isinstance(event.get("usageMetadata"), dict):
                 usage_meta = event["usageMetadata"]  # cumulative; last one wins
+            raison = _finish_reason(event, candidate, False) or raison   # le dernier événement la porte
             deja = len(tool_calls)
             for fragment in self._parse_parts(content.get("parts") or [], tool_calls, text_parts):
                 yield StreamChunk(type="text", text=fragment)
@@ -185,6 +208,7 @@ class GeminiProvider(LLMProvider):
                 # non-streaming path by providing at least a summary.
                 raw={"stream": True, "model": self.config.model, "usageMetadata": usage_meta},
                 usage=_usage_from(usage_meta),
+                finish_reason="tool_calls" if raison == "stop" and tool_calls else raison,
             ),
         )
 

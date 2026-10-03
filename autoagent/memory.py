@@ -47,6 +47,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable
 
+from ._fichiers import atomic_write_text, quarantine
 from .logging import get_logger
 from .schema import TAINT_SENTINEL, LLMRequest, Message, TokenUsage, is_tainted
 
@@ -194,6 +195,7 @@ class SummarizingMemory:
         self.summary_max_tokens = summary_max_tokens
         self._summary = ""
         self._covered = 0  # nb de messages non-système déjà repliés dans le résumé
+        self._covered_fp = ""  # empreinte du préfixe replié (détection d'une AUTRE conversation)
         self._archive: list[Message] = []  # tout ce qui a été replié (pour recall)
         self._tainted = False  # 0.17 : préserve la teinte à travers la compaction
         self.last_usage: TokenUsage | None = None  # 0.17 : coût du dernier compact
@@ -204,6 +206,19 @@ class SummarizingMemory:
         self.last_usage = None  # coût mesuré de CE compact (lu par la boucle pour le budget)
         system_msgs = [m for m in messages if m.role == "system"]
         others = [m for m in messages if m.role != "system"]
+        if (
+            self._covered
+            and self._covered <= len(others)
+            and _prefix_fingerprint(others[: self._covered]) != self._covered_fp
+        ):
+            # Même mémoire, AUTRE conversation au moins aussi longue (0.22.0) :
+            # un appelant après l'autre sur la même instance. On gardait le
+            # résumé de A et l'avancement de A — B recevait le résumé de A (avec
+            # ses noms, ses numéros de dossier) et ses propres premiers messages
+            # n'étaient jamais résumés ni montrés. `FactMemory` avait déjà cette
+            # garde (trouvée en test réel) ; ici, tout repart de zéro.
+            self._covered, self._covered_fp = 0, ""
+            self._archive, self._summary, self._tainted = [], "", False
         # Un hôte qui persiste l'historique COMPACTÉ (le pattern courant :
         # sauvegarder result.messages) nous repasse notre propre résumé comme
         # message système in-band. On le réabsorbe comme graine au lieu d'en
@@ -223,7 +238,7 @@ class SummarizingMemory:
             # L'historique a raccourci : soit l'hôte nous repasse un historique
             # DÉJÀ compacté (résumé in-band réabsorbé ci-dessus -> on le garde),
             # soit c'est une nouvelle conversation (pas de marqueur -> zéro).
-            self._covered, self._archive = 0, []
+            self._covered, self._covered_fp, self._archive = 0, "", []
             if not inband:
                 self._summary = ""
         if len(others) <= self.max_messages:
@@ -245,6 +260,7 @@ class SummarizingMemory:
                 return list(messages)
             self._archive.extend(to_fold)
             self._covered = cut
+            self._covered_fp = _prefix_fingerprint(others[:cut])
         return self._assemble(system_msgs, others[cut:])
 
     def recall(self, query: str, k: int = 5) -> list[Message]:
@@ -435,13 +451,31 @@ class FactMemory:
         self._vectors: dict[int, list[float]] = {}  # id de fait -> embedding
         self._tainted = False  # 0.17 : préserve la teinte à travers la compaction
         self.last_usage: TokenUsage | None = None  # 0.17 : coût de la dernière extraction
+        # Dépenses LLM pas encore rapportées à la boucle (0.22.0). En mode
+        # background, l'extraction finit APRÈS que `compact()` a rendu la main ;
+        # elle écrivait `last_usage`, que le `compact()` suivant remettait à
+        # None avant que quiconque le lise — prouvé : 4 800 jetons payés, 0
+        # rapporté. On accumule ici ; chaque `compact()` vide la file dans
+        # `last_usage`, que la boucle ajoute au budget du run.
+        self._usage_attente: list[TokenUsage] = []
         if self.path is not None and self.path.exists():
             self._load()
+
+    def _noter_usage(self, usage: TokenUsage | None) -> None:
+        if usage is not None:
+            with self._lock:
+                self._usage_attente.append(usage)
 
     # ── protocole Memory ─────────────────────────────────────────────────
 
     def compact(self, messages: list[Message]) -> list[Message]:
-        self.last_usage = None  # coût de CE compact (sync) ; en background, renseigné plus tard
+        resultat = self._compact(messages)
+        with self._lock:
+            attente, self._usage_attente = self._usage_attente, []
+        self.last_usage = _somme_usages(attente)   # sync + background terminé depuis le dernier compact
+        return resultat
+
+    def _compact(self, messages: list[Message]) -> list[Message]:
         system_msgs = [m for m in messages if m.role == "system"]
         others = [m for m in messages if m.role != "system"]
         # Réabsorption : l'hôte qui persiste l'historique compacté nous
@@ -506,7 +540,7 @@ class FactMemory:
                 def _worker() -> None:
                     try:
                         self._extract(to_fold)
-                    except Exception as exc:  # noqa: BLE001
+                    except Exception as exc:
                         job["error"] = exc
                         _log.exception(
                             "background fact extraction failed; slice will be retried"
@@ -628,7 +662,7 @@ class FactMemory:
         if missing:
             vectors = self.embed_fn([f["fact"] for f in missing])
             with self._lock:
-                for fact, vector in zip(missing, vectors):
+                for fact, vector in zip(missing, vectors, strict=False):
                     self._vectors[fact["id"]] = list(vector)
             self._save_vectors()
         query_vec = self.embed_fn([query])[0]
@@ -734,6 +768,7 @@ class FactMemory:
             _log.exception("forget_matching: appel LLM échoué — aucune suppression")
             return []
         self.last_usage = getattr(response, "usage", None)
+        self._noter_usage(self.last_usage)   # compté aussi au prochain compact (budget du run)
 
         ids = _parse_forget_ids(response.content or "")
         vises = {f["id"] for f in candidats}          # jamais hors du lot soumis
@@ -879,7 +914,9 @@ class FactMemory:
         # `getattr` : la comptabilité de jetons est un BONUS, pas une exigence. Un
         # provider tiers ou un double de test qui renvoie un objet sans `usage` ne
         # doit pas faire échouer une compaction — elle est best-effort par contrat.
-        self.last_usage = getattr(response, "usage", None)
+        # Mis en FILE (0.22.0) : en background, c'est le seul moyen que ce coût
+        # atteigne la boucle (voir `_usage_attente`).
+        self._noter_usage(getattr(response, "usage", None))
         with self._lock:
             self._apply_operations(_parse_operations(response.content or ""))
             self._save()
@@ -994,14 +1031,15 @@ class FactMemory:
         if self.path is None:
             return
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
+            # Atomique (0.22.0) : une écriture interrompue laissait un JSON
+            # tronqué, traité comme vide au redémarrage puis ÉCRASÉ — perte totale.
+            atomic_write_text(
+                self.path,
                 json.dumps(
                     {"facts": self._facts, "next_id": self._next_id},
                     ensure_ascii=False,
                     indent=2,
                 ),
-                encoding="utf-8",
             )
         except OSError:
             _log.exception("fact store write failed (%s); facts kept in memory", self.path)
@@ -1018,13 +1056,15 @@ class FactMemory:
         try:
             with self._lock:
                 data = {str(fid): vec for fid, vec in self._vectors.items()}
-            vpath.write_text(json.dumps(data), encoding="utf-8")
+            atomic_write_text(vpath, json.dumps(data))
         except OSError:
             _log.exception("vector sidecar write failed (%s); vectors kept in memory", vpath)
 
     def _load(self) -> None:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("fact store root is not a JSON object")
             facts = data.get("facts")
             if isinstance(facts, list):
                 self._facts = [
@@ -1034,7 +1074,12 @@ class FactMemory:
                 ]
             self._next_id = int(data.get("next_id") or (max((f["id"] for f in self._facts), default=0) + 1))
         except (OSError, ValueError):
+            # On repart à vide, mais SANS détruire l'ancien fichier : il est mis
+            # de côté (`<nom>.corrompu-<date>`), sinon la prochaine sauvegarde
+            # l'écrasait et les faits étaient perdus pour de bon (0.22.0).
             _log.exception("fact store unreadable (%s); starting empty", self.path)
+            if self.path is not None and self.path.exists():
+                quarantine(self.path)
             self._facts, self._next_id = [], 1
         vpath = self._vectors_path()
         if vpath is not None and vpath.exists():
@@ -1153,11 +1198,23 @@ def _rrf_fuse(*rankings: list[dict[str, Any]], k: int = 60) -> list[dict[str, An
     return [seen[fid] for fid, _ in ordered]
 
 
+def _somme_usages(usages: list[TokenUsage]) -> TokenUsage | None:
+    """Somme de plusieurs usages ; None si rien n'a été rapporté (jamais un zéro inventé)."""
+    if not usages:
+        return None
+    caches = [u.cached_tokens for u in usages if u.cached_tokens is not None]
+    return TokenUsage(
+        input_tokens=sum(u.input_tokens or 0 for u in usages),
+        output_tokens=sum(u.output_tokens or 0 for u in usages),
+        cached_tokens=sum(caches) if caches else None,
+    )
+
+
 def _cosine(a: list[float], b: list[float]) -> float:
     """Similarité cosinus en pur stdlib (les vecteurs sont courts)."""
     if len(a) != len(b) or not a:
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
     norm = math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b))
     return dot / norm if norm else 0.0
 

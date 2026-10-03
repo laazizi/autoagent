@@ -222,6 +222,9 @@ def _default_phrase_context(step: Step, signals: PhraseSignals) -> dict[str, Any
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$")
 
+# Ce que la personne entend quand `record()` a planté (le détail est au journal).
+_RECORD_FAILED = "the answer could not be recorded; ask for it again"
+
 
 # ---------------------------------------------------------------------------
 # The orchestrator
@@ -336,8 +339,14 @@ class Orchestrator:
             raw = (self.provider.complete(request).content or "").strip()
             raw = _FENCE_RE.sub("", raw)
             data = json.loads(raw)
-        except Exception:
-            _log.warning("interpret call failed or returned non-JSON; treating as unclear")
+        except Exception as exc:
+            # Comportement inchangé (le flux reste en place, la question est
+            # reposée) — mais le journal dit désormais SI c'est une panne du
+            # fournisseur ou une réponse mal formée : les deux se confondaient.
+            _log.warning("interpret call failed (%s: %s); treating as unclear",
+                         type(exc).__name__, str(exc)[:200])
+            return InterpretOutcome(status="unclear")
+        if not isinstance(data, dict):
             return InterpretOutcome(status="unclear")
         status = data.get("status")
         if status == "answered":
@@ -370,6 +379,28 @@ class Orchestrator:
             if chunk.type == "text" and chunk.text:
                 yield chunk.text
 
+    # -- host callbacks, guarded -----------------------------------------
+
+    def _accepts_extra(self, step_id: str) -> bool:
+        """`accept_extra` qui plante = refus (le créneau n'est pas exposé) —
+        jamais un tour cassé au milieu d'un appel (0.22.0)."""
+        if self.accept_extra is None:
+            return False
+        try:
+            return bool(self.accept_extra(step_id))
+        except Exception:
+            _log.exception("accept_extra(%s) raised; treating as not accepted", step_id)
+            return False
+
+    def _describe_safely(self, step_id: str, value: Any) -> str:
+        """`describe` qui plante après un enregistrement RÉUSSI : on garde la
+        valeur enregistrée et on accuse réception sous la forme par défaut."""
+        try:
+            return self.describe(step_id, value)
+        except Exception:
+            _log.exception("describe(%s) raised; using the default acknowledgment", step_id)
+            return f"{step_id} = {value}"
+
     # -- the turn ---------------------------------------------------------
 
     def turn(self, user_text: str) -> Iterator[TurnEvent]:
@@ -390,23 +421,25 @@ class Orchestrator:
             current_recorded = False
             described: list[str] = []
             for step_id, value in outcome.values:
-                if step_id not in exposed and not (
-                    self.accept_extra is not None and self.accept_extra(step_id)
-                ):
+                if step_id not in exposed and not self._accepts_extra(step_id):
                     continue  # the host only accepts slots IT exposed
                 error = None
                 try:
                     error = self.record(step_id, value)
-                except Exception as exc:
+                except Exception:
+                    # Le TEXTE de l'exception partait au modèle qui parle à la
+                    # personne : une erreur de base (« connection to server at
+                    # 10.0.0.5… ») pouvait être lue à l'enquêté (0.22.0). Le
+                    # détail va au journal ; la personne entend un refus neutre.
                     _log.exception("record(%s) raised", step_id)
-                    error = str(exc)
+                    error = _RECORD_FAILED
                 if error:
                     if step_id == current_id:
                         signals.validation_error = error
                     continue  # horizon extras that fail are dropped
                 if step_id == current_id:
                     current_recorded = True
-                described.append(self.describe(step_id, value))
+                described.append(self._describe_safely(step_id, value))
                 yield TurnEvent(type="recorded", step_id=step_id, value=value)
             if current_recorded:
                 signals.ack = "; ".join(described[:10])
