@@ -34,8 +34,12 @@ from .errors import (
     AgentCancelled,
     ApprovalRequired,
     AutoAgentError,
+    JournalCorrupted,
+    JournalError,
+    JournalLocked,
     MaxStepsExceeded,
     MCPError,
+    OutcomeUnknown,
     ProviderError,
     ReplayMismatch,
     TokenBudgetExceeded,
@@ -43,6 +47,7 @@ from .errors import (
     ToolValidationError,
 )
 from .evolution import EVOLUTION_CAPABILITIES, EvolutionRuntime, enable_software_evolution
+from .journal import Journal, idempotency_key
 from .logging import get_logger
 from .mcp import MCPClient
 from .memory import BufferMemory, FactMemory, Memory, SummarizingMemory
@@ -115,6 +120,12 @@ __all__ = [
     "EvalTask",
     "Variant",
     "compare_configs",
+    "Journal",
+    "JournalCorrupted",
+    "JournalError",
+    "JournalLocked",
+    "OutcomeUnknown",
+    "idempotency_key",
     "Bounds",
     "TraceMetrics",
     "summarize_trace",

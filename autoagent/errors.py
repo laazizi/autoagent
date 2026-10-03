@@ -21,8 +21,12 @@ __all__ = [
     "AgentCancelled",
     "ApprovalRequired",
     "AutoAgentError",
+    "JournalCorrupted",
+    "JournalError",
+    "JournalLocked",
     "MCPError",
     "MaxStepsExceeded",
+    "OutcomeUnknown",
     "ProviderError",
     "ReplayMismatch",
     "TokenBudgetExceeded",
@@ -162,3 +166,43 @@ class TokenBudgetExceeded(_ResumableError):
     def __init__(self, message: str = "", *args: Any) -> None:
         super().__init__(message, *args)
         self.spent: int = 0
+
+
+class JournalError(AutoAgentError):
+    """Le journal durable n'a pas pu enregistrer (disque plein, fichier verrouillé ou
+    corrompu). FAIL-CLOSED : un effet dont l'INTENTION n'a pas pu être écrite ne part pas.
+    C'est le contrat inverse de la trace (observabilité, fail-open) — un journal qui se tait
+    sans rien dire n'est plus un journal."""
+
+
+class JournalLocked(JournalError):
+    """Un autre processus tient déjà ce journal en écriture. Deux processus qui reprennent le
+    MÊME run refont chacun l'effet en cours : un seul écrivain à la fois."""
+
+
+class JournalCorrupted(JournalError):
+    """La chaîne d'empreintes du journal ne se vérifie plus (enregistrement modifié ou retiré
+    au milieu du fichier). Attribut ``seq`` : le premier enregistrement fautif."""
+
+    def __init__(self, message: str = "", *args: Any) -> None:
+        super().__init__(message, *args)
+        self.seq: int | None = None
+
+
+class OutcomeUnknown(_ResumableError):
+    """Levée à la REPRISE depuis le journal : un appel dont l'intention est écrite mais pas le
+    résultat — l'effet a peut-être eu lieu (le processus est mort entre les deux).
+
+    La relancer pourrait refaire un envoi, un paiement. Rien n'a été relancé : à toi de dire ce
+    qui s'est passé, à partir de ce que SEUL le système externe sait (le mail est-il parti ?)::
+
+        journal.resolve(call_id, ok=True, result={"envoye": True})   # il est parti
+        journal.resolve(call_id, retry=True)                         # il n'est pas parti : relance
+        agent.resume_from_journal(journal)
+
+    Attributes: ``calls`` (les appels à l'issue inconnue), ``state`` (instantané), ``messages``.
+    """
+
+    def __init__(self, message: str = "", *args: Any) -> None:
+        super().__init__(message, *args)
+        self.calls: list[ToolCall] = []

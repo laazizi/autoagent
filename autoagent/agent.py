@@ -14,7 +14,9 @@ from .errors import (
     AgentCancelled,
     ApprovalRequired,
     AutoAgentError,
+    JournalError,
     MaxStepsExceeded,
+    OutcomeUnknown,
     TokenBudgetExceeded,
     ToolError,
 )
@@ -24,6 +26,7 @@ from .guards import (  # noqa: F401 — re-exportés pour les tests
     _call_signature,
     _count_call_signatures,
 )
+from .journal import Journal, RunView, key_scope
 from .logging import get_logger
 from .memory import Memory
 from .providers import create_provider
@@ -573,6 +576,15 @@ class Agent:
             the failure (``loop_guard_block``) instead of ending on a
             mute ``max_steps``. Counted from the transcript, so it
             survives checkpoint/resume.
+        journal: Optional durable ``Journal`` (D3, ``journal.py``). Every tool
+            call writes its INTENTION (fsync'd) BEFORE it runs and its result
+            after; the conversation is journaled at each step boundary. After
+            a hard kill, ``agent.resume_from_journal()`` re-injects the
+            results of completed calls and refuses to silently re-run a call
+            whose outcome is unknown (``OutcomeUnknown`` — the process died
+            between the effect and its record). FAIL-CLOSED: if the intention
+            cannot be written, the effect does not run. ``None`` (default):
+            historical behaviour, nothing written.
     """
 
     def __init__(
@@ -599,8 +611,10 @@ class Agent:
         max_repeated_tool_calls: int | None = None,
         trifecta_guard: str = "deny",
         bounds: Bounds | None = None,
+        journal: Journal | None = None,
     ) -> None:
         self.provider = provider
+        self.journal = journal
         self.registry = registry or ToolRegistry()
         self.system_prompt = system_prompt
         self.max_steps = max_steps
@@ -1357,6 +1371,81 @@ class Agent:
                 )
         raise AutoAgentError("agent loop ended without a result")  # pragma: no cover
 
+    def resume_from_journal(
+        self,
+        journal: Journal | None = None,
+        *,
+        run_id: str | None = None,
+        on_unknown: str = "pause",
+        context: dict[str, Any] | None = None,
+        cancel_token: threading.Event | None = None,
+        checkpoint: CheckpointHook | None = None,
+    ) -> AgentResult:
+        """Reprend un run depuis le JOURNAL DURABLE — après une coupure brutale (D3).
+
+        Le journal sait, pour chaque appel d'outil de l'étape interrompue, s'il a été écrit
+        (intention), exécuté (résultat), ou s'il est dans l'entre-deux :
+
+        * **résultat écrit** → réinjecté, l'outil n'est PAS relancé, et il ne repasse pas par
+          la politique (la décision a été prise à l'époque, l'effet a eu lieu) ;
+        * **rien d'écrit** → il tourne normalement (politique comprise) ;
+        * **intention sans résultat — l'issue est INCONNUE** (le processus est mort entre
+          l'effet et son enregistrement) → par défaut (``on_unknown="pause"``) rien n'est
+          relancé : ``OutcomeUnknown``, AVANT qu'aucun outil de l'étape ne tourne. Tu dis ce
+          qui s'est passé (``journal.resolve(...)``) puis tu reprends. Un outil déclaré
+          ``idempotent=True`` est relancé tout seul : c'est ce que le drapeau promet.
+          ``on_unknown="retry"`` relance tout (au moins une fois : à ne choisir que si tes
+          outils dédoublonnent par ``idempotency_key()``).
+
+        ``run_id`` : un run précis ; par défaut le dernier run mort sans ``run_end`` ou arrêté
+        sur une pause / une borne reprenable. Pas de variante streaming pour l'instant.
+        """
+        if on_unknown not in ("pause", "retry"):
+            raise ValueError("on_unknown must be 'pause' or 'retry'")
+        journal = journal or self.journal
+        if journal is None:
+            raise AutoAgentError("resume_from_journal needs a Journal (pass one, or build the Agent with journal=)")
+        if self.journal is None:
+            self.journal = journal
+        elif self.journal is not journal:
+            raise AutoAgentError("this agent writes to another Journal: build it with the one you resume from")
+        vue = journal.run_view(run_id) if run_id else journal.last_resumable_run()
+        if vue is None or not vue.messages:
+            raise AutoAgentError("no resumable run in this journal")
+        state = vue.to_run_state()
+        inconnus = [c for c in vue.in_doubt() if on_unknown == "pause" and not self._is_idempotent(c)]
+        if inconnus:
+            exc = OutcomeUnknown(
+                f"{len(inconnus)} tool call(s) have an UNKNOWN outcome ({', '.join(c.name for c in inconnus)}): the "
+                f"process died between the effect and its record, so it may have happened. Nothing was re-run. "
+                f"Tell the journal what happened — journal.resolve(call_id, ok=True, result=...) if it did, "
+                f"journal.resolve(call_id, retry=True) if it did not — then resume again."
+            )
+            exc.calls, exc.state, exc.messages = inconnus, state, state.messages
+            raise exc
+        for event in self._run_loop(
+            state.messages,
+            context=context,
+            cancel_token=cancel_token,
+            streaming=False,
+            checkpoint=checkpoint,
+            resume_from=state,
+            journal_view=vue,
+        ):
+            if event.type == "done":
+                return AgentResult(
+                    output=event.output,
+                    messages=event.messages,
+                    steps=event.steps,
+                    usage=event.usage,
+                    finish_reason=event.finish_reason,
+                )
+        raise AutoAgentError("agent loop ended without a result")  # pragma: no cover
+
+    def _is_idempotent(self, call: ToolCall) -> bool:
+        spec = next((s for s in self.registry.specs() if s.name == call.name), None)
+        return bool(spec is not None and spec.idempotent)
+
     def resume_stream(
         self,
         state: RunState,
@@ -1468,6 +1557,7 @@ class Agent:
         streaming: bool,
         checkpoint: CheckpointHook | None = None,
         resume_from: RunState | None = None,
+        journal_view: RunView | None = None,
     ) -> Iterator[StreamEvent]:
         """THE agent loop — single implementation behind both public entry
         points (0.10.0; previously ``run_messages`` and
@@ -1653,11 +1743,63 @@ class Agent:
             programme a lu du contenu non fiable (une fonction de l'hôte `untrusted`), le
             résultat sera encadré et le run teinté : voir `bridge_tainted` ci-dessous."""
             gate = ActionGate(self, guards, call, step, context)
-            with gate_scope(gate):
-                result = self.registry.execute(call, context=context)
+            if journal is not None and journal_run[0] is not None:
+                # D3 (`journal.py`) : l'INTENTION est écrite et forcée sur le disque AVANT
+                # l'effet, le résultat APRÈS. Fail-CLOSED : si l'intention ne s'écrit pas
+                # (`JournalError`), l'outil ne tourne pas. L'écart entre les deux écritures
+                # est la fenêtre où une coupure laisse une issue inconnue (`OutcomeUnknown`).
+                spec = next((s for s in self.registry.specs() if s.name == call.name), None)
+                cle = journal.record_intent(journal_run[0], call, step=step,
+                                            idempotent=bool(spec is not None and spec.idempotent))
+                with key_scope(cle), gate_scope(gate):
+                    result = self.registry.execute(call, context=context)
+                journal.record_result(journal_run[0], call, result, tainted=gate.tainted_by_host)
+            else:
+                with gate_scope(gate):
+                    result = self.registry.execute(call, context=context)
             if gate.tainted_by_host:
                 guards.bridge_tainted.add(call.id)
             return result
+
+        # ── Le journal durable (D3) : ouverture du run, instantanés, fin ─────────
+        journal = self.journal
+        journal_run: list[str | None] = [None]
+        journale = [0]                    # combien de messages du transcript sont déjà dans le journal
+        deja_faits: dict[str, Any] = {}   # appels déjà exécutés avant la coupure : résultat réinjecté
+
+        def _journal_state(step: int) -> None:
+            """Écrit le DELTA de conversation depuis le dernier état + les compteurs — à deux
+            moments : l'assistant vient de demander des outils (avant qu'aucun ne tourne), et
+            l'étape est finie (résultats dans le transcript)."""
+            if journal is None or journal_run[0] is None:
+                return
+            compteurs = _snapshot(step).to_dict()
+            compteurs.pop("messages", None)
+            journal.record_state(journal_run[0], compteurs,
+                                 [m.to_dict() for m in working_messages[journale[0]:]])
+            journale[0] = len(working_messages)
+
+        def _journal_end(status: str, *, discret: bool = False) -> None:
+            """`discret=True` : sur un chemin d'erreur, ne pas MASQUER l'exception d'origine
+            si le journal lui-même est en panne."""
+            if journal is None or journal_run[0] is None:
+                return
+            try:
+                journal.record_end(journal_run[0], status)
+            except JournalError:
+                if not discret:
+                    raise
+                _log.exception("journal: run_end(%s) not written", status)
+
+        if journal is not None:
+            if journal_view is not None:
+                journal_run[0] = journal.begin_run(resumes=journal_view.run_id)
+                journale[0] = len(working_messages)     # tout ce que le journal contenait déjà
+                deja_faits = journal_view.completed()
+                guards.bridge_tainted |= journal_view.bridge_tainted()   # la teinte survit à la coupure
+            else:
+                journal_run[0] = journal.begin_run()
+                _journal_state(resume_from.step if resume_from else 0)   # état de départ : toute la conversation
 
         def _run_turn_tools(
             calls: list[ToolCall], step: int, req_span: str | None
@@ -1668,8 +1810,12 @@ class Agent:
             # qu'AJOUTER des refus (retourner None n'efface rien), donc elle ne
             # peut jamais dé-bloquer une garde intégrée — l'hôte reste souverain
             # sans pouvoir affaiblir la frontière par inadvertance.
-            overrides = guards.builtin(calls, step, req_span)
-            overrides.update(guards.policy(calls, step, req_span))
+            # Un appel DÉJÀ exécuté avant une coupure (son résultat est dans le journal, D3)
+            # ne repasse ni par les gardes ni par l'outil : la décision a été prise à
+            # l'époque, et l'effet a eu lieu — le rejouer serait le refaire.
+            a_decider = [c for c in calls if c.id not in deja_faits]
+            overrides = guards.builtin(a_decider, step, req_span)
+            overrides.update(guards.policy(a_decider, step, req_span))
 
             def _timed(call: ToolCall) -> tuple[Any, int, Any]:
                 """Exécute UN appel et rend (résultat, durée, dépense déléguée).
@@ -1683,6 +1829,12 @@ class Agent:
                 denied = overrides.get(call.id)
                 if denied is not None:
                     return denied, 0, None
+                if call.id in deja_faits:
+                    repris = deja_faits.pop(call.id)
+                    self._emit("tool_call_replayed",
+                               {"name": call.name, "call_id": call.id, "step": step},
+                               parent_id=req_span)
+                    return repris, 0, None
                 started_at = time.monotonic()
                 avance = en_avance.pop(call.id, None)
                 if avance is not None:
@@ -1784,6 +1936,7 @@ class Agent:
                 )
                 _absorber_delegations()
                 _checkpoint(resume_from.step)
+                _journal_state(resume_from.step)
 
             for step in range(start_step, self.max_steps + 1):
                 # Cooperative cancellation: the host may set `cancel_token` to
@@ -1812,6 +1965,7 @@ class Agent:
                         _avec_temoin({"status": "token_budget", "steps": step - 1}),
                         parent_id=run_span,
                     )
+                    _journal_end("token_budget", discret=True)
                     exhausted = TokenBudgetExceeded(
                         f"Run token budget exhausted: spent {spent} >= budget {self.token_budget}"
                     )
@@ -1944,6 +2098,7 @@ class Agent:
                         turn_start = len(working_messages)
                         yield StreamEvent(type="correction", text=correction.content)
                         _checkpoint(step)
+                        _journal_state(step)
                         continue
                     self._emit(
                         "run_end",
@@ -1955,6 +2110,7 @@ class Agent:
                         }),
                         parent_id=run_span,
                     )
+                    _journal_end("ok")
                     yield StreamEvent(
                         type="done",
                         output=response.content,
@@ -1971,12 +2127,16 @@ class Agent:
                     )
                     return
 
+                # D3 : l'assistant vient de demander des outils et AUCUN n'a tourné — c'est le
+                # point où une coupure doit pouvoir « finir l'étape » sans redemander au modèle.
+                _journal_state(step)
                 yield from _run_turn_tools(list(response.tool_calls), step, req_span)
                 _absorber_delegations()
 
                 # Step boundary: every tool result of this step is in the
                 # transcript — the run is resumable from exactly here.
                 _checkpoint(step)
+                _journal_state(step)
 
             self._emit("max_steps_exceeded", {"max_steps": self.max_steps}, parent_id=run_span)
             self._emit(
@@ -1984,20 +2144,24 @@ class Agent:
                 _avec_temoin({"status": "max_steps", "steps": self.max_steps}),
                 parent_id=run_span,
             )
+            _journal_end("max_steps", discret=True)
             exceeded = MaxStepsExceeded(f"Agent exceeded max_steps={self.max_steps}")
             exceeded.messages = working_messages  # consumed by run_messages_stream
             exceeded.state = _snapshot(self.max_steps)  # resumable after raising max_steps
             raise exceeded
         except AgentCancelled:
             self._emit("run_end", {"status": "cancelled"}, parent_id=run_span)
+            _journal_end("cancelled", discret=True)
             raise
         except ApprovalRequired:
             self._emit("run_end", {"status": "approval_required"}, parent_id=run_span)
+            _journal_end("approval_required", discret=True)
             raise
         except (MaxStepsExceeded, TokenBudgetExceeded):
             raise  # run_end already emitted at the raise site
         except Exception:
             self._emit("run_end", {"status": "error"}, parent_id=run_span)
+            _journal_end("error", discret=True)
             raise
 
     def _is_untrusted(self, call: ToolCall) -> bool:
