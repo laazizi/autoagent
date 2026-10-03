@@ -28,6 +28,7 @@ from .agent import (
 )
 from .bounds import Bounds
 from .cascade import CascadeResult, TierAttempt, cascade
+from .compare import ComparisonReport, EvalTask, Variant, compare_configs
 from .dynamic import DynamicToolBuilder, PythonRunner, ToolBuildRequest
 from .errors import (
     AgentCancelled,
@@ -110,6 +111,10 @@ __all__ = [
     "CascadeResult",
     "TierAttempt",
     "cascade",
+    "ComparisonReport",
+    "EvalTask",
+    "Variant",
+    "compare_configs",
     "Bounds",
     "TraceMetrics",
     "summarize_trace",

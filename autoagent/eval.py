@@ -208,6 +208,39 @@ class ReliabilityReport:
         }
 
 
+def _tentative(
+    agent: Any,
+    prompt: str,
+    check: Callable[[Any], bool],
+    context: dict[str, Any] | None,
+    index: int,
+) -> Attempt:
+    """UNE tentative mesurée : l'unité que `run_k` et `compare_configs` partagent.
+
+    L'agent est déjà construit (une fabrique qui plante est une erreur du banc,
+    pas un échec de fiabilité) ; ce qui se passe ENSUITE — un run qui lève, un
+    juge qui lève — est un échec mesuré, jamais une exception du banc.
+    """
+    attempt = Attempt(index=index, ok=False)
+    try:
+        result = agent.run(prompt, context=context)
+        attempt.steps = getattr(result, "steps", 0)
+        usage = getattr(result, "usage", None)
+        attempt.total_tokens = getattr(usage, "total_tokens", None)
+        attempt.input_tokens = getattr(usage, "input_tokens", None)
+        attempt.output_tokens = getattr(usage, "output_tokens", None)
+        attempt.cached_tokens = getattr(usage, "cached_tokens", None)
+        attempt.output = getattr(result, "output", "") or ""
+        try:
+            attempt.ok = bool(check(result))
+        except Exception as exc:
+            attempt.error = f"check raised: {type(exc).__name__}: {exc}"
+    except Exception as exc:
+        # Un run qui plante EST un échec de fiabilité, pas une erreur du banc.
+        attempt.error = f"{type(exc).__name__}: {exc}"
+    return attempt
+
+
 def run_k(
     agent_or_factory: Any,
     prompt: str,
@@ -243,23 +276,7 @@ def run_k(
     report = ReliabilityReport(k=k)
     for index in range(1, k + 1):
         agent = agent_or_factory() if callable(agent_or_factory) else agent_or_factory
-        attempt = Attempt(index=index, ok=False)
-        try:
-            result = agent.run(prompt, context=context)
-            attempt.steps = getattr(result, "steps", 0)
-            usage = getattr(result, "usage", None)
-            attempt.total_tokens = getattr(usage, "total_tokens", None)
-            attempt.input_tokens = getattr(usage, "input_tokens", None)
-            attempt.output_tokens = getattr(usage, "output_tokens", None)
-            attempt.cached_tokens = getattr(usage, "cached_tokens", None)
-            attempt.output = getattr(result, "output", "") or ""
-            try:
-                attempt.ok = bool(check(result))
-            except Exception as exc:
-                attempt.error = f"check raised: {type(exc).__name__}: {exc}"
-        except Exception as exc:
-            # Un run qui plante EST un échec de fiabilité, pas une erreur du banc.
-            attempt.error = f"{type(exc).__name__}: {exc}"
+        attempt = _tentative(agent, prompt, check, context, index)
         report.attempts.append(attempt)
         if on_attempt is not None:
             try:
