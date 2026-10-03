@@ -56,7 +56,10 @@ _log = get_logger("policy")
 
 _ACTIONS = ("allow", "deny", "approve")
 _RESTRICTIVE = ("deny", "approve")          # ne peuvent que retirer des droits
-_CONTEXT_KEYS = ("args", "tainted", "egress", "step", "permissions")
+# `source` (D1) : d'où vient l'action — "tool" (appel direct du modèle), "host_function" (fonction
+# de l'hôte appelée par du code du modèle), "subagent" (outil d'un sous-agent qui hérite de la
+# politique). Permet de dire en DONNÉES « aucun envoi depuis un programme », sans toucher au code.
+_CONTEXT_KEYS = ("args", "tainted", "egress", "step", "permissions", "source")
 
 
 def _as_number(value: Any) -> float | None:
@@ -274,6 +277,8 @@ class ToolPolicySpec:
                 perms = list(getattr(spec, "permissions", None) or [])
                 if not _match_predicate(perms, predicate):
                     return False
+            elif key == "source" and not _match_predicate(getattr(ctx, "source", "tool"), predicate):
+                return False
         return True
 
 

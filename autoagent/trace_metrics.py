@@ -201,6 +201,14 @@ def summarize_trace(source: str | Path | Iterable[Any]) -> TraceMetrics:
             m.blocked_by_guard[t] = m.blocked_by_guard.get(t, 0) + 1
         elif t in _TEMOINS:
             m.would_block[t] = m.would_block.get(t, 0) + 1
+        elif t == "gate_decision":
+            # La porte de décision (D1) : un refus d'une action que le MODÈLE a déclenchée par
+            # son propre code (`host_function`) ou par un sous-agent (`subagent`).
+            cle = f"gate_decision:{p.get('source', '?')}"
+            if p.get("allowed") is False:
+                m.blocked_by_guard[cle] = m.blocked_by_guard.get(cle, 0) + 1
+            if p.get("would_block"):
+                m.would_block[cle] = m.would_block.get(cle, 0) + 1
         elif t == "context_pruned":
             m.pruned_chars += int(p.get("chars_saved") or 0)
     if tokens_vus:

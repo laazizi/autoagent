@@ -18,6 +18,7 @@ from .errors import (
     TokenBudgetExceeded,
     ToolError,
 )
+from .gate import ActionGate, active_gate, gate_scope
 from .guards import (  # noqa: F401 — re-exportés pour les tests
     TurnGuards,
     _call_signature,
@@ -175,6 +176,15 @@ class ToolPolicyContext:
             it survives checkpoint/resume. NB: evaluated BEFORE the turn's
             tools run — a fetch and a sensitive call requested in the SAME
             turn both see the pre-turn taint state.
+        egress: ``True`` when the targeted tool/function is marked ``egress``.
+        source: where the action comes from. ``"tool"`` (default): a tool call
+            the model made directly. ``"host_function"``: a host function the
+            model's OWN CODE called through the bridge (``run_python``, a
+            generated tool, ``call_host_function``). ``"subagent"``: a tool call a
+            sub-agent made while it inherited this agent's policy. The SAME
+            policy sees all three — one decision for every path that acts. An
+            ``ApprovalRequired`` raised for the last two denies the call: a
+            program or a delegate cannot be paused mid-run.
     """
 
     call: ToolCall
@@ -184,6 +194,7 @@ class ToolPolicyContext:
     context: dict[str, Any]
     tainted: bool = False
     egress: bool = False
+    source: str = "tool"
 
 
 # None = allow. A str = deny with that reason (the model sees it as a tool
@@ -626,6 +637,15 @@ class Agent:
             }
             bounds.apply_to(self, explicites)
             self.prune_batch = max(1, int(self.prune_batch))
+        # La porte de décision (D1, `gate.py`) : les fonctions de l'hôte que le CODE du
+        # modèle appelle (`run_python`, outils générés, `call_host_function`) passent par
+        # `tool_policy` et la garde trifecta, comme un appel d'outil direct. Un agent sans
+        # politique ni outil `egress` ne voit aucune différence. `False` rend le
+        # comportement 0.22.0 (pont non gouverné) — à ne choisir qu'en connaissance de cause.
+        self.govern_host_calls = True
+        # La porte du PARENT, posée le temps d'un run de sous-agent qui hérite de sa
+        # politique (`as_tool(inherit_policy=True)`). `None` = comportement historique.
+        self._parent_gate: ActionGate | None = None
         self.dynamic_builder: DynamicToolBuilder | None = None
         self._dynamic_tools_built_this_run = 0
         self._python_runs_this_run = 0
@@ -1120,6 +1140,7 @@ class Agent:
         name: str,
         description: str,
         request_description: str = "La demande à traiter, formulée en langage naturel.",
+        inherit_policy: bool = False,
     ) -> Callable[..., Any]:
         """Expose THIS agent as a tool for another agent (0.10.0).
 
@@ -1147,6 +1168,15 @@ class Agent:
           * The returned dict carries ``output``, ``steps`` and ``tokens``
             (when the provider reports usage) so the parent — and your
             transcript — see the delegation cost.
+          * ``inherit_policy=True`` (opt-in): every tool call the sub-agent
+            makes during this delegation ALSO goes through the PARENT's
+            ``tool_policy``, trifecta guard and taint (``ctx.source ==
+            "subagent"``). Without it the sub-agent acts under its own policy
+            only, so a supervisor under a strict policy could delegate to a
+            specialist with none and have it do what the supervisor cannot.
+            An approval request from the parent's policy DENIES the call: a
+            delegate cannot be paused mid-run. Transitive across nested
+            delegations.
 
         Thread-safety: an ``Agent`` instance serves ONE caller at a time.
         If the parent uses ``parallel_tool_calls=True``, give each
@@ -1161,6 +1191,12 @@ class Agent:
             # reste ici après un run raté ne doit pas être facturé au parent au
             # tour suivant.
             canal.poser(None)
+            # D1 : la porte posée par la boucle autour de CET appel d'outil devient celle du
+            # PARENT pour la durée du run du sous-agent (`TurnGuards._parent_policy`).
+            parent = active_gate() if inherit_policy else None
+            anterieur = agent_self._parent_gate
+            if parent is not None:
+                agent_self._parent_gate = parent
             try:
                 result = agent_self.run(request, context=context)
             except Exception as exc:
@@ -1170,6 +1206,8 @@ class Agent:
                 # aveugle. Les arrêts reprenables portent la dépense dans `.state`.
                 canal.poser(_depense_d_un_echec(exc))
                 raise
+            finally:
+                agent_self._parent_gate = anterieur
             sortie = result.output
             if is_tainted(result.messages):
                 # Le sous-agent a lu du contenu externe : sa réponse peut le
@@ -1539,8 +1577,7 @@ class Agent:
             if not en_avance_pool:
                 en_avance_pool.append(ThreadPoolExecutor(
                     max_workers=4, thread_name_prefix="autoagent-early"))
-            en_avance[call.id] = en_avance_pool[0].submit(
-                self.registry.execute, call, context=context)
+            en_avance[call.id] = en_avance_pool[0].submit(_executer, call, step)
             self._emit("tool_call_early_start",
                        {"step": step, "name": call.name, "call_id": call.id},
                        parent_id=req_span)
@@ -1607,6 +1644,21 @@ class Agent:
         guards = TurnGuards(self, working_messages, context, taint, temoin, _snapshot)
         _policy_overrides = guards.policy
 
+        def _executer(call: ToolCall, step: int) -> Any:
+            """L'UNIQUE chemin par lequel la boucle lance un outil (D1, `gate.py`).
+
+            La porte est posée autour du handler : tout ce que celui-ci déclenche lui-même
+            — une fonction de l'hôte appelée par du code du modèle, un sous-agent — passe
+            par la MÊME décision que l'appel direct (politique, trifecta, teinte). Si le
+            programme a lu du contenu non fiable (une fonction de l'hôte `untrusted`), le
+            résultat sera encadré et le run teinté : voir `bridge_tainted` ci-dessous."""
+            gate = ActionGate(self, guards, call, step, context)
+            with gate_scope(gate):
+                result = self.registry.execute(call, context=context)
+            if gate.tainted_by_host:
+                guards.bridge_tainted.add(call.id)
+            return result
+
         def _run_turn_tools(
             calls: list[ToolCall], step: int, req_span: str | None
         ) -> Iterator[StreamEvent]:
@@ -1641,7 +1693,7 @@ class Agent:
                     result = avance.result()
                     en_avance_utilises[0] += 1
                 else:
-                    result = self.registry.execute(call, context=context)
+                    result = _executer(call, step)
                 duration_ms = int((time.monotonic() - started_at) * 1000)
                 # Consommé (prendre = lire et vider) : un deuxième appel du même
                 # outil ne doit pas refacturer la dépense du premier. Le canal
@@ -1676,7 +1728,7 @@ class Agent:
                         tool_name=call.name,
                         tool_status="ok" if tool_result.ok else "error",
                     )
-                    untrusted = self._is_untrusted(call)
+                    untrusted = self._is_untrusted(call) or call.id in guards.bridge_tainted
                     if untrusted:
                         taint[0] = True                     # teinte monotone
                     working_messages.append(
@@ -1696,7 +1748,7 @@ class Agent:
                         tool_name=call.name,
                         tool_status="ok" if tool_result.ok else "error",
                     )
-                    untrusted = self._is_untrusted(call)
+                    untrusted = self._is_untrusted(call) or call.id in guards.bridge_tainted
                     if untrusted:
                         taint[0] = True                     # teinte monotone
                     working_messages.append(
@@ -2186,6 +2238,7 @@ def delegate_to(
     name: str = "delegate",
     description: str | None = None,
     max_parallel: int = 4,
+    inherit_policy: bool = False,
 ) -> Callable[..., Any]:
     """Un outil qui interroge PLUSIEURS sous-agents EN MÊME TEMPS (0.20.0).
 
@@ -2220,6 +2273,10 @@ def delegate_to(
     ``error``, les autres passent. Et si le run d'un spécialiste a vu du contenu
     externe non fiable, sa sortie est rendue ENCADRÉE — sans quoi déléguer
     laverait la teinte.
+
+    ``inherit_policy=True`` (opt-in, D1) : chaque appel d'outil d'un spécialiste passe
+    AUSSI par la politique, la garde trifecta et la teinte du PARENT (voir
+    `Agent.as_tool`). Défaut inchangé : un spécialiste agit sous sa propre politique.
     """
     if not specialistes:
         raise ValueError("delegate_to attend au moins un spécialiste")
@@ -2231,14 +2288,19 @@ def delegate_to(
         f"several times. Available specialists: {', '.join(noms)}."
     )
 
-    def _une(cible: str, demande: str,
-             context: dict[str, Any] | None) -> tuple[dict[str, Any], Any]:
+    def _une(cible: str, demande: str, context: dict[str, Any] | None,
+             parent: ActionGate | None = None) -> tuple[dict[str, Any], Any]:
         agent = specialistes[cible]
+        anterieur = agent._parent_gate
+        if parent is not None:
+            agent._parent_gate = parent
         try:
             resultat = agent.run(demande, context=context)
         except Exception as exc:                       # remonte au LLM, pas au parent
             # …mais sa DÉPENSE remonte au parent (0.22.0), comme pour `as_tool`.
             return {"specialist": cible, "error": f"{type(exc).__name__}: {exc}"}, _depense_d_un_echec(exc)
+        finally:
+            agent._parent_gate = anterieur
         sortie = resultat.output
         if is_tainted(resultat.messages):
             # Le spécialiste a lu du contenu externe : sa sortie peut le citer.
@@ -2261,6 +2323,9 @@ def delegate_to(
         canal.poser(None)
         if not isinstance(requests, list) or not requests:
             return {"responses": [], "error": "`requests` must be a non-empty list."}
+        # La porte du parent se lit ICI, dans le thread de l'appel : les threads du pool
+        # qui font tourner les spécialistes ne la voient pas (contexte vide).
+        parent = active_gate() if inherit_policy else None
 
         # Regroupement par spécialiste : un Agent ne sert qu'un appelant à la
         # fois, donc deux demandes pour la même cible ne peuvent PAS partir
@@ -2282,7 +2347,7 @@ def delegate_to(
             # Chaque index n'est écrit que par UN thread : pas de verrou requis.
             for index in groupes[cible]:
                 demande = str((requests[index] or {}).get("request", ""))
-                reponses[index], usages[index] = _une(cible, demande, context)
+                reponses[index], usages[index] = _une(cible, demande, context, parent)
 
         if len(groupes) > 1:
             with ThreadPoolExecutor(

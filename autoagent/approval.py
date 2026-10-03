@@ -39,6 +39,7 @@ from typing import Any, Callable
 
 from ._fichiers import atomic_write_text
 from .errors import ToolError, ToolValidationError
+from .gate import active_gate
 from .sandbox import (
     extract_tool_metadata,
     load_generated_tool,
@@ -210,6 +211,14 @@ def _make_native_handler(
         fn = host_functions.get(name)
         if fn is None:
             raise RuntimeError(f"host function not allowed: {name}")
+        # LA porte (D1, gate.py) : un outil promu en natif est du code approuvé par empreinte,
+        # mais ses données viennent du run — taint, politique et trifecta s'appliquent aux
+        # fonctions de l'hôte qu'il appelle, comme au pont du bac à sable.
+        gate = active_gate()
+        refus = None if gate is None else gate.decide(
+            name, args or {}, spec=getattr(fn, "__autoagent_tool_spec__", None))
+        if refus is not None:
+            raise RuntimeError(f"ToolPolicyDenied: {refus}")
         return fn(**(args or {}))
 
     def handler(context: dict[str, Any] | None = None, **kwargs: Any) -> Any:

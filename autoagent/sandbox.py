@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .errors import ToolError, ToolValidationError
+from .gate import active_gate
 from .schema import JsonDict, ToolSpec
 
 __all__ = [
@@ -370,10 +371,21 @@ def _drive_bridge(
                 if fn is None:
                     resp: JsonDict = {"ok": False, "error": f"host function not allowed: {name}"}
                 else:
-                    try:
-                        resp = {"ok": True, "result": fn(**(msg.get("args") or {}))}
-                    except Exception as exc:
-                        resp = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                    # LA porte (D1, gate.py) AVANT l'exécution : du code écrit par le modèle
+                    # appelle ici une fonction de l'hôte — avec la politique, la garde
+                    # trifecta et la teinte du run qui l'a lancé. Hors d'un run d'agent
+                    # (`active_gate()` est None), rien ne change.
+                    gate = active_gate()
+                    refus = None if gate is None else gate.decide(
+                        name, msg.get("args") or {},
+                        spec=getattr(fn, "__autoagent_tool_spec__", None))
+                    if refus is not None:
+                        resp = {"ok": False, "error": f"ToolPolicyDenied: {refus}"}
+                    else:
+                        try:
+                            resp = {"ok": True, "result": fn(**(msg.get("args") or {}))}
+                        except Exception as exc:
+                            resp = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
                 proc.stdin.write(json.dumps(resp, ensure_ascii=False, default=repr) + "\n")
                 proc.stdin.flush()
             elif kind == "result":

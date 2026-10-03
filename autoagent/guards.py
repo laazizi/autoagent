@@ -25,6 +25,7 @@ from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
 from .errors import ApprovalRequired
+from .gate import evaluate_policy, trifecta_blocks
 from .logging import get_logger
 from .registry import ToolResult
 from .schema import Message, ToolCall, is_tainted
@@ -102,6 +103,10 @@ class TurnGuards:
         # l'appeler deux fois pour le même appel — en avance, puis au tour —
         # comptait double. Une décision par appel, réutilisée par le tour.
         self._verdicts: dict[str, str | None] = {}
+        # Appels d'outil dont l'exécution a lu du contenu NON FIABLE par une fonction de
+        # l'hôte (D1, `gate.py`) : leur résultat sera encadré et le run teinté, même si
+        # l'outil lui-même (`run_python`, un outil généré) n'est pas déclaré `untrusted`.
+        self.bridge_tainted: set[str] = set()
 
     # ── anti-boucle ──────────────────────────────────────────────────────────
 
@@ -197,7 +202,8 @@ class TurnGuards:
         if not (self.taint[0] or is_tainted(self.messages)):
             return overrides                      # rien d'externe n'est entré
         for call in calls:
-            if not agent._is_egress(call):
+            # `trifecta_blocks` : la définition de la règle, partagée avec la porte (D1).
+            if not trifecta_blocks(agent, True, agent._is_egress(call)):
                 continue
             if dry:
                 # Vérification anticipée : JAMAIS de pause ici. L'appel n'est pas
@@ -253,6 +259,14 @@ class TurnGuards:
         refuse) est MÉMORISÉ par call.id et réutilisé par le tour : la
         politique de l'hôte n'est appelée qu'une fois par appel.
         """
+        overrides = self._own_policy(calls, step, req_span, dry=dry)
+        overrides.update(self._parent_policy(calls, step, req_span, overrides, dry=dry))
+        return overrides
+
+    def _own_policy(
+        self, calls: list[ToolCall], step: int, req_span: str | None, *, dry: bool = False
+    ) -> dict[str, ToolResult]:
+        """La politique de CET agent (le comportement historique, inchangé)."""
         from .agent import ToolPolicyContext  # import paresseux : évite le cycle
 
         agent = self.agent
@@ -273,9 +287,11 @@ class TurnGuards:
                 tainted=tainted,
                 egress=bool(spec is not None and spec.egress),
             )
-            try:
-                verdict = agent.tool_policy(policy_ctx)
-            except ApprovalRequired as pause:
+            # `evaluate_policy` (gate.py) : l'UNIQUE endroit où le callable de l'hôte est
+            # appelé, fail-CLOSED (une politique qui plante refuse). Ici une pause est
+            # propagée avec un instantané ; la porte, elle, la convertit en refus.
+            verdict, pause = evaluate_policy(agent, policy_ctx)
+            if pause is not None:
                 if dry:
                     overrides[call.id] = ToolResult(ok=False, error="ApprovalRequired")
                     continue
@@ -291,15 +307,7 @@ class TurnGuards:
                     },
                     parent_id=req_span,
                 )
-                raise
-            except Exception as exc:
-                # Fail-CLOSED: a buggy policy denies. This hook is a
-                # security boundary — the opposite contract of trace/
-                # checkpoint callbacks, which fail-open.
-                _log.exception("tool_policy raised; denying %r (fail-closed)", call.name)
-                verdict = f"policy error: {type(exc).__name__}: {exc}"
-            if verdict is not None and not isinstance(verdict, str):
-                verdict = "policy returned an unsupported verdict type"
+                raise pause
             if dry:
                 self._verdicts[call.id] = verdict     # le tour réutilisera CETTE décision
                 if verdict is not None:
@@ -309,6 +317,39 @@ class TurnGuards:
                 continue
             self._deny(overrides, call, step, req_span, verdict)
         return overrides
+
+    def _parent_policy(
+        self, calls: list[ToolCall], step: int, req_span: str | None,
+        deja: dict[str, ToolResult], *, dry: bool = False,
+    ) -> dict[str, ToolResult]:
+        """La politique du PARENT, pour un sous-agent qui en hérite (D1).
+
+        Posée par `as_tool(inherit_policy=True)` / `delegate_to(inherit_policy=True)` le
+        temps d'un run. Sans elle, un superviseur sous `tool_policy` stricte pouvait
+        déléguer à un spécialiste SANS politique et faire faire par lui ce qu'il ne pouvait
+        pas faire lui-même. Le parent décide avec SA politique, SA garde trifecta et SA
+        teinte (plus celle du sous-agent). Une demande d'approbation REFUSE : un sous-agent
+        ne peut pas être mis en pause au milieu de son run par le parent.
+        """
+        parent = self.agent._parent_gate
+        supplement: dict[str, ToolResult] = {}
+        if parent is None:
+            return supplement
+        tainted = self.taint[0] or is_tainted(self.messages)
+        for call in calls:
+            if call.id in deja:
+                continue
+            if dry:
+                # La politique du parent est un callable de l'HÔTE, parfois à effet de bord :
+                # elle ne s'appelle qu'UNE fois par appel, au tour. Pas de lancement en avance.
+                supplement[call.id] = ToolResult(ok=False, error="EarlyDeferred")
+                continue
+            spec = next((s for s in self.agent.registry.specs() if s.name == call.name), None)
+            refus = parent.decide(call.name, call.arguments, spec=spec, source="subagent",
+                                  messages=self.messages, step=step, own_tainted=tainted)
+            if refus is not None:
+                self._deny(supplement, call, step, req_span, refus)
+        return supplement
 
     def _deny(self, overrides: dict[str, ToolResult], call: ToolCall, step: int,
               req_span: str | None, verdict: str) -> None:

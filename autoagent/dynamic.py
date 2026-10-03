@@ -128,9 +128,12 @@ class PythonRunner:
         permet au modèle d'écrire UN programme qui appelle plusieurs fois des outils
         de l'hôte, au lieu d'un appel d'outil par tour. Mêmes règles que pour
         `DynamicToolBuilder` : liste blanche, exécutées chez l'hôte avec ses droits sur
-        des arguments choisis par le modèle — et elles NE PASSENT PAS par la politique
-        d'outils de l'agent (`tool_policy`, trifecta, approbation) : n'expose ici que des
-        fonctions que tu laisserais appeler sans condition."""
+        des arguments choisis par le modèle. Depuis D1 elles passent par LA porte de
+        décision de l'agent qui lance l'extrait (`gate.py`) : `tool_policy` (avec
+        `ctx.source == "host_function"`), garde trifecta et teinte — une approbation
+        humaine y REFUSE, un programme ne pouvant pas être mis en pause. Pour qu'une
+        fonction compte comme `egress` ou `untrusted`, décore-la avec `autoagent.tool(...)`.
+        Hors d'un run d'agent (le runner appelé à la main), rien n'est consulté."""
         sandbox = sandbox or SubprocessSandbox(timeout=timeout)
         if isinstance(sandbox, SubprocessSandbox) and sandbox.warm:
             sandbox = dataclasses.replace(sandbox, warm=False)

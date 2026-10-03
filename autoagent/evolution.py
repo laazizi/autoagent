@@ -9,6 +9,7 @@ from typing import Any
 
 from .agent import Agent
 from .errors import ToolError
+from .gate import active_gate
 from .logging import get_logger, warn_once
 from .pipeline import PipelineManager
 from .registry import schema_from_callable
@@ -369,6 +370,14 @@ class EvolutionRuntime:
         func = self.host_functions.get(name)
         if func is None:
             raise ToolError(f"Unknown host function: {name}")
+        # LA porte (D1, gate.py) : cet outil est un DISPATCHER — la politique de l'hôte a vu
+        # `call_host_function`, pas la fonction qu'il lance. La porte rend la décision sur
+        # le NOM de la fonction réellement appelée.
+        gate = active_gate()
+        refus = None if gate is None else gate.decide(
+            name, arguments or {}, spec=getattr(func, "__autoagent_tool_spec__", None))
+        if refus is not None:
+            raise ToolError(f"ToolPolicyDenied: {refus}")
         result = func(**(arguments or {}))
         return {"ok": True, "result": result}
 
