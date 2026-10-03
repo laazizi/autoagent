@@ -1,4 +1,4 @@
-"""Le constructeur visuel génère du Python qui tourne sur la lib COURANTE (0.21.0).
+"""Le constructeur visuel génère du Python qui tourne sur la lib COURANTE.
 
 `constructeur_autoagent.html` est du JavaScript qui émet du Python. Rien ne le
 faisait tourner en CI : il pouvait dériver de la lib en silence (kwarg renommé,
@@ -81,7 +81,7 @@ class TestChaquePreset:
     def test_tous_les_presets_se_generent(self, generes: list[dict]) -> None:
         rates = [p for p in generes if not p["ok"]]
         assert not rates, "presets en échec : " + "; ".join(f"{p['label']} → {p['erreur']}" for p in rates)
-        assert len(generes) >= 27
+        assert len(generes) >= 30
 
     def test_aucun_placeholder(self, reussis: list[dict]) -> None:
         vides = [p["label"] for p in reussis if Path(p["fichier"]).read_text(encoding="utf-8").lstrip().startswith("# ←")]
@@ -148,6 +148,15 @@ ATTENDUS = {
     "deleg": ("delegate_to(",),
     "casc": ("cascade(", "check=juge"),
     "synth": ("synthesize_tool(", "Example("),
+    # Comparer deux configurations : la primitive, des tâches à juge EN CODE, un contrôle A/A,
+    # et `params` qui DÉCLARE l'écart (l'empreinte ne lit pas le code d'un outil).
+    "comp": ("compare_configs(", "Variant(\"A\"", "EvalTask(", "lambda res:", "control=True", "params={\"modele\""),
+    # D1 : un sous-agent qui hérite de la politique du parent — l'option doit être ÉMISE, avec la
+    # politique qu'il hérite et la gestion d'une approbation.
+    "herite": ("inherit_policy=True", "ToolPolicySpec.from_dict(", "except ApprovalRequired", "egress=True"),
+    # D3 : le journal durable — créé, branché sur l'agent, reprise ET gestion d'une issue inconnue.
+    "jrn": ("journal = Journal(", "journal=journal", "resume_from_journal(", "except OutcomeUnknown",
+            "journal.resolve(", "journal.close()"),
     "evol": ("EvolutionRuntime(", "enable_software_evolution(", "validation_command="),
     # Outils dynamiques, lots A-C : tout ce que les options émettent doit exister dans la lib.
     "dynpro": ("allowed_permissions=set()", "max_repairs=2", "persist=True", "PythonRunner(sandbox=bac)",

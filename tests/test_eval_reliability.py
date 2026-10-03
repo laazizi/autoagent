@@ -3,7 +3,9 @@
 `pass@1` ne dit presque rien à un exploitant : 90 % de pass@1 donne **43 % à
 k=8**, parce que `pass^k ≈ p^k` s'effondre exponentiellement. Ce banc rend cet
 effondrement visible, avec un juge DÉTERMINISTE fourni par l'hôte (jamais un
-LLM-as-judge : ils plafonnent sous 55 % sur les échecs d'agent).
+LLM-as-judge : sur Who&When, la meilleure attribution automatique des échecs
+d'agent désigne l'agent fautif dans 53,5 % des cas et l'étape dans 14,2 % —
+Zhang et al., arXiv:2505.00212).
 """
 
 from __future__ import annotations

@@ -31,7 +31,7 @@ gates, durable runs, fact memory, MCP client, OpenTelemetry export.
    | Observability (trace, checkpoint, OTel, memory compaction) | **fail-open**: log and continue, never break the run |
    | Security (`tool_policy`, workspace, sandbox, approval manifest) | **fail-closed**: a crashing policy DENIES |
    | Tool handlers | exceptions become tool errors the model sees — never a crash |
-5. **Run the tests**: `pytest tests -q` (1198 tests, under a minute — about 50 s on Windows, where each sandbox subprocess costs ~0.1 s; the 7 `test_constructeur` tests need Node and are skipped without it). Docker
+5. **Run the tests**: `pytest tests -q` (1330 tests, about a minute — about 60 s on Windows, where each sandbox subprocess costs ~0.1 s; the 12 `test_constructeur` tests need Node and are skipped without it). Docker
    sandbox tests skip themselves when no daemon. `tests/conftest.py`
    provides `FakeLLMProvider` (records requests in `.calls`).
 6. **Sync the docs with any change** — the recurring failure mode of this
@@ -62,13 +62,16 @@ gates, durable runs, fact memory, MCP client, OpenTelemetry export.
 | `autoagent/_fichiers.py` | `atomic_write_text` / `quarantine` — state files (facts, vectors, manifest) never left truncated nor overwritten when unreadable (0.22.0) |
 | `autoagent/cascade.py` | `cascade` — cheap tier first, escalate only when the host's `check` refuses (0.21.0); failed tiers paid; `ApprovalRequired` propagates |
 | `autoagent/trace_metrics.py` | `summarize_trace` — efficiency counters from a JSONL trace, runs rebuilt from span parentage (0.21.0) |
-| `autoagent/policy.py` | `ToolPolicySpec` — tool policy as versionable JSON; `compile()` → the existing `tool_policy` signature; monotonic containment (`narrow`/`expand`) |
-| `autoagent/eval.py` | `run_k` — `pass^k` reliability measurement with a host-supplied DETERMINISTIC judge (never an LLM judge) |
+| `autoagent/journal.py` | `Journal` — durable, append-only, hash-chained JSONL, ONE writer (OS lock on `<file>.lock`, freed at process death). INTENT fsync'd BEFORE the effect, result AFTER (`Agent._run_loop._executer`); `Agent(journal=)` + `resume_from_journal()`: completed calls re-injected (never re-run, not re-policed), unknown outcomes raise `OutcomeUnknown` BEFORE any tool of the step runs (`idempotent=True` tools re-run), `journal.resolve(...)` is the host's decision. **Fail-CLOSED** (no intent written, no effect) — the opposite of the trace, so they stay two mechanisms. `on_boundary` hook = kill points for tests. `tests/test_journal.py` (crash at each of 10 boundaries; 3 mutants must go red) + `tests/test_journal_kill.py` (real `os._exit`). Power loss NOT tested |
+| `autoagent/policy.py` | `ToolPolicySpec` — tool policy as versionable JSON; `compile()` → the existing `tool_policy` signature; monotonic containment (`narrow`/`expand`); `when: {"source": …}` |
+| `autoagent/gate.py` | `ActionGate` — THE decision for every path that acts: the host-function bridge (`run_python`, generated tools), native `call_host`, `call_host_function`, and sub-agents with `inherit_policy=True`. Policy (`evaluate_policy` — the ONLY place `tool_policy` is called) + trifecta (`trifecta_blocks`) + taint; fail-closed; an approval request DENIES (no pause mid-program). The loop sets the gate around every tool execution (`_executer`); sinks read `active_gate()`. `tests/test_gate.py` AST-checks that every host-function sink decides BEFORE it runs — a new execution path must fail it, not bypass the policy. Proven on 0.22.0: the bridge let a refused mail leave |
+| `autoagent/eval.py` | `run_k` — `pass^k` reliability measurement with a host-supplied DETERMINISTIC judge (never an LLM judge); `_tentative` is the one measured attempt both `run_k` and `compare_configs` use |
+| `autoagent/compare.py` | `compare_configs` — two configurations on the same tasks, deterministic judges, arms ALTERNATING each repetition. The verdict needs TWO calculations to agree: an exact stratified permutation test (false-alert probability ≤ α by construction) and a Wilson–Newcombe interval; default answer "indistinguishable". Measured by exact enumeration: the interval alone declared a winner on IDENTICAL configurations up to 14.6 % of the time — never simplify the rule to it (`tests/test_compare_calibration.py` pins this). A/A control, suite/arm fingerprints, cost with bootstrap, `detectable_difference` (what the plan can see). Pure functions `wilson_interval`, `paired_interval`, `paired_p_value` |
 | `autoagent/providers/` | OpenAI, Anthropic, DeepSeek, Gemini (raw wire) + `RoutingProvider`; `base.py` holds `synthetic_call_id` and `parse_tool_arguments` (invalid JSON escapes repaired, truncated JSON still refused) |
-| `examples_autoagent/` | 34 runnable demos (French), one facet each — `_common.py` picks the provider from `.env` |
+| `examples_autoagent/` | 37 runnable demos (French), one facet each — `_common.py` picks the provider from `.env` |
 | `examples/` | the 55-line vs 164-line before/after argument |
 | `constructeur_autoagent.html` | offline visual builder → generates Python; presets must compile (see harness note in git history) |
-| `autoagent-dev-doc.md` | the full reference (§1–26) |
+| `autoagent-dev-doc.md` | the full reference (§1–40) |
 
 ## Release process (maintainer-triggered only)
 

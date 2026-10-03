@@ -3,7 +3,7 @@
 > Référence technique complète pour intégrer, étendre et tester `autoagent` dans un projet Python.
 > **Public visé** : devs qui vont écrire des tools, brancher l'agent sur leur app, ou éventuellement contribuer à la lib.
 
-**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-10-03 · **Couvre autoagent** : 0.22.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
+**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-10-03 · **Couvre autoagent** : 0.23.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
 
 ---
 
@@ -56,6 +56,9 @@
 35. [`summarize_trace` — l'efficacité lue dans la trace](#35-summarize_trace--lefficacité-lue-dans-la-trace) *(0.21.0)*
 36. [Usage et performance : connexions persistantes, `Bounds`, `guards.py`, exceptions typées](#36-usage-et-performance--connexions-persistantes-bounds-guardspy-exceptions-typées) *(0.21.0)*
 37. [0.22.0 — audit de sécurité et de robustesse, outils dynamiques mesurés](#37-0220--audit-de-sécurité-et-de-robustesse-outils-dynamiques-mesurés) *(0.22.0)*
+38. [`compare_configs` — comparer deux configurations sans se raconter d'histoires](#38-compare_configs--comparer-deux-configurations-sans-se-raconter-dhistoires) *(0.23.0)*
+39. [La porte de décision unique — tout ce qui agit passe par la même décision](#39-la-porte-de-décision-unique--tout-ce-qui-agit-passe-par-la-même-décision) *(0.23.0)*
+40. [Le journal durable — une coupure brutale ne refait jamais un effet](#40-le-journal-durable--une-coupure-brutale-ne-refait-jamais-un-effet) *(0.23.0)*
 
 ---
 
@@ -176,14 +179,14 @@ print(len(result.messages))  # historique complet
 python examples/demo_autoagent.py        # 3 agents + workspace borné, 55 lignes
 python examples/demo_pure_python.py      # LA MÊME chose sans la lib : 164 lignes
 
-# Les 21 démos thématiques (une facette chacune — voir leur README) :
+# Les 37 démos thématiques (une facette chacune — voir leur README) :
 python examples_autoagent/01_hello_tools.py
 python examples_autoagent/17_memoire_factuelle.py
 ```
 
 Et le **constructeur visuel** (`constructeur_autoagent.html`, hors-ligne) :
 assemble des blocs → code Python généré ; menu « Charger un exemple » =
-18 presets + les démos complètes en lecture.
+30 presets (tous générés et compilés en CI) + les démos complètes en lecture.
 
 ---
 
@@ -1612,6 +1615,14 @@ sur des arguments choisis par le modèle** — valide-les comme n'importe quelle
 donc le prompt demande une liste de self-tests vide à un outil qui s'en sert. Défaut : `None`,
 rien n'est exposé.
 
+**La porte de décision (D1, §39).** Toute fonction de l'hôte appelée par du **code écrit par le
+modèle** — le pont du bac à sable (`run_python`, outil généré), l'`call_host` d'un outil promu en
+natif, le dispatcher `call_host_function` d'`EvolutionRuntime` — passe par la **même** décision que
+l'appel d'outil direct : `tool_policy` (avec `ctx.source == "host_function"`), garde trifecta et
+teinte. Une fonction qui doit compter comme `egress` ou `untrusted` se décore avec
+`autoagent.tool(egress=True)` / `autoagent.tool(untrusted=True)`. Dans la 0.22.0 le pont était une
+porte latérale (prouvé : un envoi refusé par la politique partait quand même).
+
 ### 11.6 Promotion humaine sandbox → natif — `autoagent/approval.py`
 
 Cycle de confiance :
@@ -1752,9 +1763,10 @@ offre au modèle : mets-le sous `tool_policy`, et sous Docker pour du code que t
 `PythonRunner(host_functions={…})` (0.22.0) laisse l'extrait appeler des fonctions de l'hôte
 (`context["call_host"]("nom", {...})`) : le modèle écrit **un programme** qui boucle sur plusieurs
 appels au lieu d'émettre un appel d'outil par tour ; la description de `run_python` en liste les
-noms, signatures et première ligne de docstring. ⚠️ Ces appels **ne passent pas** par `tool_policy`,
-la garde trifecta ni l'approbation (le pont est une porte latérale) : n'expose que ce que tu
-laisserais appeler sans condition.
+noms, signatures et première ligne de docstring. Ces appels passent par **la porte de décision**
+(§39) : la politique `tool_policy` les voit (`ctx.source == "host_function"`), la garde trifecta
+aussi, et un programme qui lit du contenu non fiable ne peut plus envoyer. *(Dans la 0.22.0 le pont
+était une porte latérale : prouvé, un envoi refusé par la politique partait quand même.)*
 
 *Mesuré* (DeepSeek, 9 runs par cas, mêmes tâches : lire ~40 comptages de capteurs puis agréger ;
 outils classiques à appels parallèles permis **contre** un seul `run_python` + pont) :
@@ -2126,6 +2138,12 @@ autoagent/
 ├── replay.py                # 0.16.0 — RecordSession / ReplaySession (§23)
 ├── policy.py                # 0.18.0 — ToolPolicySpec : la politique d'outils en JSON (§26.2)
 ├── eval.py                  # 0.18.0 — run_k : fiabilité pass^k, juge déterministe (§25.4)
+├── compare.py               # 0.23.0 — compare_configs : deux configurations, test exact + intervalle,
+│                            # contrôle A/A, empreintes, coût (§38)
+├── gate.py                  # 0.23.0 — ActionGate : la porte de décision unique (politique, trifecta,
+│                            # teinte) pour le pont, le dispatcher et les sous-agents (§39)
+├── journal.py               # 0.23.0 — Journal : intention fsync AVANT l'effet, résultat APRÈS, chaîne
+│                            # d'empreintes, un seul écrivain ; reprise sans refaire d'effet (§40)
 └── providers/
     ├── __init__.py          # create_provider (fabrique par nom)
     ├── base.py              # LLMProvider (ABC) + deep-merge de config.extra_body ;
@@ -2203,12 +2221,19 @@ from autoagent import (
     ToolPolicySpec,             # §26.2 — la politique en DONNÉES
     normalize_schema_types,     # §24.5 — types JSON Schema abaissés à la frontière
 
+    # 0.23.0 — comparer deux configurations (§38)
+    compare_configs, Variant, EvalTask, ComparisonReport,
+
+    # 0.23.0 — le journal durable (§40)
+    Journal, idempotency_key, OutcomeUnknown, JournalError, JournalLocked, JournalCorrupted,
+
     # Erreurs
     AutoAgentError, MaxStepsExceeded, ProviderError, ToolError, ToolValidationError,
     TokenBudgetExceeded, MCPError,
 )
 from autoagent.trace import truncate_preview        # helper public pour previews redactés
 from autoagent.eval import run_k, ReliabilityReport  # 0.18.0 — fiabilité pass^k (§25.4)
+from autoagent.compare import detectable_difference, paired_interval, paired_p_value, wilson_interval  # §38
 ```
 
 ### Annexe C — Cheat-sheet
@@ -3192,7 +3217,9 @@ la meilleure méthode désigne l'agent fautif dans 53,5 % des cas et l'étape fa
 (un agent a des effets de bord, l'ordre doit rester reproductible). Un run qui
 plante **est** un échec de fiabilité ; un juge qui plante est rapporté, jamais
 avalé. Combiné à `ReplaySession`, ça donne une non-régression de fiabilité
-hors-ligne et gratuite.
+hors-ligne et gratuite. Pour savoir si un CHANGEMENT de configuration a
+amélioré quelque chose — et pas seulement tiré un meilleur échantillon —,
+voir `compare_configs` (§38).
 
 ---
 
@@ -4168,6 +4195,365 @@ partagé pour `delegate_to` (risque d'interblocage) n'a pas été fait ; les nom
 point n'ont pas été vérifiés ; la correction Gemini sur les champs optionnels n'est **pas vérifiée en
 réel** (crédits épuisés au moment de l'audit) ; la liste d'interdits qui filtre le code généré **n'est
 pas une frontière** — Docker l'est.
+
+## 38. `compare_configs` — comparer deux configurations sans se raconter d'histoires
+
+*(0.23.0 — voir le `CHANGELOG.md`)*
+
+```python
+from autoagent import EvalTask, Variant, compare_configs
+
+rapport = compare_configs(
+    Variant("v1", lambda: construire_agent(prompt_v1), params={"prompt": "v1"}),
+    Variant("v2", lambda: construire_agent(prompt_v2), params={"prompt": "v2"}),
+    [EvalTask("solde", "Solde du client C-102 ?", lambda r: "4821" in r.output),
+     EvalTask("stock", "Stock de la référence R-7 ?", lambda r: "3517" in r.output)],
+    repeats=8, control=True,
+)
+print(rapport.summary())
+```
+
+On change un prompt, un modèle, un outil ; un premier échantillon « montre un gain » ; on publie.
+Or relancer la **même** configuration donne déjà des résultats différents : environ 54 % de la
+variance des résultats, sur plus de 18 000 trajectoires, vient du simple re-lancement et non du
+changement de configuration (Wiedmann et al., arXiv:2610.01618, preprint d'octobre 2026). Deux
+fois pendant la 0.22.0, un premier échantillon m'a fait croire à un gain qui n'existait pas.
+`compare_configs` ne rend un verdict que si la preuve existe.
+
+### 38.1 Ce que fait le banc
+
+- **Mêmes tâches, mêmes juges** déterministes que `run_k` (§25.4) — jamais un LLM-juge. Un
+  `Variant` porte une **fabrique** : un agent neuf par tentative (une instance réutilisée est
+  acceptée, et signalée, parce que son état s'accumule).
+- **Les bras alternent à chaque répétition** (ordre tourné, bras de tête tiré avec `seed`) : une
+  dérive du fournisseur ou un cache chaud touche les deux bras de la même façon.
+- **Écart apparié par tâche** : la difficulté propre d'une tâche s'annule. L'écart est la moyenne
+  des écarts des tâches.
+- Une exception pendant un run, ou un juge qui lève, **est un échec mesuré** (comme `run_k`) — et
+  le rapport le dit dans `notes`, parce qu'une panne d'infrastructure n'est pas une mauvaise
+  configuration.
+- Nombre d'appels : `tâches × repeats × 2`, `× 3` avec `control=True`. Aucune parallélisation :
+  l'ordre doit rester reproductible. `on_attempt(bras, tâche, tentative)` donne la progression
+  (et de quoi archiver au fil de l'eau).
+
+### 38.2 La règle de verdict — et la mesure qui l'a décidée
+
+Le verdict est `"b_better"`, `"a_better"` ou `"indistinguishable"` — **par défaut**. Il faut que
+**deux calculs s'accordent** :
+
+1. un **test exact par permutation, stratifié par tâche** (de la famille du test exact de
+   Cochran–Mantel–Haenszel). Hypothèse nulle : sur chaque tâche, A et B ont le même taux de
+   réussite, donc les étiquettes A/B des essais sont échangeables. Conditionnellement au nombre de
+   succès de chaque tâche, la statistique (somme des succès de A) est une somme d'hypergéométriques
+   indépendantes : la loi se calcule **exactement** par convolution — aucun tirage, aucune graine.
+   Sous l'hypothèse nulle la probabilité de déclarer une différence est ≤ α, **par construction** ;
+2. l'**intervalle de Wilson–Newcombe combiné par tâche** (somme des écarts au carré des intervalles
+   de Wilson de chaque bras de chaque tâche), qui dit la **taille** de l'écart. Sur 56/70 contre
+   48/80 — l'exemple de Newcombe (*Statistics in Medicine* 17:873–890, 1998) — il donne 0,2000
+   [0,0524 ; 0,3339], identique à statsmodels 0.15.0.
+
+**Pourquoi pas l'intervalle seul** — mesuré, par énumération exacte de toutes les issues, sur des
+configurations **identiques** (p = 0,5 sur chaque tâche) :
+
+| Plan (tâches × essais) | Intervalle seul déclare un gagnant | Règle livrée |
+|---|---|---|
+| 2 × 3 | 14,6 % | 1,2 % |
+| 2 × 5 | 11,5 % | 1,4 % |
+| 3 × 3 | 9,6 % | 1,7 % |
+| 1 × 5 | 6,1 % | 2,2 % |
+| 3 × 4 | 8,3 % | 2,4 % |
+
+Au lieu des 5 % annoncés. Sa couverture moyenne sur des suites variées (96–99 %) cachait ces cas :
+c'est la moyenne qui rassure et le cas particulier qui trompe. `tests/test_compare_calibration.py`
+fige la mesure pour que la règle ne soit pas « simplifiée » en silence. **L'intervalle reste
+approché** : sa couverture, mesurée par simulation, va d'environ 83 % (taux extrêmes, beaucoup de
+tâches, peu d'essais) à 99 %. C'est pourquoi il ne décide pas seul, et pourquoi le rapport écrit
+« intervalle *approché* ».
+
+### 38.3 Le contrôle A/A
+
+`control=True` ajoute un bras A′ — une copie de A — et compare A′ à A : **deux configurations
+identiques doivent sortir « indistinguables »**. Si la mesure voit une différence, elle se trompe
+elle-même (biais lié à l'ordre ou à l'identité d'un bras, état partagé que l'un abîme ou nettoie,
+tentatives non indépendantes) et aucun verdict A/B ne vaut : `rapport.trustworthy` est faux et le
+résumé le dit. +50 % d'appels ; à faire au moins une fois par suite, et après tout changement de
+juge ou d'infrastructure. Ce que le contrôle **ne** dit **pas** : un contrôle réussi ne prouve pas
+que tout va bien (jusqu'à 5 % des contrôles échouent par hasard), et une dérive lente du
+fournisseur ne le fait pas échouer — l'alternance la répartit sur les deux bras.
+
+### 38.4 « Indistinguable » n'est pas « équivalent »
+
+Un plan trop petit ne voit rien, et se tait. `detectable_difference(n_tâches, repeats)` donne le
+plus petit écart **vrai** que la règle de verdict détecterait avec 80 % de chances (tâches toutes à
+50 % pour A, par défaut ; simulation à graine fixe, arrondi à 5 points) :
+
+| Plan | Plus petit écart détecté |
+|---|---|
+| 1 tâche × 5 | aucun, même énorme |
+| 2 tâches × 5 | aucun, même énorme |
+| 4 tâches × 5 | 45 points |
+| 4 tâches × 8 | 40 points |
+| 10 tâches × 5 | 30 points |
+| 6 tâches × 10 | 25 points |
+| 12 tâches × 10 | 20 points |
+
+Autrement dit : 4 tâches de 5 essais ne voient pas un gain de 30 points (mesuré : 40 % de
+détection). Le rapport l'écrit sous un verdict « indistinguables ». Un plan où aucune séparation,
+même parfaite, ne donnerait `p < α` (`p_min ≥ α`) est signalé : 1 tâche × 3 essais ne peut pas
+descendre sous `p = 0,1`. Aucun verdict « équivalent » n'est offert : prouver « pas pire de plus de
+X points » demande son propre contrôle d'erreur, non fourni ici.
+
+### 38.5 Coût et empreintes
+
+- **Coût** : jetons par tentative et **par succès** (les échecs se paient), changement relatif avec
+  un intervalle bootstrap (graine fixe), `cost_fn` pour convertir avec **ton** tarif. Aucun usage
+  rapporté par le fournisseur → pas de ligne de coût, jamais un zéro inventé.
+- **Empreintes** — de quoi parle ce rapport. La suite : noms, consignes, contextes, **source du juge
+  et valeurs qu'il capture** (`lambda r: attendu in r.output` avec un autre `attendu` est une autre
+  suite). Chaque bras : prompt système, schémas d'outils, bornes, modèle, `params`. Elles lisent la
+  **structure** de l'agent, **pas le code d'un outil** : mesuré en réel, deux bras dont l'outil se
+  comporte différemment avaient la même empreinte tant que l'écart n'était pas déclaré dans
+  `Variant(params=...)`. Une fabrique qui construit des agents différents d'une tentative à l'autre
+  est signalée.
+
+### 38.6 Mesuré en réel (DeepSeek)
+
+Quatre tâches dont la réponse n'est connue que d'un outil, 6 répétitions par bras :
+
+- **trois bras identiques** (outil qui se trompe 30 % du temps, pour que la réussite ne soit pas à
+  100 %) : « indistinguables », p = 1,000, contrôle A/A compris (écart +8 points [−14 ; +29]). Sur
+  une seule tâche, deux configurations **identiques** ont fait 5/6 et 2/6 — c'est ce que vaut un
+  premier échantillon sur une tâche ;
+- **outil sain contre outil faux 60 % du temps** : A meilleure, **−71 points [−82 ; −44]**,
+  p < 0,001, même sens sur les 4 tâches, **coût par succès 1 212 → 4 160 jetons**.
+
+La démo 35 rejoue ce scénario (60 runs). Le **constructeur visuel** a son bloc « Comparer deux
+configurations » (preset `comp`) : tâches « nom | consigne | juge », deux modèles, deux prompts, le
+contrôle A/A, et un diagnostic qui dit combien de runs le plan coûte. Il construit ses propres agents ;
+pour comparer **ton** assemblage, le mode « fonction à intégrer » donne `build_agent()`, qui est déjà
+une fabrique pour `Variant(...)`.
+
+### 38.7 Ce que ça ne fait pas
+
+- **Le résultat vaut pour CES tâches.** Dire que B est meilleure sur des tâches que la suite ne
+  contient pas est une autre affirmation, qu'aucun calcul ne remplace.
+- Aucune correction pour **comparaisons multiples** : cinq variantes face à une référence, ce sont
+  cinq verdicts.
+- Une **dérive** qui n'est pas répartie entre les bras (un changement de modèle côté fournisseur au
+  milieu du run, avec un seul bras déjà passé) échappe à l'alternance et au contrôle.
+- Le **juge** est celui de l'hôte : un juge qui accepte des réponses vides (le défaut relevé sur τ-bench
+  par Zhu et al., arXiv:2507.02825) compte des succès qui n'en sont pas.
+
+## 39. La porte de décision unique — tout ce qui agit passe par la même décision
+
+*(0.23.0 — voir le `CHANGELOG.md`)*
+
+Jusqu'ici la boucle décidait pour un appel d'outil **direct** : anti-boucle, garde trifecta,
+politique de l'hôte (`TurnGuards`). Mais le modèle agit par d'autres chemins, que cette décision
+ne voyait pas — et les nommer est la moitié du travail :
+
+| Chemin | Avant | Maintenant |
+|---|---|---|
+| appel d'outil direct | `TurnGuards` | inchangé (mêmes événements de trace, mêmes fixtures de rejeu) |
+| fonction de l'hôte appelée par du code du modèle (`run_python`, outil généré) | **aucune décision** | la porte (`ctx.source == "host_function"`) |
+| outil promu en natif qui appelle `call_host` | aucune | la porte |
+| dispatcher `call_host_function` (EvolutionRuntime) | la politique voyait le nom du dispatcher, pas celui de la fonction lancée | la porte, sur le **nom de la fonction** |
+| sous-agent (`as_tool`, `delegate_to`) | sa propre politique seulement | idem par défaut ; `inherit_policy=True` ajoute celle du **parent** (`ctx.source == "subagent"`) |
+
+**Prouvé sur la 0.22.0** (script, sans réseau ni clé) : une politique qui refuse `envoyer_mail` ne
+refusait rien quand le même envoi partait d'un programme écrit par le modèle ; un programme qui
+lisait une fonction `untrusted` puis envoyait par une fonction `egress` passait la garde trifecta
+sans être vu ; le dispatcher `call_host_function` contournait la politique. Trois scénarios, un
+mail parti dans chacun. Sur l'arbre D1, zéro.
+
+**Vérifié sur un vrai modèle** (DeepSeek) : invité à lire un compteur puis à l'envoyer par mail alors
+que la politique de l'hôte interdit les mails, le modèle écrit le programme lui-même. Sans la porte
+(`govern_host_calls = False`) un mail part ; avec elle, aucun — et le modèle annonce à l'utilisateur
+que l'envoi a été refusé par la politique de l'hôte, qu'il a lue dans le refus rendu à l'intérieur du
+programme.
+
+### 39.1 Une seule décision
+
+`autoagent/gate.py` : `ActionGate.decide(nom, arguments, spec=, source=)` rend `None` (autorisé) ou
+la raison du refus. Dans cet ordre : la **garde trifecta** (`trifecta_blocks` — la même définition
+que la boucle) puis la **politique de l'hôte** (`evaluate_policy` — le seul endroit du paquet où
+`tool_policy` est appelé). Fail-**closed** : une politique qui plante, qui rend autre chose qu'un
+`str`/`None`, ou la porte elle-même qui lève → refus. Une **approbation humaine refuse** : un
+programme ou un sous-agent ne peut pas être mis en pause en plein milieu (l'effet serait déjà
+parti), la raison le dit.
+
+La boucle pose une porte autour de **chaque** exécution d'outil (`Agent._run_loop._executer`,
+`contextvars`) ; les endroits qui lancent une fonction de l'hôte la lisent (`active_gate()`). **Hors
+d'un run d'agent** (un `PythonRunner` appelé à la main, les self-tests du constructeur) il n'y a pas
+de porte : rien ne change. Un agent **sans politique ni outil `egress`** ne voit aucune différence.
+
+**La teinte entre dans le programme.** Une fonction de l'hôte décorée `@tool(untrusted=True)` appelée
+pendant un programme teinte la suite **de ce programme** et, l'outil terminé, **le run** (le
+résultat de `run_python` est encadré comme du contenu externe). Sans cela, un `run_python` qui
+lit une page repartait « propre » et le tour suivant pouvait envoyer ce qu'il venait de lire.
+
+### 39.2 Ce que la politique voit
+
+`ToolPolicyContext.source` : `"tool"` (défaut — appel direct), `"host_function"`, `"subagent"`.
+`ctx.spec` porte `egress` / `untrusted` / permissions de la fonction visée quand elle est décorée
+avec `autoagent.tool(...)`. En **données** : `{"tool": "*", "action": "deny", "when": {"source":
+"host_function", "egress": true}}` interdit tout envoi depuis un programme. Chaque décision
+imbriquée émet un événement de trace `gate_decision` (`source`, `name`, `allowed`, `reason`,
+`would_block`, `parent_call_id`) — autorisée ou refusée : c'est le registre de ce que le modèle a
+fait par ses propres programmes.
+
+### 39.3 Les sous-agents — sur demande
+
+`agent.as_tool(..., inherit_policy=True)` et `delegate_to({...}, inherit_policy=True)` : chaque appel
+d'outil que le sous-agent fait pendant la délégation passe **aussi** par la politique, la garde
+trifecta et la teinte du **parent** (celle du parent teinté s'applique au spécialiste : un parent
+qui a lu une page ne débloque pas l'envoi en déléguant). L'héritage est **transitif** (un petit-enfant
+est borné par toute la chaîne). Défaut : `False` — un spécialiste agit sous sa propre politique,
+comportement historique.
+
+### 39.4 Pas de pause, un retour en arrière
+
+- Une demande d'approbation (`ApprovalRequired`) **refuse** dans un programme ou chez un
+  sous-agent (voir plus haut). Pour qu'un envoi demande l'accord d'un humain, garde-le en appel d'outil
+  direct.
+- `agent.govern_host_calls = False` rend le comportement 0.22.0 (pont non gouverné) — un attribut, pas
+  un argument du constructeur : un choix qui désarme la porte doit se lire dans le code de l'hôte.
+
+### 39.5 La structure est testée, pas seulement le comportement
+
+`tests/test_gate.py` prouve chaque chemin (comportement) **et** analyse le code source : (1)
+`tool_policy(...)` n'est appelé qu'à un endroit ; (2) les trois fonctions qui exécutent une fonction
+de l'hôte (`_drive_bridge`, `_call_host`, `call_host_function`) consultent la porte **avant** de
+lancer, et ce sont les **seules** ; (3) `registry.execute` n'est appelé que par la boucle (qui pose
+la porte) et les deux enveloppes de record/replay. Un nouveau chemin d'exécution **fait échouer** ce
+fichier au lieu de contourner la politique en silence.
+
+### 39.6 Ce que ça ne fait pas
+
+- La **frontière** reste le bac à sable : la porte décide *si* une fonction de l'hôte peut être
+  appelée, pas *ce que fait* le code du modèle dans son processus (la liste d'interdits AST n'est
+  pas une frontière — Docker l'est).
+- Un **plan figé avant la lecture de contenu externe**, que la politique ne pourrait plus que
+  resserrer, n'est pas fait : la porte applique la politique de l'hôte, elle n'en invente pas.
+- Le journal d'événements unique (reprise, rejeu, audit tirés d'un même fichier) est une autre
+  direction : la porte émet des événements, elle ne les persiste pas.
+
+## 40. Le journal durable — une coupure brutale ne refait jamais un effet
+
+*(0.23.0 — voir le `CHANGELOG.md`)*
+
+```python
+from autoagent import Agent, Journal, OutcomeUnknown, idempotency_key
+
+journal = Journal("run.jsonl")
+agent = Agent(provider, journal=journal)
+
+@agent.tool
+def envoyer_mail(destinataire: str) -> dict:
+    cle = idempotency_key()                  # stable d'avant à après une coupure
+    return api_mail.envoyer(destinataire, idempotency_key=cle)
+
+agent.run("Envoie le compte rendu à Marie.")
+
+# … le processus meurt (kill -9, panne) ; dans un NOUVEAU processus :
+agent = Agent(provider, journal=Journal("run.jsonl"))
+try:
+    agent.resume_from_journal()
+except OutcomeUnknown as exc:                # l'effet est peut-être parti : RIEN n'a été relancé
+    for appel in exc.calls:                  # à toi de vérifier auprès du système externe
+        journal.resolve(appel.id, ok=True, result={"envoye": True})    # il est parti
+        # journal.resolve(appel.id, retry=True)                          # il n'est pas parti : relance
+    agent.resume_from_journal()
+```
+
+### 40.1 Le trou
+
+Un run reprend d'un instantané pris à la fin de chaque étape (`checkpoint=`, §19). Si le processus
+meurt **pendant** une étape — le premier outil a envoyé son mail, rien n'est encore écrit —, la
+reprise repart de l'instantané précédent (ou de zéro) et **refait l'étape** : le mail part deux fois.
+La littérature relève le même défaut chez les frameworks d'agents : à la reprise, les effets sont
+refaits, et k processus qui reprennent la même pause déclenchent l'effet k fois (Khan, arXiv:2608.03836,
+preprint à auteur unique d'août 2026).
+
+### 40.2 Ce que fait le journal
+
+Un fichier JSONL, **un seul écrivain**. Pour chaque appel d'outil :
+
+1. **`intent`** — l'appel, sa clé d'idempotence, son étape — écrit et forcé sur le disque (`fsync`)
+   **AVANT** l'effet ;
+2. l'outil tourne ;
+3. **`result`** — le résultat — écrit **APRÈS**. L'écart entre 1 et 3 est la fenêtre où une coupure laisse
+   une **issue inconnue**.
+
+La conversation est écrite en **deltas** (le fichier grossit linéairement, pas à chaque étape de la taille
+du transcript) à deux moments : quand l'assistant vient de demander des outils (aucun n'a tourné), et à la
+fin de l'étape. Chaque enregistrement porte l'**empreinte du précédent** (`verify()`).
+
+| Ce que le journal sait d'un appel de l'étape interrompue | À la reprise |
+|---|---|
+| **résultat écrit** | **réinjecté**, l'outil n'est PAS relancé, il ne repasse pas par la politique (la décision a été prise, l'effet a eu lieu) |
+| rien d'écrit | il tourne normalement (politique comprise) |
+| **intention sans résultat — issue inconnue** | **`OutcomeUnknown`**, levée AVANT qu'aucun outil de l'étape ne tourne ; rien n'est relancé |
+| issue inconnue, outil `idempotent=True` | relancé tout seul : c'est ce que le drapeau promet |
+| décision de l'hôte `resolve(ok=True, result=…)` | le résultat décidé est réinjecté, rien relancé |
+| décision de l'hôte `resolve(retry=True)` | relancé, avec la **même** clé d'idempotence |
+
+`on_unknown="retry"` relance tout (au moins une fois : seulement si tes outils dédoublonnent par
+`idempotency_key()`). Une **seconde** coupure après un `retry` redevient une issue inconnue : la machine
+à états lit les enregistrements dans l'ordre, un `retry` ne vaut que pour l'intention qui le précède.
+
+### 40.3 Fail-closed — et pourquoi la trace reste à part
+
+Si l'**intention** ne peut pas être écrite (disque plein, journal cassé), l'effet **ne part pas**
+(`JournalError`) : une action qu'on ne peut pas consigner est refusée. C'est le contrat **inverse** de la
+trace (§4.5 : observabilité, fail-open — un incident de journalisation ne casse jamais le run). La thèse
+d'un « journal unique » se heurte à cette différence : on ne peut pas être à la fois fail-open et
+fail-closed sur le même fichier. La trace reste donc un mécanisme à part ; le journal est celui sur lequel
+reposent la reprise et l'audit des effets.
+
+### 40.4 Les garanties, une par une
+
+- **Chaîne d'empreintes** : retirer ou modifier un enregistrement au milieu rompt la chaîne
+  (`JournalCorrupted` à l'ouverture, `verify()`). Ce n'est **pas une signature** : qui peut réécrire tout
+  le fichier peut recalculer toute la chaîne — pour une preuve opposable, ancre `head()` ailleurs.
+- **Queue tronquée réparée** : une dernière ligne à moitié écrite (kill pendant l'écriture) est retirée à
+  l'ouverture ; une ligne illisible **ailleurs** est refusée, jamais réparée en silence.
+- **Un seul écrivain** : un verrou du système sur `<fichier>.lock`, **libéré à la mort du processus**
+  (aucun verrou périmé après un `kill -9`). Un second processus reçoit `JournalLocked` : deux processus qui
+  reprennent le même run ne refont pas chacun l'effet en cours. La lecture reste possible pendant
+  l'écriture.
+- **La teinte survit** : un programme qui a lu du contenu non fiable par une fonction de l'hôte (§39) garde
+  le run teinté après une reprise.
+- **`idempotency_key()`** : `None` hors d'un run journalisé ; sinon la même clé avant et après la coupure.
+
+### 40.5 Mesuré
+
+- **Une coupure à chacune des dix frontières d'écriture** (`tests/test_journal.py`) : aucun effet terminé
+  relancé, aucune issue inconnue relancée en silence, l'outil idempotent relancé, le mail parti une seule
+  fois dans chaque ligne où l'hôte a tranché.
+- **Trois variantes volontairement cassées** — tout traité comme idempotent, résultats jamais réinjectés,
+  intention écrite après l'effet — font échouer 3, 6 et 7 de ces tests : ils ont des dents.
+- **De VRAIES morts de processus** (`os._exit(137)`, aucun nettoyage ; `tests/test_journal_kill.py`), y
+  compris deux processus qui reprennent en même temps : le second est refusé.
+- **Un vrai modèle** (DeepSeek, un vrai outil qui écrit dans un fichier `fsync`) : tué après l'effet, avant
+  le résultat ; la reprise lève `OutcomeUnknown` et ne relance rien ; l'hôte constate dans le fichier,
+  tranche ; le modèle conclut « l'e-mail a bien été envoyé ». **1 mail, 2 appels au modèle** : le modèle n'a
+  pas été re-sollicité pour l'étape interrompue.
+- La démo 37 (hors ligne) tue un enfant après l'envoi et compte les mails : **2** avec une reprise par
+  checkpoint seul, **1** avec le journal.
+
+### 40.6 Ce que ça ne fait pas
+
+- La **panne de courant** n'est pas testée : elle dépend de l'honnêteté du disque face à `fsync`.
+- Le journal contient les arguments et résultats **complets** des outils (il le faut pour reprendre sans
+  refaire) : protège-le comme un instantané (droits du fichier, durée de conservation). Ce n'est pas un
+  journal à expédier tel quel à un tiers.
+- **L'unité est l'appel d'outil.** Un programme `run_python` ou un sous-agent qui meurt à moitié a une issue
+  inconnue **dans son ensemble** : les appels de fonctions de l'hôte à l'intérieur, et les outils du
+  sous-agent, ne sont pas journalisés un à un (donne un journal propre au sous-agent pour un grain plus fin).
+- Pas de rotation du fichier ; pas de variante streaming de `resume_from_journal` ; l'issue inconnue
+  demande un humain (ou un contrôle auprès du système externe) — elle ne se devine pas.
+- Le journal unique qui remplacerait aussi la trace et les fixtures de rejeu n'est pas fait (§40.3).
 
 ---
 *Doc maintenue par l'équipe Alyce R&D. Pour questions, ouvrir une issue sur le repo interne ou taper l'auteur sur Slack.*

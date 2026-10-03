@@ -7,6 +7,239 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-10-03
+
+**0.23.0 is three things, each closed by a verification gate — including on a
+real model.** (1) `compare_configs`: compare two configurations without fooling
+yourself — a verdict needs an exact test AND an interval to agree; measured, the
+interval alone declared a winner on IDENTICAL configurations up to 14.6 % of the
+time. (2) One decision gate for every path that acts — PROVEN on 0.22.0: a policy
+that refused a mail refused nothing when the same send came from a program the
+model wrote. (3) A durable journal: a hard kill never re-runs an effect (2 mails
+with a checkpoint-only resume, 1 with the journal).
+
+**Upgrade notes.** ONE behaviour change, on an option shipped in 0.22.0: host
+functions called from model-written code (`run_python`, generated tools,
+`call_host_function`) now go through your `tool_policy`, the trifecta guard and
+taint. An agent with no `tool_policy` and no `egress` / `untrusted` host function
+sees no difference. If you combined a `tool_policy` with `host_functions`, a
+deny-by-default policy now denies them until it allows their names;
+`agent.govern_host_calls = False` restores the 0.22.0 behaviour. Everything else is
+new and opt-in: `compare_configs`, `Agent(journal=)`, `as_tool(inherit_policy=True)`
+and `delegate_to(..., inherit_policy=True)`, and the new visual-builder blocks.
+
+### Security — one decision gate for every path that acts (D1)
+
+The loop decided for a DIRECT tool call (host policy, trifecta guard, taint). The
+model also acts through other paths that decision did not see. **Proven on the
+published 0.22.0** by a script — no network, no key — three scenarios, **one mail
+sent in each**:
+
+- a `tool_policy` that refuses `envoyer_mail` refused nothing when the same send
+  came from a program the model wrote (`run_python`, a generated tool): the
+  host-function bridge was a side door;
+- a program that read untrusted content through a host function and then sent
+  through an `egress` one passed the trifecta guard unseen;
+- `EvolutionRuntime`'s `call_host_function` dispatcher: the policy saw the
+  dispatcher's name, not the function it ran.
+
+`ActionGate` (`autoagent/gate.py`) is now THE decision, applied to every path:
+
+- **Host functions called by model-written code** — the sandbox bridge
+  (`run_python`, generated tools, Docker or subprocess), the `call_host` of a tool
+  promoted to native, and `call_host_function` — go through the agent's
+  `tool_policy` (with `ctx.source == "host_function"`), the trifecta guard and taint.
+  A function counts as `egress` / `untrusted` when decorated with
+  `autoagent.tool(...)`. Out of an agent run (a `PythonRunner` called by hand) there
+  is no gate and nothing changes.
+- **Taint enters the program**: an `untrusted` host function called during a program
+  taints the rest of that program and, once the tool ends, the run (the result of
+  `run_python` is framed as external content). Before, a `run_python` that read a page
+  left the run "clean" and the next turn could send what it had just read.
+- **Sub-agents, on request**: `as_tool(inherit_policy=True)` and
+  `delegate_to(..., inherit_policy=True)` make every tool call the sub-agent makes
+  also go through the PARENT's policy, trifecta guard and taint (`ctx.source ==
+  "subagent"`), transitively. Default `False`: a specialist keeps acting under its
+  own policy.
+- An approval request (`ApprovalRequired`) **denies** inside a program or a delegate —
+  neither can be paused mid-run (the effect would already have left), and the
+  reason says so. A policy that raises, or returns something other than `str`/`None`,
+  denies (fail-closed), as before.
+- `ToolPolicyContext.source`, and `{"when": {"source": "host_function"}}` in a
+  declarative `ToolPolicySpec`: "no send from a program" as data. Every nested
+  decision emits a `gate_decision` trace event; `summarize_trace` counts the refusals
+  as `gate_decision:<source>`.
+- **The structure is tested, not just the behaviour** (`tests/test_gate.py`, AST
+  analysis of the package): `tool_policy` is called from exactly one place; the three
+  functions that run a host function consult the gate BEFORE, and they are the only
+  ones; `registry.execute` is called only by the loop (which sets the gate) and the
+  two record/replay wrappers. A new execution path fails that file instead of
+  bypassing the policy in silence. The direct tool-call path keeps its trace events
+  and replay fixtures unchanged.
+- **Upgrade note — a behaviour change on an option shipped in 0.22.0.** An agent with
+  no `tool_policy` and no `egress`/`untrusted` host function sees no difference. If
+  you combined a `tool_policy` with `host_functions`, the policy now applies to them:
+  a deny-by-default policy denies a host function until it allows its name.
+  `agent.govern_host_calls = False` restores the 0.22.0 behaviour — an attribute, not a
+  constructor argument, so a choice that disarms the gate reads in the host's code.
+- **Verified on a real model** (DeepSeek): asked to read a counter and mail its value
+  while the host policy forbids mail, the model wrote the program itself. Without the
+  gate (`govern_host_calls = False`) one mail left; with it, none — and the model told
+  the user the send had been refused by the host's policy, reading the denial the gate
+  returned inside the program.
+- Demo 36 (offline, no key) replays the three scenarios with and without the gate;
+  dev-doc §39; the visual builder gets `inherit_policy` on its sub-agent and parallel
+  delegation blocks, the `source` condition in its policy hint and a preset (`herite`).
+  Not done: a plan frozen before external content is read (the gate applies the host's
+  policy, it does not invent one).
+
+### Added — a durable journal: a hard kill never re-runs an effect (D3)
+
+A run resumes from a snapshot taken at the end of each step. If the process dies
+DURING a step — the first tool already sent its mail, nothing is written yet — the
+resume restarts from the previous snapshot (or from scratch) and REDOES the step:
+the mail goes out twice. The literature reports the same defect across agent
+frameworks: effects are refired on resume, and k processes resuming the same pause
+fire the effect k times (Khan, arXiv:2608.03836, an August 2026 single-author
+preprint).
+
+`Journal` (`autoagent/journal.py`; `Agent(journal=Journal(path))`;
+`agent.resume_from_journal()`): one append-only JSONL file, one writer.
+
+- **The INTENTION is written and fsync'd BEFORE the effect, the result AFTER.** On
+  resume, a call whose result is written is never re-run (its result is re-injected,
+  and it does not go back through the policy — the decision was taken then, the effect
+  happened). A call with nothing written runs normally. A call with an intention but
+  no result has an **UNKNOWN outcome** — the effect may have happened — and is NOT
+  re-run in silence: `OutcomeUnknown`, raised BEFORE any tool of the step runs. The
+  host says what happened (`journal.resolve(call_id, ok=True, result=…)` if it did,
+  `retry=True` if it did not) and resumes again. A tool declared `idempotent=True` is
+  re-run on its own — that is what the flag promises. `on_unknown="retry"` re-runs
+  everything (at-least-once; only if your tools deduplicate).
+- **`idempotency_key()`** gives a tool a key that is STABLE from before to after the
+  kill (same run, same call id): pass it to the external service and it deduplicates.
+- **Fail-CLOSED**: if the intention cannot be written (disk full, journal broken), the
+  effect does not run (`JournalError`). That is the opposite of the trace
+  (observability, fail-open) — which is why they stay two mechanisms rather than one
+  file. A hash chain links every record to the previous one (`verify()`,
+  `JournalCorrupted`): removing or editing a record in the middle breaks it. It is NOT a
+  signature — whoever can rewrite the whole file can recompute the chain; anchor
+  `head()` elsewhere for proof. A torn LAST line (a kill during the write) is repaired on
+  open; any other bad line is refused, never repaired.
+- **One writer**: an OS lock on `<file>.lock`, released when the process dies — no stale
+  lock to clean up after a kill. A second process that opens the same journal gets
+  `JournalLocked`: two processes resuming the same run do not each redo the pending
+  effect.
+- **Taint survives the kill**: a program that read untrusted content through a host
+  function (D1) keeps the run tainted after a resume.
+- **Measured, not asserted.** (1) A crash at each of the ten write boundaries
+  (`tests/test_journal.py`): no completed effect re-run, no unknown outcome re-run in
+  silence, the idempotent tool re-run, the mail sent exactly once in every row where the
+  host resolved it. (2) Three deliberately broken variants — everything treated as
+  idempotent, results never re-injected, intention written after the effect — turn
+  3, 6 and 7 of those tests red: they have teeth. (3) REAL process deaths
+  (`os._exit(137)`, no cleanup — `tests/test_journal_kill.py`), including two processes
+  resuming at once: the second is refused. (4) A real model (DeepSeek, a real tool
+  writing to an fsync'd file): the process was killed after the effect and before the
+  result; the resume raised `OutcomeUnknown` and re-ran nothing; once the host had
+  checked the file and resolved, the model concluded ("the e-mail was sent") — 1 mail
+  in total, and 2 model calls: the model was NOT asked again for the interrupted step.
+  Demo 37 (offline) kills a child process after the send and counts the mails: 2 with a
+  checkpoint-only resume, 1 with the journal. The visual builder gets a "Journal
+  durable" block (preset `jrn`): it creates the journal, wires `journal=`, resumes an
+  interrupted run and handles an unknown outcome by asking — its generated code was run
+  for real on DeepSeek.
+- **What it does not do, said plainly.** Power loss is not tested — it depends on the
+  disk honouring fsync. The journal holds the FULL arguments and results of the tools
+  (it must, to resume without redoing): protect it like a snapshot (file permissions,
+  retention) — it is not a log to ship to a third party. The unit is the TOOL CALL: a
+  `run_python` program or a sub-agent that dies mid-way has an unknown outcome as a
+  whole (its inner host-function calls and its own tool calls are not journaled one by
+  one — give a sub-agent its own journal for finer grain). No rotation: the file grows
+  linearly (conversation deltas, not snapshots). No streaming variant of
+  `resume_from_journal`. Not done: the single event log that would also replace the
+  trace and replay fixtures.
+
+### Added — `compare_configs`: compare two configurations without fooling yourself
+
+Twice while building 0.22.0 a first sample "showed" a gain that did not exist. That
+is not bad luck: re-running the SAME configuration already gives different
+results — about 54 % of the outcome variance, over 18,000+ trajectories, comes
+from repeating a configuration rather than changing it (Wiedmann et al.,
+arXiv:2610.01618, October 2026 preprint). `compare_configs` returns a verdict only
+when the evidence is there.
+
+- `compare_configs(a, b, tasks, repeats=5, control=False, ...)` with `Variant`,
+  `EvalTask` and `ComparisonReport` (top-level exports) and, in `autoagent.compare`,
+  the pure functions `wilson_interval`, `paired_interval`, `paired_p_value` and
+  `detectable_difference`. Same tasks and same DETERMINISTIC judges as `run_k`
+  (never an LLM judge); a fresh agent per attempt from a factory; the arms
+  **alternate** at every repetition (rotated order, starting arm drawn from
+  `seed`) so provider drift or a warm cache hits both; the difference is paired
+  per task, so a task's own difficulty cancels.
+- **The verdict needs two calculations to agree; the default answer is
+  `indistinguishable`.** An exact stratified permutation test (conditional on each
+  task's success count, computed by exact convolution — no sampling, no seed)
+  whose false-alert probability is ≤ α by construction, and a Wilson–Newcombe
+  interval combined across tasks. **Why not the interval alone — measured:** by
+  exact enumeration of every outcome, on IDENTICAL configurations the interval
+  declared a winner in 14.6 % of cases (2 tasks × 3 attempts) and 11.5 %
+  (2 × 5) instead of 5 %, while its average coverage over varied suites (96–99 %)
+  hid it. The delivered rule stays under 2.4 % on every enumerated plan.
+  `tests/test_compare_calibration.py` pins this so the rule cannot be quietly
+  "simplified" to the interval.
+- `control=True` adds an A' arm (a copy of A) and compares it with A: two identical
+  configurations must come out indistinguishable. It catches order or arm-identity
+  bias, shared state, non-independent attempts. A pass does not prove everything
+  is fine (up to 5 % of controls fail by chance), and slow provider drift hits all
+  arms alike thanks to the alternation. +50 % calls.
+- **"Indistinguishable" is not "equivalent".** `detectable_difference(tasks,
+  repeats)` gives the smallest true difference the plan would detect with 80 %
+  power, and the report prints it: 4 tasks × 5 repetitions cannot see less than
+  ≈45 points. No equivalence verdict is offered — it needs its own error control.
+- Cost: tokens per attempt and per success (failures are paid), relative change
+  with a bootstrap interval, `cost_fn` for a host tariff. No usage reported → no
+  cost line, never an invented zero.
+- Fingerprints of the suite (names, prompts, contexts, the judge's source AND the
+  values it captures — `lambda r: attendu in r.output` with another `attendu` is
+  another suite) and of each arm (system prompt, tool schemas, bounds, model,
+  `params`). They read the agent's STRUCTURE, not a tool's code: declare what
+  differs in `Variant(params=...)` — in the real run below, two arms whose tool
+  misbehaved differently had the same fingerprint until declared. A factory that
+  builds different agents from one attempt to the next is flagged.
+- Stated limits (in the report and the docs): the result holds for THESE tasks;
+  the interval is approximate (coverage measured from ≈83 % to ≈99 % depending on
+  the true rates); no multiple-comparison correction; exceptions count as failures
+  and are reported; a design too small to ever reach α says so.
+- **Verified on a real model** (DeepSeek, 4 tasks × 6 repetitions, answers only a
+  tool knows): three IDENTICAL arms came out indistinguishable (p = 1.000), A/A
+  control included; a healthy tool against one wrong 60 % of the time was detected —
+  −71 points [−82 ; −44], p < 0.001, same direction on all 4 tasks, cost per
+  success 1 212 → 4 160 tokens. On one task, two IDENTICAL configurations scored
+  5/6 and 2/6: that is what a single-task first sample is worth.
+- The Wilson–Newcombe construction reproduces Newcombe's example (56/70 vs 48/80:
+  difference 0.2000, interval [0.0524 ; 0.3339], *Statistics in Medicine* 17:873–890,
+  1998), identical to statsmodels 0.15.0 (`confint_proportions_2indep`,
+  `method="newcomb"`).
+- Demo 35 (real model), dev-doc §38, `eval._tentative` extracted from `run_k` so
+  both share one measured attempt (same behaviour, same tests).
+- **The visual builder gets a "Comparer deux configurations" block** (preset
+  `comp`, 30 presets in total with the two above): tasks as `name | prompt | judge expression`, two
+  models, two system prompts, the A/A control, and a diagnostic that says how many
+  runs the plan costs. It builds its own agents; to compare YOUR assembly, the
+  "function to integrate" mode already yields `build_agent()`, a factory for
+  `Variant(...)`. The generated code was run for real on DeepSeek (45 runs, 36 s):
+  the default tasks are easy, all three arms scored 100 %, and the report said
+  so — "Plafond ou plancher", "would not detect less than ≈50 points" — instead of
+  announcing a winner.
+
+### Fixed
+
+- **The visual builder still emitted the unsourced "LLM judges cap under 55 %"
+  claim** in the comments of the code it generates (the 0.22.0 sweep removed it
+  from the README, `eval.py` and the dev-doc but missed the builder). Replaced by
+  the sourced Who&When figures.
+
 ## [0.22.0] - 2026-10-03
 
 **0.22.0 is two things.** (1) An audit of the whole codebase for security and
@@ -1707,7 +1940,8 @@ underscored or imported from a submodule path is internal and may change.
 - CI invariants: `ruff check`, `ruff format --check`, `mypy autoagent/`,
   and `pytest` are all green.
 
-[Unreleased]: https://github.com/laazizi/autoagent/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/laazizi/autoagent/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/laazizi/autoagent/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/laazizi/autoagent/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/laazizi/autoagent/releases/tag/v0.21.0
 [0.20.1]: https://github.com/laazizi/autoagent/releases/tag/v0.20.1

@@ -598,6 +598,8 @@ const DEFS = {
       {k:"tname",l:"nom de l'outil (vu par l'agent)", kind:"text", def:"delegate"},
       {k:"stages", l:"spécialistes (une par ligne : nom | rôle)", kind:"textarea",
        def:"comptage | Tu es expert en comptages routiers. Une phrase.\nenquete | Tu es expert en enquêtes déplacements. Une phrase."},
+      {k:"inherit", l:"les spécialistes héritent de la politique du parent (inherit_policy)", kind:"check", def:false,
+       hint:"leurs appels d'outils passent AUSSI par la tool_policy, la garde trifecta et la teinte du parent"},
     ],
   },
   cascade: {
@@ -695,6 +697,8 @@ const DEFS = {
       {k:"tname",l:"nom de l'outil (vu par l'orchestrateur)", kind:"text", def:"interroger_specialiste"},
       {k:"desc", l:"description (quand déléguer)", kind:"text", def:"Délègue une sous-tâche au spécialiste."},
       {k:"system",l:"system_prompt du spécialiste", kind:"textarea", def:"Tu es un spécialiste. Réponds de façon concise et factuelle."},
+      {k:"inherit", l:"hérite de la politique du parent (inherit_policy)", kind:"check", def:false,
+       hint:"ses appels d'outils passent AUSSI par la tool_policy, la garde trifecta et la teinte du parent"},
     ],
   },
   chaine: {
@@ -739,6 +743,13 @@ const DEFS = {
       {k:"resume", l:"reprendre depuis le snapshot s'il existe", kind:"check", def:true},
     ],
   },
+  journal: {
+    name:"Journal durable", cat:"run", one:true, sub:"Journal — l'intention fsync AVANT l'effet : une coupure brutale ne refait jamais un effet",
+    fields:[
+      {k:"file", l:"fichier du journal (JSONL, un seul écrivain)", kind:"text", def:"run.jsonl",
+       hint:"contient les arguments et résultats COMPLETS des outils : protège-le comme un snapshot"},
+    ],
+  },
   evolution: {
     name:"Évolution logicielle", cat:"tool", one:true, sub:"EvolutionRuntime — l'agent modifie CE logiciel sous garde : dossier borné, validation, rollback",
     fields:[
@@ -758,7 +769,7 @@ const DEFS = {
       {k:"default", l:"action par défaut", kind:"select", opts:["allow","deny","approve"], def:"allow", w:"half"},
       {k:"rules", l:"règles (une par ligne : outil | action | condition JSON (optionnelle) | motif)", kind:"textarea",
        def:'* | deny | {"tainted": true, "egress": true} | sortie interdite après lecture de contenu non fiable\nenvoyer_mail | approve | | un humain valide chaque envoi\necrire_rapport | deny | {"args": {"chemin": {"ends_with": ".exe"}}} | pas d\'exécutable',
-       hint:"deny > approve > allow > défaut ; conditions : args, tainted, egress, step, permissions"},
+       hint:"deny > approve > allow > défaut ; conditions : args, tainted, egress, step, permissions, source (tool | host_function | subagent)"},
     ],
   },
   record: {
@@ -773,6 +784,22 @@ const DEFS = {
     fields:[
       {k:"k", l:"k (nombre de runs)", kind:"number", def:"5"},
       {k:"juge", l:"juge EN CODE : corps de `def juge(res) -> bool` (res.output, res.steps)", kind:"textarea", def:'return "156.25" in res.output'},
+    ],
+  },
+  comparer: {
+    name:"Comparer deux configurations", cat:"run", one:true, sub:"compare_configs — mêmes tâches, juges EN CODE, verdict « indistinguables » par défaut",
+    fields:[
+      {k:"prov", l:"provider", kind:"select", opts:["gemini","openai","anthropic","deepseek","groq"], def:"gemini", w:"half"},
+      {k:"repeats", l:"répétitions par bras et par tâche", kind:"number", def:"5", w:"half"},
+      {k:"model_a", l:"modèle A", kind:"text", def:"gemini-3.7-flash", w:"half"},
+      {k:"model_b", l:"modèle B", kind:"text", def:"gemini-3.7-flash", w:"half"},
+      {k:"system_a", l:"system_prompt A", kind:"textarea", def:"Tu es un assistant de calcul. Réponds par le nombre."},
+      {k:"system_b", l:"system_prompt B", kind:"textarea", def:"Tu es un assistant de calcul. Réponds par le nombre seul, sans aucun texte autour."},
+      {k:"steps", l:"max_steps", kind:"number", def:"3", w:"half"},
+      {k:"control", l:"contrôle A/A (A rejoué contre sa copie : +50 % d'appels)", kind:"check", def:true, w:"half"},
+      {k:"taches", l:"tâches (une par ligne : nom | consigne | expression Python sur `res`, le juge)", kind:"textarea",
+       def:'carre | Quel est le carré de 12.5 ? | "156.25" in res.output\ncube | Quel est le cube de 7 ? | "343" in res.output\nsomme | Combien font 4821 + 3517 ? | "8338" in res.output',
+       hint:"le juge est du CODE sur `res` (res.output, res.steps) — jamais un LLM"},
     ],
   },
   run: {
@@ -798,14 +825,14 @@ const INFO = {
   dynamic:{api:"DynamicToolBuilder + enable_dynamic_tools", info:"Donne à l'agent le pouvoir d'ÉCRIRE ses propres outils Python à la volée : il décrit la capacité voulue, un LLM génère le code, celui-ci est validé (AST) puis exécuté dans le bac à sable. Limite le nombre d'outils générés par run. Options : reprise des refus (max_repairs), bibliothèque persistante (réutilise les outils d'un run à l'autre), plafond de permissions, run_python (extrait éphémère)."},
   memory:{api:"BufferMemory · SummarizingMemory · FactMemory", info:"Borne le contexte quand la conversation s'allonge. BufferMemory garde les N derniers messages ; SummarizingMemory RÉSUME les vieux tours ; FactMemory extrait des FAITS atomiques tenus à jour (une contradiction remplace le fait périmé, JSON lisible par identité). Options : recall (l'agent lit sa mémoire) et remember (il mémorise volontairement, FactMemory)."},
   trace:{api:"TraceEmitter(file=…)", info:"Enregistre chaque événement (appel LLM, appel d'outil, correction…) dans un fichier JSONL, secrets masqués. Partagée par l'agent ET tous les sous-agents → tu vois tout l'arbre d'exécution dans une seule trace."},
-  subagent:{api:"agent.as_tool(name=, description=)", info:"Un agent complet exposé comme OUTIL d'un autre : l'orchestrateur décide quand le solliciter (ordre émergent, piloté par le LLM). Chaque appel démarre une conversation fraîche ; ses échecs deviennent des erreurs d'outil, jamais un crash."},
+  subagent:{api:"agent.as_tool(name=, description=)", info:"Un agent complet exposé comme OUTIL d'un autre : l'orchestrateur décide quand le solliciter (ordre émergent, piloté par le LLM). Chaque appel démarre une conversation fraîche ; ses échecs deviennent des erreurs d'outil, jamais un crash. Par défaut le spécialiste agit sous SA politique : coche « hérite de la politique » (inherit_policy) pour que ses appels d'outils passent AUSSI par la politique, la garde trifecta et la teinte du parent — sans cela un parent strict peut déléguer à un spécialiste sans politique ce qu'il ne peut pas faire lui-même."},
   chaine:{api:"boucle for … .run() (code)", info:"Enchaîne des étapes dans un ordre GARANTI par le code (A→B→C) : chaque étape reçoit la sortie de la précédente. Idéal pour un traitement séquentiel maîtrisé (extraction → analyse → synthèse). Déterministe, pas piloté par le LLM."},
   parallele:{api:"ThreadPoolExecutor … .run() (code)", info:"Lance plusieurs experts EN PARALLÈLE sur la même entrée (threads), collecte tous les résultats, puis un synthétiseur les fusionne. Gain de latence quand les analyses sont indépendantes."},
   hook:{api:"post_turn_hook", info:"Garde-fou côté hôte appelé quand le modèle veut conclure : retourne None pour valider, ou un Message pour demander une correction (re-lancer des tests, vérifier une condition…). Plafonné pour éviter les boucles."},
   orchestrator:{api:"Orchestrator(current_steps=, record=)", info:"Paradigme différent : TA machine à états décide de l'avancement, le LLM se contente d'interpréter les réponses et de reformuler les questions. Idéal pour des flux question/réponse déterministes (formulaire, prise de RDV). Définis tes étapes « id | question »."},
   run:{api:"agent.run(prompt) · run_stream(prompt)", info:"Lance l'agent sur ta consigne et affiche la réponse. Coche « streaming » pour consommer la réponse token par token (run_stream), avec les événements tool_start / done au fil de l'eau."},
   bounds:{api:"Bounds(max_steps=, token_budget=, max_tool_result_chars=, prune_tool_results_after=, prune_batch=, max_repeated_tool_calls=, trifecta_guard=, shadow_guards=)", info:"Les huit bornes d'un agent en UN objet lisible, partageable, sérialisable dans une trace (agent.bounds.to_dict()). Avec ce bloc, les bornes des options Agent sont remplacées par bounds=. Le mode témoin (shadow_guards) observe les gardes sans les appliquer : pour MESURER avant d'activer — il ne protège pas."},
-  delegation:{api:"delegate_to({nom: agent, …}, name=)", info:"UN outil, plusieurs demandes : celles qui visent des spécialistes différents partent EN PARALLÈLE (−39 % de temps mesuré). L'appel ne rend la main que quand TOUS ont fini — c'est ce qui garde token_budget exact (paralléliser ≠ passer en asynchrone). Un même spécialiste est sérialisé ; l'ordre des réponses suit les demandes ; la teinte d'un spécialiste remonte ; la dépense de tous entre dans le plafond du parent."},
+  delegation:{api:"delegate_to({nom: agent, …}, name=)", info:"UN outil, plusieurs demandes : celles qui visent des spécialistes différents partent EN PARALLÈLE (−39 % de temps mesuré). L'appel ne rend la main que quand TOUS ont fini — c'est ce qui garde token_budget exact (paralléliser ≠ passer en asynchrone). Un même spécialiste est sérialisé ; l'ordre des réponses suit les demandes ; la teinte d'un spécialiste remonte ; la dépense de tous entre dans le plafond du parent. « inherit_policy » : leurs appels d'outils passent aussi par la politique du parent."},
   cascade:{api:"cascade([lambda: agent_lite, lambda: agent_pro], tache, check=juge)", info:"Le petit modèle d'abord, le gros seulement si TON juge (du CODE, pas l'avis du modèle) refuse. Les paliers ratés se paient et sont dans la facture. Une pause d'approbation remonte : la cascade ne contourne jamais tool_policy. Mesuré : sur des micro-tâches la cascade peut coûter PLUS en jetons — elle gagne en euros si le jeton lite coûte moins qu'un seuil que la démo 33 calcule."},
   synthese:{api:"synthesize_tool(builder, goal, examples, holdout=, max_attempts=, register_on=)", info:"Le modèle écrit un outil, le bac à sable exécute TES exemples (args → attendu) et décide. Les exemples sont COUPÉS : la part cachée n'est jamais transmise au modèle, même quand elle rate (il apprend combien, jamais lesquels) — sinon il code les exemples un par un. Un outil refusé est effacé du disque ; un outil accepté reste en bac à sable jusqu'à ta promotion par empreinte."},
   mcp:{api:"MCPClient(commande).mount(agent, prefix=, include=)", info:"Branche un serveur MCP (Model Context Protocol) : il tourne en sous-processus local (stdio) et CHACUN de ses outils devient un outil autoagent ordinaire, validé par le registre avant chaque appel. Filtre avec « include » : monter 3 outils précis vaut mieux que 40 (contexte + surface d'attaque). Zéro dépendance."},
@@ -815,12 +842,14 @@ const INFO = {
   policy:{api:"ToolPolicySpec.from_dict({...}).compile() → tool_policy=", info:"La politique d'outils en DONNÉES : des règles allow / deny / approve relisibles en diff et versionnables, compilées vers le hook tool_policy existant. Précédence par ACTION (deny > approve > allow > défaut), jamais par ordre des lignes. Fail-CLOSED : une faute de frappe échoue au démarrage, une condition qui plante refuse l'appel. « approve » met la boucle en PAUSE avant tout effet de bord — le script généré demande à l'humain puis reprend."},
   record:{api:"RecordSession(f).provider(vrai) + .registry() · ReplaySession(f)", info:"Fige un run réel dans une fixture JSONL (appels LLM et outils, secrets masqués), puis le rejoue HORS-LIGNE : zéro réseau, zéro outil exécuté, zéro jeton — un test CI gratuit et déterministe. Toute divergence (outil manquant, prompt changé) lève ReplayMismatch en pointant l'étape."},
   fiabilite:{api:"run_k(agent, consigne, k=, check=juge) → ReliabilityReport", info:"Un agent qui réussit 8 fois sur 10 n'est pas fiable : run_k relance la MÊME consigne k fois et compte avec TON juge en code (jamais un LLM juge). Rend pass@1, pass^k observé, l'estimation p^k, la dispersion des étapes et les jetons par succès — les échecs se paient aussi."},
+  journal:{api:"Agent(journal=Journal(fichier)) · agent.resume_from_journal() · journal.resolve(call_id, ok=/retry=)", info:"Un run reprend d'un instantané pris à la fin de chaque étape : si le processus meurt PENDANT une étape — le mail est parti, rien n'est écrit — la reprise refait l'étape et le mail part deux fois. Le journal écrit l'INTENTION de chaque appel d'outil (fsync) AVANT l'effet, le résultat APRÈS. À la reprise : un appel terminé n'est jamais relancé ; un appel dont l'issue est INCONNUE (intention écrite, pas de résultat) n'est PAS relancé en silence — OutcomeUnknown, AVANT qu'aucun outil de l'étape ne tourne : tu vérifies auprès du système externe, puis journal.resolve(). Un outil idempotent=True est relancé tout seul. idempotency_key() donne une clé stable à passer au service externe. FAIL-CLOSED : si l'intention ne s'écrit pas, l'effet ne part pas. Testé par de vraies morts de processus ; la panne de courant ne l'est pas."},
+  comparer:{api:"compare_configs(Variant(A), Variant(B), taches, repeats=, control=) → ComparisonReport", info:"Un premier échantillon « montre un gain » : mais relancer la MÊME configuration donne déjà des résultats différents (environ 54 % de la variance vient du re-lancement). Ici les deux bras jouent les mêmes tâches, avec TES juges en code, en ALTERNANT à chaque répétition. Le verdict exige l'accord d'un test exact par permutation et d'un intervalle ; par défaut : « indistinguables » — ce qui n'est PAS « équivalentes » : le rapport dit l'écart minimal que ce plan aurait vu (4 tâches × 5 répétitions ne détectent pas moins de ≈45 points). Le contrôle A/A rejoue A contre sa copie : il doit sortir « indistinguable ». Le résultat vaut pour CES tâches. Sur des tâches trop faciles les deux bras réussissent toujours : le rapport le dit."},
 };
 
 const ENV = {gemini:"GEMINI_API_KEY", openai:"OPENAI_API_KEY", anthropic:"ANTHROPIC_API_KEY", deepseek:"DEEPSEEK_API_KEY", groq:"GROQ_API_KEY"};
 // Version de la lib que ce constructeur couvre. Le test headless la compare à
 // autoagent.__version__ : le constructeur ne peut plus prendre de retard en silence.
-const LIB_VERSION = "0.22.0";
+const LIB_VERSION = "0.23.0";
 // Modèle par défaut de chaque fournisseur : changer le provider sans
 // changer le modèle produisait `from_model("deepseek","gemini-…")`.
 const MODELE_DEFAUT = {gemini:"gemini-3.7-flash", openai:"gpt-4o-mini",
@@ -924,6 +953,19 @@ function parseStages(raw){
   });
 }
 
+/* « Comparer » : « nom | consigne | expression Python sur `res` » — le juge est la 3ᵉ colonne
+   (il peut contenir des « | » : on ne coupe que sur les deux premiers). */
+function parseTaches(raw){
+  return String(raw||"").split("\n").map(l=>l.trim()).filter(Boolean).map(l=>{
+    const i = l.indexOf("|"), j = i < 0 ? -1 : l.indexOf("|", i+1);
+    return {
+      nom: (i >= 0 ? l.slice(0,i) : l).trim().replace(/\s+/g,"_"),
+      consigne: i < 0 ? "" : (j < 0 ? l.slice(i+1) : l.slice(i+1, j)).trim(),
+      expr: j < 0 ? "" : l.slice(j+1).trim(),
+    };
+  });
+}
+
 function generate(){
   const by = t => stack.filter(b=>b.type===t);
   const agentB = by("agent")[0];
@@ -931,9 +973,10 @@ function generate(){
   const chaineB = by("chaine")[0];
   const parB    = by("parallele")[0];
   const cascSeul = by("cascade")[0];
+  const compB = by("comparer")[0];
   const notes = [];                                   // diagnostic montré au-dessus du code
   const note = (lvl, txt) => notes.push({lvl, txt});
-  if(!agentB && !orchB && !chaineB && !parB && !cascSeul){
+  if(!agentB && !orchB && !chaineB && !parB && !cascSeul && !compB){
     return {notes, code:"# ← Ajoute un bloc « Agent » (ou « Orchestrator », « Chaîne », « Parallèle ») pour démarrer.\n# Puis empile des outils, une mémoire, une trace, un bac à sable…", env:null, loc:0};
   }
   const a   = agentB ? agentB.f : null;
@@ -954,6 +997,7 @@ function generate(){
   const dyn   = by("dynamic")[0];
   const mcps  = by("mcp");
   const ckpt  = by("checkpoint")[0];
+  const jrnB  = agentB ? by("journal")[0] : null;
   const run   = by("run")[0];
   const hasTrace = !!(tr || otelB);   // OTel implique une TraceEmitter, créée au besoin
   const adv   = agentB && !a.routing && ((a.baseurl||"").trim() || (a.keyenv||"").trim());  // provider avancé
@@ -968,6 +1012,7 @@ function generate(){
   if(otelB) names.add("OTelTraceExporter");
   if(agentB && mcps.length) names.add("MCPClient");
   if(agentB && ckpt) names.add("RunState");
+  if(jrnB){ names.add("Journal"); names.add("OutcomeUnknown"); }
   if(wss.length) names.add("ProjectWorkspace");
   const boundsB = by("bounds")[0], delegB = by("delegation")[0], cascB = by("cascade")[0], synthB = by("synthese")[0];
   const polB = agentB ? by("policy")[0] : null, recB = agentB ? by("record")[0] : null, fiabB = agentB ? by("fiabilite")[0] : null;
@@ -990,7 +1035,7 @@ function generate(){
   if(!agentB){
     const besoin = {tool:"Outil Python", workspace:"Écriture bornée", sandbox:"Bac à sable", dynamic:"Outils dynamiques",
       synthese:"Synthèse par l'exemple", mcp:"Serveur MCP", memory:"Mémoire", subagent:"Sous-agent", hook:"Vérification",
-      checkpoint:"Checkpoint / reprise", delegation:"Délégation parallèle", policy:"Politique d'outils",
+      checkpoint:"Checkpoint / reprise", journal:"Journal durable", delegation:"Délégation parallèle", policy:"Politique d'outils",
       record:"Enregistrer / rejouer", fiabilite:"Fiabilité", run:"Lancer"};
     for(const [ty, nom] of Object.entries(besoin)) if(by(ty).length) note("warn", `« ${nom} » est ignoré : il lui faut un bloc Agent.`);
     if(boundsB && !chaineB && !parB) note("warn", "« Bornes » est ignoré : il lui faut un bloc Agent, une Chaîne ou un Parallèle.");
@@ -1021,7 +1066,18 @@ function generate(){
       note("info", "Trifecta : une sortie LÉGITIME est aussi bloquée dès que le run est teinté. Choisis trifecta_guard=approve si le métier exige l'envoi.");
     if(a.parallel) note("info", "parallel_tool_calls : les handlers d'outils doivent être thread-safe (l'ordre du transcript reste déterministe).");
     if(delegB) note("info", "delegate_to : parallèle ≠ asynchrone — l'appel rend la main quand TOUS les spécialistes ont fini ; token_budget reste exact.");
+    if((delegB && delegB.f.inherit) || subs.some(s=>s.f.inherit)){
+      if(!polB && !trifApprove && !tools.some(x=>x.f.egress))
+        note("info", "inherit_policy : le parent n'a ni politique d'outils ni outil egress — il n'y a presque rien à hériter. Ajoute « Politique d'outils » pour que le parent borne aussi ses spécialistes.");
+      else note("ok", "inherit_policy : les appels d'outils des spécialistes passent aussi par la politique du parent (une demande d'approbation y REFUSE : un sous-agent ne peut pas être mis en pause).");
+    }
     if(ckpt && mem) note("info", "À la reprise depuis un snapshot, la compaction mémoire est SAUTÉE (le snapshot est pris mi-run).");
+    if(jrnB){
+      note("info", "Journal : marque idempotent=True les outils de lecture — une issue inconnue y est relancée toute seule ; les autres demandent un humain (OutcomeUnknown), jamais une relance en silence.");
+      if(run && run.f.stream) note("info", "En streaming, la reprise depuis le journal n'est pas émise (le journal est bien écrit).");
+      if(!tools.length && !mcps.length && !dyn) note("info", "Journal : il protège les EFFETS des outils — sans outil, il n'y a rien à protéger.");
+      if(codeMode==="integration" && !orchB && !chaineB && !parB) note("info", "En mode « fonction à intégrer », la reprise depuis le journal n'est pas émise : build_agent() construit l'agent, l'hôte pilote la reprise.");
+    }
     const prune = (boundsB ? boundsB.f.prune : a.prune);
     if(prune!=="" && prune!=null && a.prov==="gemini")
       note("info", "Élaguer casse le préfixe du cache. Sur Gemini le cache implicite est opportuniste (mesuré) ; il est déterministe sur DeepSeek.");
@@ -1053,6 +1109,7 @@ function generate(){
   if(delegB){ names.add("delegate_to"); names.add("Agent"); }
   if(cascB){ names.add("cascade"); names.add("Agent"); }
   if(synthB){ names.add("Example"); names.add("synthesize_tool"); names.add("DynamicToolBuilder"); names.add("create_provider"); names.add("ModelConfig"); }
+  if(compB){ names.add("compare_configs"); names.add("EvalTask"); names.add("Variant"); names.add("Agent"); }
   const emitCascade = () => {
     const c = cascB.f;
     L.push(`# Cascade PAR RÉSULTAT : le palier bon marché d'abord ; le fort seulement si le JUGE`);
@@ -1067,6 +1124,49 @@ function generate(){
     L.push(`resultat = cascade([_palier(${pyStr(c.lite)}), _palier(${pyStr(c.pro)})], ${pyLines(c.prompt, 0)}, check=juge)`);
     L.push(`print(resultat.summary())   # palier qui a convaincu, escalades, jetons de TOUS les paliers`);
     L.push(`print(resultat.result.output)`);
+  };
+  /* « Comparer deux configurations » : autonome (comme la cascade), il construit ses propres
+     agents. Le diagnostic dit ce que ce plan coûte et ce qu'il ignore. */
+  const compTaches = compB ? parseTaches(compB.f.taches).filter(t => t.consigne && t.expr) : [];
+  if(compB){
+    const c = compB.f;
+    for(const t of parseTaches(c.taches).filter(t => !(t.consigne && t.expr)))
+      note("warn", `Comparer : la tâche « ${t.nom} » n'a pas de consigne ou de juge (colonnes 2 et 3) : ignorée.`);
+    if(!compTaches.length) note("warn", "Comparer : aucune tâche utilisable (une par ligne : nom | consigne | expression Python sur `res`).");
+    const rep = Math.max(1, Math.round(num(c.repeats, 5))), bras = c.control ? 3 : 2;
+    if(compTaches.length)
+      note("info", `Comparer : ${compTaches.length} tâche(s) × ${rep} répétition(s) × ${bras} bras = ${compTaches.length*rep*bras} runs, chacun au moins un appel au modèle. Le rapport imprime aussi le plus petit écart que CE plan détecte.`);
+    if(c.model_a === c.model_b && c.system_a === c.system_b)
+      note("info", "A et B sont identiques : c'est un contrôle A/A à lui seul — le verdict attendu est « indistinguables ».");
+    if(agentB) note("info", "« Comparer » construit ses propres agents (Agent.from_model) : le bloc Agent n'est pas utilisé ici. Pour comparer TON assemblage, passe en mode « fonction à intégrer » : build_agent() est déjà une fabrique pour Variant(...).");
+    if(run) note("info", "« Lancer » n'est pas utilisé : « Comparer » porte ses propres tâches.");
+    if(codeMode==="integration" && agentB && !orchB && !chaineB && !parB)
+      note("info", "En mode « fonction à intégrer », « Comparer » n'est pas émis : build_agent() ne contient que l'agent.");
+  }
+  const emitCompare = () => {
+    const c = compB.f, rep = Math.max(1, Math.round(num(c.repeats, 5)));
+    L.push(`# Comparer deux configurations : mêmes tâches, MÊMES juges en code (jamais un LLM juge),`);
+    L.push(`# bras qui ALTERNENT à chaque répétition. Le verdict exige l'accord d'un test exact et d'un`);
+    L.push(`# intervalle ; par défaut « indistinguables » — ce qui n'est PAS « équivalentes ».`);
+    L.push(`TACHES = [`);
+    for(const t of compTaches) L.push(`    EvalTask(${pyStr(t.nom)}, ${pyStr(t.consigne)}, lambda res: ${t.expr}),`);
+    L.push(`]`);
+    L.push(``);
+    L.push(`MODELE_A, MODELE_B = ${pyStr(c.model_a)}, ${pyStr(c.model_b)}`);
+    L.push(`SYSTEME_A = ${pyLines(c.system_a, 12)}`);
+    L.push(`SYSTEME_B = ${pyLines(c.system_b, 12)}`);
+    L.push(``);
+    L.push(`def _bras(modele: str, systeme: str):`);
+    L.push(`    # UNE FABRIQUE : un agent NEUF à chaque tentative (sinon on mesure l'accumulation d'état).`);
+    L.push(`    return lambda: Agent.from_model(${pyStr(c.prov)}, modele, system_prompt=systeme, max_steps=${num(c.steps, 3)})`);
+    L.push(``);
+    L.push(`# params DÉCLARE ce qui change : l'empreinte lit la structure de l'agent, pas son code.`);
+    L.push(`rapport = compare_configs(`);
+    L.push(`    Variant("A", _bras(MODELE_A, SYSTEME_A), params={"modele": MODELE_A, "system_prompt": SYSTEME_A}),`);
+    L.push(`    Variant("B", _bras(MODELE_B, SYSTEME_B), params={"modele": MODELE_B, "system_prompt": SYSTEME_B}),`);
+    L.push(`    TACHES, repeats=${rep}, control=${c.control ? "True" : "False"},`);
+    L.push(`)`);
+    L.push(`print(rapport.summary())   # écart, intervalle approché, test exact, ce que le plan voit, coût, empreintes`);
   };
   if(mem){
     if(mem.f.kind==="BufferMemory") names.add("BufferMemory");
@@ -1083,7 +1183,7 @@ function generate(){
   if(orchB){ names.add("Orchestrator"); names.add("Step"); names.add("create_provider"); names.add("ModelConfig"); }
 
   const L = [];
-  const env = ENV[(agentB?a.prov:(orchB?orchB.f.prov:(chaineB?chaineB.f.prov:(parB?parB.f.prov:(cascSeul?cascSeul.f.prov:"gemini")))))] || "GEMINI_API_KEY";
+  const env = ENV[(agentB?a.prov:(orchB?orchB.f.prov:(chaineB?chaineB.f.prov:(parB?parB.f.prov:(cascSeul?cascSeul.f.prov:(compB?compB.f.prov:"gemini"))))))] || "GEMINI_API_KEY";
   // Mode « fonction à intégrer » : seulement pour un programme AGENT (les flux
   // Orchestrator/Chaîne/Parallèle restent des scripts par nature).
   const integ = codeMode==="integration" && agentB && !orchB && !chaineB && !parB;
@@ -1271,6 +1371,14 @@ function generate(){
       L.push(`    _CHECKPOINT.write_text(json.dumps(state.to_dict()), encoding="utf-8")`);
       L.push(``);
     }
+    // journal durable : l'INTENTION de chaque appel est écrite (fsync) AVANT l'effet
+    if(jrnB){
+      L.push(`# Journal durable : l'INTENTION de chaque appel d'outil est écrite (fsync) AVANT l'effet, le`);
+      L.push(`# résultat APRÈS. Une coupure brutale ne refait jamais un effet ; une issue INCONNUE n'est pas`);
+      L.push(`# relancée en silence. Fail-CLOSED : sans intention écrite, l'outil ne part pas.`);
+      L.push(`journal = Journal(${pyStr(jrnB.f.file||"run.jsonl")})`);
+      L.push(``);
+    }
     // définitions des outils PARTAGÉS (fonctions simples, attachées ensuite à chaque agent)
     for(const t of sharedTools){
       L.push(`def ${(t.f.fname||"outil").trim()}(${t.f.params||""}) -> ${t.f.ret||"dict"}:`);
@@ -1316,6 +1424,7 @@ function generate(){
     if(hook) kwTail.push(`post_turn_hook=${(hook.f.fname||"verifier").trim()}`);
     if(hook && num(hook.f.maxcorr,1)!==1) kwTail.push(`max_corrections_per_run=${num(hook.f.maxcorr,1)}`);
     if(polB) kwTail.push(`tool_policy=${(polB.f.var||"politique").trim()}`);
+    if(jrnB) kwTail.push(`journal=journal`);
 
     const mc = [`provider=${pyStr(a.prov)}`, `model=${pyStr(a.model)}`];
     if(adv && (a.baseurl||"").trim()) mc.push(`base_url=${pyStr(a.baseurl.trim())}`);
@@ -1413,7 +1522,12 @@ function generate(){
       const sv = (s.f.var||"specialiste").trim();
       L.push(`${av}.add_tool(${sv}.as_tool(`);
       L.push(`    name=${pyStr(s.f.tname||"interroger_"+sv)},`);
-      L.push(`    description=${pyStr(s.f.desc||"Délègue une sous-tâche.")}))`);
+      if(s.f.inherit){
+        L.push(`    description=${pyStr(s.f.desc||"Délègue une sous-tâche.")},`);
+        L.push(`    inherit_policy=True))   # ses appels d'outils passent AUSSI par la politique du parent`);
+      }else{
+        L.push(`    description=${pyStr(s.f.desc||"Délègue une sous-tâche.")}))`);
+      }
       L.push(``);
     }
     // délégation parallèle : UN outil, plusieurs spécialistes, exécutés ensemble
@@ -1426,7 +1540,7 @@ function generate(){
       for(const [nom, role] of specs)
         L.push(`    ${pyStr(nom)}: Agent.from_model(${pyStr(d.prov)}, ${pyStr(d.model)}, system_prompt=${pyStr(role)}, max_steps=2),`);
       L.push(`}`);
-      L.push(`${av}.add_tool(delegate_to(_specialistes, name=${pyStr(d.tname||"delegate")}))`);
+      L.push(`${av}.add_tool(delegate_to(_specialistes, name=${pyStr(d.tname||"delegate")}${d.inherit ? `, inherit_policy=True` : ``}))`);
       L.push(``);
     }
     // outils propres à l'agent principal (@decorator)
@@ -1509,6 +1623,8 @@ function generate(){
       // rien : build_agent() retournera l'agent (voir l'enveloppe en fin de generate)
     }else if(cascB){
       emitCascade();
+    }else if(compB){
+      emitCompare();
     }else if(synthB){
       const s = synthB.f;
       const lignes = String(s.examples||"").split("\n").map(l=>l.trim()).filter(Boolean);
@@ -1529,8 +1645,9 @@ function generate(){
     }else if(fiabB){
       const fb = fiabB.f;
       if(!run) note("warn", "Fiabilité : ajoute « Lancer » pour fournir la consigne à répéter.");
-      L.push(`# Fiabilité MESURÉE : k runs de la même consigne, TON juge en code (jamais un LLM juge —`);
-      L.push(`# ils plafonnent sous 55 % sur les échecs d'agent). Les échecs se paient aussi.`);
+      L.push(`# Fiabilité MESURÉE : k runs de la même consigne, TON juge en code (jamais un LLM juge :`);
+      L.push(`# sur Who&When, la meilleure attribution automatique désigne l'agent fautif dans 53,5 % des`);
+      L.push(`# cas et l'étape fautive dans 14,2 % — Zhang et al., arXiv:2505.00212). Les échecs se paient aussi.`);
       L.push(`def juge(res) -> bool:`);
       L.push(indentBody(fb.juge || "return bool(res.output.strip())", "    "));
       L.push(``);
@@ -1659,7 +1776,28 @@ function generate(){
         L.push(`        print(f"\\n\\n({ev.steps} tours d'agent)")`);
         wrapRun();
       }else{
-        if(ckpt && ckpt.f.resume){
+        if(jrnB){
+          const args = extra.replace(/^, /, "");
+          L.push(`# Reprise depuis le JOURNAL : si un run a été interrompu (kill, panne), on le continue SANS`);
+          L.push(`# refaire d'effet. Un appel dont l'issue est INCONNUE (intention écrite, pas de résultat) n'est`);
+          L.push(`# jamais relancé en silence : OutcomeUnknown, AVANT qu'aucun outil de l'étape ne tourne.`);
+          L.push(`try:`);
+          L.push(`    if journal.last_resumable_run():`);
+          L.push(`        resultat = ${av}.resume_from_journal(${args})`);
+          L.push(`    else:`);
+          L.push(`        resultat = ${av}.${methode}(${cible}${extra})`);
+          L.push(`except OutcomeUnknown as inconnu:`);
+          L.push(`    # RIEN n'a été relancé. À toi de vérifier auprès du système externe : l'effet est-il parti ?`);
+          L.push(`    for appel in inconnu.calls:`);
+          L.push(`        parti = input(f"{appel.name}({appel.arguments}) est-il parti ? [o/N] ").strip().lower() == "o"`);
+          L.push(`        if parti:`);
+          L.push(`            journal.resolve(appel.id, ok=True, result={"constate": "parti"})`);
+          L.push(`        else:`);
+          L.push(`            journal.resolve(appel.id, retry=True)`);
+          L.push(`    resultat = ${av}.resume_from_journal(${args})`);
+          L.push(`finally:`);
+          L.push(`    journal.close()`);
+        }else if(ckpt && ckpt.f.resume){
           L.push(`# Reprise : si un snapshot existe (run interrompu), on continue au lieu de repartir de zéro.`);
           L.push(`if _CHECKPOINT.exists():`);
           L.push(`    _etat = RunState.from_dict(json.loads(_CHECKPOINT.read_text(encoding="utf-8")))`);
@@ -1787,6 +1925,7 @@ function generate(){
 
   /* ═══ PARALLÈLE + fusion (fan-out concurrent puis synthèse) ═══ */
   if(cascB && !agentB && !orchB){ emitCascade(); }
+  if(compB && !agentB && !orchB){ emitCompare(); }
   if(parB){
     const p = parB.f, stages = parseStages(p.stages);
     const traceArg = hasTrace ? `, trace=trace` : ``;
@@ -2387,6 +2526,22 @@ const PRESETS = [
     mk("tool",{fname:"carre",params:"n: float",ret:"dict",doc:"Renvoie le carré d'un nombre.",body:'return {"carre": n * n}'}),
     mk("fiabilite",{k:"5",juge:'return "156.25" in res.output'}),
     mk("run",{prompt:"Quel est le carré de 12.5 ?"}),
+  ]},
+  {id:"jrn", grp:"Flux & intégration", label:"37 · Journal durable (une coupure ne refait pas un effet)", make:()=>[
+    mk("agent",{var:"agent",system:"Tu envoies le mail demandé avec ton outil, puis tu confirmes en une phrase.",steps:"4"}),
+    mk("tool",{fname:"envoyer_mail",params:"destinataire: str, corps: str",ret:"dict",doc:"Envoie un e-mail (effet irréversible).",body:'print(f"[mail → {destinataire}] {corps[:60]}")\nreturn {"envoye": True}'}),
+    mk("journal",{}),
+    mk("run",{prompt:"Envoie « bonjour » à moi@alyce.fr."}),
+  ]},
+  {id:"herite", grp:"Sécurité & bornes", label:"36 · Sous-agent borné par la politique du parent (inherit_policy)", make:()=>[
+    mk("agent",{var:"superviseur",system:"Tu délègues l'envoi au spécialiste, puis tu confirmes en une phrase.",steps:"5"}),
+    mk("tool",{fname:"envoyer_mail",params:"destinataire: str, corps: str",ret:"dict",doc:"Envoie un e-mail (fait SORTIR de l'information).",body:'print(f"[mail → {destinataire}] {corps[:60]}")\nreturn {"envoye": True}',egress:true,share:true}),
+    mk("subagent",{var:"expediteur",tname:"expedier",desc:"Délègue l'envoi d'un message.",system:"Tu envoies le message demandé avec ton outil d'envoi.",inherit:true}),
+    mk("policy",{}),
+    mk("run",{prompt:"Envoie « bonjour » à moi@alyce.fr."}),
+  ]},
+  {id:"comp", grp:"Observabilité & tests", label:"35 · Comparer deux configurations (A/B + contrôle A/A)", make:()=>[
+    mk("comparer",{}),
   ]},
   {id:"evol", grp:"Outils qui s'écrivent", label:"Évolution logicielle (modifier un logiciel sous garde)", make:()=>[
     mk("agent",{var:"agent",steps:"10",system:"Tu fais évoluer ce logiciel. Inspecte d'abord (fichiers, slots), modifie par petites étapes, valide après chaque changement ; si la validation échoue à cause de toi, annule (rollback) ou corrige plus petit."}),
