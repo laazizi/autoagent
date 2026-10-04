@@ -4209,8 +4209,11 @@ seul — de 67 % à 89 % de moins.**
 | 4 | 292 | 2 042 | −86 % | 0 |
 | 5 | 780 | 2 581 | −70 % | 2 |
 
-Le gros modèle dépense en volume des jetons de réflexion (de 925 à 1 804 sur la seule première tâche) que le petit
-n'a presque pas. Une escalade paie toujours deux paliers : les deux runs à 2 escalades sont ceux où la cascade a le
+La première tâche coûte à elle seule de 925 à 1 804 jetons au gros modèle. Un sixième run, instrumenté pour compter
+les MÊMES appels des deux façons, dit pourquoi : le gros seul y dépense 2 522 jetons de réflexion sur 2 815 (1 798 sur
+les 1 888 de la première tâche), le petit aucun. Compté comme avant la 0.23.1 (entrée + réponse, sans les pensées), ce
+même run donne **+30 %** pour la cascade (382 contre 293) ; compté comme aujourd'hui, **−79 %** (589 contre 2 815) :
+le renversement vient de la comptabilité, pas du modèle. Une escalade paie toujours deux paliers : les deux runs à 2 escalades sont ceux où la cascade a le
 plus coûté (897 et 780), et elle reste loin sous le gros seul. La démo imprime aussi le **seuil** : la cascade gagne en
 euros si le jeton lite coûte moins de X % du jeton pro, X calculé du run (`jetons de pro évités / jetons de lite
 dépensés`). Le rapport de prix réel est la donnée de l'hôte — la lib ne présume aucun tarif (§27.5). Ce qui décide en

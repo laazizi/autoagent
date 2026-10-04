@@ -12,11 +12,14 @@ Documentation and demos only — nothing in the `autoagent` package changes.
 ### Fixed
 
 - **The measurement behind demo 33 (`cascade()`) had the wrong sign.** The README, the demos README, the dev-doc
-  (§34.2) and the builder said "369 tokens vs 307 — the cascade cost MORE". That figure predates the 0.23.1 Gemini
-  accounting, which ignored thinking tokens: the big model alone counted 307 tokens then, 2 042–2 711 now, while the
-  small model's counts barely moved. Re-measured on 4 Oct 2026 on 0.24.0 (5 real runs of the four tasks,
-  `gemini-3.5-flash-lite` → `gemini-3.7-flash`): the cascade spent **67 % to 89 % fewer tokens** (279–897 vs
-  2 042–2 711), with 0 to 2 escalations per run. Tokens, not euros; 5 runs, one pair of models, four short tasks.
+  (§34.2) and the builder said "369 tokens vs 307 — the cascade cost MORE". That figure was taken before 0.23.1, when
+  a run's Gemini token count left the thinking tokens out: the big model alone counted 307 tokens then, 2 042–2 711
+  now, while the small model's counts barely moved. Re-measured on 4 Oct 2026 on 0.24.0 (5 real runs of the four
+  tasks, `gemini-3.5-flash-lite` → `gemini-3.7-flash`): the cascade spent **67 % to 89 % fewer tokens** (279–897 vs
+  2 042–2 711), with 0 to 2 escalations per run. A sixth run, instrumented to count the SAME calls both ways, confirms
+  the cause: **+30 %** for the cascade with the old count (382 tokens vs 293), **−79 %** with the new one (589 vs
+  2 815) — the big model alone spent 2 522 thinking tokens, the small one none. Tokens, not euros; one pair of
+  models, four short tasks.
 - **Demo 38, level 2: the printed Wilson bound.** The interval covers every run that reached a verdict (24:
   `tags_unicode` never reaches the model, so 3 of them expose nothing), while the demo's own note spoke of the 21
   exposed runs. The demo now prints both — [0 % ; 14 %] on 24 runs and [0 % ; 15 %] on the 21 exposed ones.
