@@ -9,9 +9,8 @@ bouge donc pas d'une ligne.
     spec = ToolPolicySpec.from_dict({
         "default": "allow",
         "rules": [
-            {"tool": "write_file", "action": "allow",
-             "when": {"args": {"path": {"starts_with": "rapports/"}}}},
             {"tool": "write_file", "action": "deny",
+             "when": {"args": {"path": {"not": {"path_within": "rapports/"}}}},
              "reason": "écriture limitée à rapports/"},
             {"tool": "*", "action": "deny", "when": {"tainted": True, "egress": True},
              "reason": "sortie interdite après lecture de contenu non fiable"},
@@ -19,6 +18,11 @@ bouge donc pas d'une ligne.
         ],
     })
     agent = Agent(provider, tool_policy=spec.compile())
+
+Pour confiner un chemin ou une URL, `path_within` et `url_host` (0.23.1) : `starts_with`
+compare des chaînes et se contourne (`rapports/../../etc/…`, `https://api.exemple.fr.evil.example`,
+`https://api.exemple.fr@evil.example`). Un `deny` l'emporte toujours sur un `allow` : « écrire
+seulement sous rapports/ » s'écrit donc « REFUSE si le chemin n'est PAS sous rapports/ » (`not`).
 
 Trois choix de conception :
 
@@ -42,13 +46,17 @@ Trois choix de conception :
 
 from __future__ import annotations
 
+import ipaddress
+import posixpath
 import re
+import unicodedata
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 from .errors import ApprovalRequired
-from .logging import get_logger
+from .logging import get_logger, warn_once
 
 __all__ = ["ToolPolicySpec"]
 
@@ -64,6 +72,126 @@ _CONTEXT_KEYS = ("args", "tainted", "egress", "step", "permissions", "source")
 
 def _as_number(value: Any) -> float | None:
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+# ── Opérateurs de CONFINEMENT (0.23.1) ───────────────────────────────────────────────────────
+#
+# `starts_with` compare des CHAÎNES. Pour confiner un chemin ou une URL, c'est une fausse
+# sécurité — reproduit sur la 0.23.0, avec la règle que notre propre doc enseignait :
+#   `{"path": {"starts_with": "rapports/"}}`  laisse passer  `rapports/../../etc/cron.d/x`
+#   `{"url": {"starts_with": "https://api.exemple.fr"}}`  laisse passer
+#       `https://api.exemple.fr.evil.example/…`  et  `https://api.exemple.fr@evil.example/…`
+# (même classe de faille que CVE-2025-53110, une « naive string prefix-matching check » dans le
+# serveur MCP filesystem d'Anthropic — Cymulate, 17 mars 2026).
+# `path_within` et `url_host` comparent la chose elle-même, une fois NORMALISÉE. Ils sont
+# fail-closed : tout ce qu'ils ne savent pas lire proprement ne correspond pas.
+
+_CONTROLE = re.compile(r"[\x00-\x1f\x7f]")
+_ENCODAGE_AMBIGU = re.compile(r"%(?:2e|2f|5c)", re.IGNORECASE)    # « . », « / », « \ » encodés
+_LECTEUR = re.compile(r"^([A-Za-z]):")                            # « C: » : Windows ; pour `posixpath`, un chemin RELATIF
+# Les noms de périphériques de Windows (`CON`, `NUL`, `COM1`, `LPT1.txt`…) ne sont pas des fichiers : un chemin qui
+# passe par l'un d'eux n'est dans aucun répertoire. Refusés partout (aucun fichier légitime ne s'appelle ainsi).
+_PERIPHERIQUE = re.compile(r"^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$", re.IGNORECASE)
+
+
+def _chemin_dans(chemin: str, base: str) -> bool:
+    """`chemin`, une fois normalisé (`..`, `.`, `//`, `\\`), est-il `base` elle-même ou dessous ?"""
+    # Une lettre de lecteur (`C:\Windows\win.ini`) est un chemin ABSOLU sous Windows : `posixpath` le voit relatif, et
+    # contre la base « . » il passait (reproduit sous Windows par la relecture du 4 oct. 2026). Même lecteur des deux
+    # côtés, ou aucun : on compare alors le reste.
+    lc, lb = _LECTEUR.match(chemin), _LECTEUR.match(base)
+    if (lc.group(1).lower() if lc else None) != (lb.group(1).lower() if lb else None):
+        return False
+    if lc and lb:
+        chemin, base = chemin[2:], base[2:] or "."
+    c = posixpath.normpath(chemin.replace("\\", "/"))
+    b = posixpath.normpath(base.replace("\\", "/"))
+    if any(_PERIPHERIQUE.match(morceau) for morceau in c.split("/")):
+        return False
+    if c.startswith("/") != b.startswith("/"):
+        return False                      # absolu contre relatif : on ne devine pas le répertoire courant
+    if b == ".":
+        return c != ".." and not c.startswith("../")
+    if c == b:
+        return True
+    return c.startswith(b if b.endswith("/") else b + "/")
+
+
+def _liste_de_textes(expected: Any) -> list[str]:
+    if isinstance(expected, str):
+        return [expected] if expected else []
+    if isinstance(expected, (list, tuple)):
+        return [e for e in expected if isinstance(e, str) and e]
+    return []
+
+
+def _path_within(actual: Any, expected: Any) -> bool:
+    """Le chemin est-il DANS un des répertoires attendus ? Purement syntaxique : les liens symboliques
+    sont l'affaire de l'outil. Refuse (fail-closed) un chemin vide, à caractère de contrôle (NUL…),
+    ou contenant `%2e` / `%2f` / `%5c` (un `..` encodé qu'un outil pourrait décoder). La vérification se
+    fait aussi sur la forme NFKC : des points « pleine chasse » (U+FF0E) valent un point pour certains outils."""
+    bases = _liste_de_textes(expected)
+    if not isinstance(actual, str) or not actual or not bases:
+        return False
+    formes = {actual, unicodedata.normalize("NFKC", actual)}
+    # Le contrôle des caractères de contrôle et des `%2e` porte sur CHAQUE forme : « %2e » écrit en pleine chasse vaut
+    # `%2e` après NFKC, et un outil qui normalise puis décode y verrait un « . ».
+    if any(_CONTROLE.search(f) or _ENCODAGE_AMBIGU.search(f) for f in formes):
+        return False
+    return any(all(_chemin_dans(f, base) for f in formes) for base in bases)
+
+
+# Les caractères que IDNA 2003 (le codec `idna` de la bibliothèque standard) PLIE et que IDNA 2008 (requests, urllib3,
+# Node, curl) GARDE : « straße.example » devient `strasse.example` d'un côté et `xn--strae-oqa.example` de l'autre —
+# deux domaines différents, dont l'un peut être enregistré par un attaquant. On ne parie pas : un hôte qui en contient
+# ne correspond JAMAIS (écrire la forme punycode `xn--…` dans la règle). Mesuré par la relecture sur 123 827 URLs :
+# toutes les divergences avec Node (WHATWG) étaient de cette classe.
+_AMBIGUS_IDNA = frozenset({chr(0x00DF), chr(0x1E9E), chr(0x03C2), chr(0x200C), chr(0x200D)})
+
+
+def _hote_ascii(hote: str) -> str | None:
+    hote = hote.strip().lower().rstrip(".")
+    if not hote or len(hote) > 253:                     # 253 : la longueur maximale d'un nom DNS — et l'encodeur
+        return None                                     # punycode est quadratique sur un nom géant (relecture)
+    if hote.isascii():
+        return hote
+    if _AMBIGUS_IDNA & set(hote):
+        return None
+    try:
+        return hote.encode("idna").decode("ascii")      # punycode : un « a » cyrillique (U+0430) n'est pas un « a » latin
+    except UnicodeError:
+        return None
+
+
+def _url_host(actual: Any, expected: Any) -> bool:
+    """L'hôte RÉEL de l'URL est-il un des hôtes attendus ? `api.exemple.fr` exact, ou `*.exemple.fr`
+    (sous-domaines, pas le domaine nu). http(s) seulement ; le port n'est pas examiné. Refuse l'URL à
+    identifiants (`user@hôte`), à antislash, à espace ou caractère de contrôle, sans schéma ou sans hôte :
+    les analyseurs d'URL ne s'accordent pas sur ces formes, et c'est là que se cachent les contournements."""
+    motifs = _liste_de_textes(expected)
+    if not isinstance(actual, str) or not motifs:
+        return False
+    if _CONTROLE.search(actual) or "\\" in actual or " " in actual:
+        return False
+    try:
+        parts = urlsplit(actual)
+        hote = parts.hostname
+        _ = parts.port                     # lève ValueError si le port est invalide
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https") or not parts.netloc or "@" in parts.netloc or not hote:
+        return False
+    hote_ascii = _hote_ascii(hote)
+    if hote_ascii is None:
+        return False
+    for motif in motifs:
+        if motif.strip().startswith("*."):
+            socle = _hote_ascii(motif.strip()[2:])
+            if socle and hote_ascii.endswith("." + socle):
+                return True
+        elif _hote_ascii(motif) == hote_ascii:
+            return True
+    return False
 
 
 def _match_operator(operator: str, actual: Any, expected: Any) -> bool:
@@ -86,6 +214,16 @@ def _match_operator(operator: str, actual: Any, expected: Any) -> bool:
         return isinstance(actual, (list, tuple, set)) and expected in actual
     if operator == "matches":
         return isinstance(actual, str) and re.search(str(expected), actual) is not None
+    if operator == "path_within":
+        return _path_within(actual, expected)
+    if operator == "url_host":
+        return _url_host(actual, expected)
+    if operator == "not":
+        # Négation (0.23.1) : sans elle, « écrire seulement sous rapports/ » est inexprimable —
+        # un `deny` l'emporte toujours sur un `allow` (précédence par ACTION), donc il faut pouvoir
+        # écrire « REFUSE si le chemin n'est PAS sous rapports/ ». Valeur absente (None) : le
+        # prédicat interne est faux, sa négation est vraie — le refus s'applique (fail-closed).
+        return not _match_predicate(actual, expected)
     if operator == "max_length":
         return hasattr(actual, "__len__") and len(actual) <= int(expected)
     if operator == "max_items":
@@ -159,6 +297,7 @@ class ToolPolicySpec:
                     raise ValueError(f"{where}.when.args doit être un objet")
                 for arg_name, arg_pred in predicate.items():
                     _check_operators(arg_pred, f"{where}.when.args.{arg_name}")
+                    _avertir_prefixe_fragile(arg_name, arg_pred, f"{where}.when.args.{arg_name}")
             else:
                 _check_operators(predicate, f"{where}.when.{key}")
         out = {"tool": tool, "action": action, "when": when}
@@ -282,14 +421,59 @@ class ToolPolicySpec:
         return True
 
 
+def _motif_d_hote_valide(motif: str) -> bool:
+    """Un motif `url_host` est un nom d'hôte (éventuellement `*.domaine`) ou un littéral IPv6 — rien d'autre."""
+    nu = motif.strip()
+    if re.search(r"[/@\\\s]", nu):
+        return False
+    if ":" in nu:
+        try:
+            ipaddress.IPv6Address(nu)
+            return True
+        except ValueError:
+            return False
+    return bool(nu) and nu != "*."
+
+
 def _check_operators(predicate: Any, where: str) -> None:
     """Refuse un opérateur inconnu DÈS la construction (fail-closed précoce)."""
     if not isinstance(predicate, dict):
         return  # valeur brute = égalité, rien à valider
-    for operator in predicate:
+    for operator, expected in predicate.items():
         try:
             _match_operator(operator, None, None)
         except ValueError as exc:
             raise ValueError(f"{where}: {exc}") from None
         except Exception:
             pass  # l'opérateur existe ; l'échec vient des valeurs de test None
+        # Une règle de CONFINEMENT mal écrite ne doit pas se contenter de ne jamais correspondre :
+        # dans une règle `allow` sous `default: "allow"`, ce serait une ouverture silencieuse.
+        if operator in ("path_within", "url_host") and not _liste_de_textes(expected):
+            raise ValueError(
+                f"{where}.{operator}: attendu un texte non vide ou une liste de textes, reçu {expected!r}")
+        if operator == "url_host":
+            for motif in _liste_de_textes(expected):
+                if not _motif_d_hote_valide(motif):
+                    raise ValueError(
+                        f"{where}.url_host: {motif!r} n'est pas un NOM D'HÔTE (`api.exemple.fr` ou `*.exemple.fr`) : "
+                        "ni schéma, ni port, ni chemin, ni identifiants. Un tel motif ne correspondrait jamais — "
+                        "dans une règle `not`, il refuserait tout.")
+        if operator == "not":
+            _check_operators(expected, f"{where}.not")
+
+
+# `starts_with` sur un argument qui ressemble à un chemin ou une URL : la 0.23.1 le SIGNALE (journal
+# d'avertissement, aucun changement de comportement) — c'est le motif que notre doc enseignait.
+_NOM_CHEMIN_OU_URL = re.compile(
+    r"path|file|dir|folder|url|uri|href|link|endpoint|host|chemin|fichier|dossier|r[eé]pertoire|lien|adresse|cible"
+    r"|emplacement|racine", re.IGNORECASE)
+
+
+def _avertir_prefixe_fragile(arg_name: str, predicate: Any, where: str) -> None:
+    if isinstance(predicate, dict) and "starts_with" in predicate and _NOM_CHEMIN_OU_URL.search(arg_name):
+        # Une fois par argument et par processus : une politique reconstruite à chaque requête (une par
+        # utilisateur) ne doit pas inonder le journal.
+        warn_once(
+            _log, f"policy.starts_with.{arg_name}",
+            f"{where}: `starts_with` sur l'argument `{arg_name}` ne confine NI un chemin NI une URL "
+            "(`..`, `@`, sous-domaine) — utilise `path_within` / `url_host`.")

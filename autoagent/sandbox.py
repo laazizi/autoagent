@@ -3,8 +3,10 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import math
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -16,7 +18,10 @@ from typing import Any, Callable
 
 from .errors import ToolError, ToolValidationError
 from .gate import active_gate
+from .logging import get_logger, warn_once
 from .schema import JsonDict, ToolSpec
+
+_log = get_logger("sandbox")
 
 __all__ = [
     "ALWAYS_BANNED_CALLS",
@@ -28,6 +33,7 @@ __all__ = [
     "GeneratedPythonTool",
     "NETWORK_MODULES",
     "PROCESS_SPAWN_CALLS",
+    "SandboxLimits",
     "SubprocessSandbox",
     "discard_generated_tool",
     "docker_available",
@@ -132,6 +138,147 @@ except Exception as exc:
 
 
 # ---------------------------------------------------------------------------
+# Plafonds de ressources du sous-processus (0.23.1) — OPT-IN, Linux seulement.
+# Le `SubprocessSandbox` n'en avait AUCUN : un outil pouvait allouer des
+# centaines de Mo, écrire des Go ou tenir un cœur jusqu'au délai mur. Les
+# plafonds sont posés par le RUNNER lui-même, avant de charger le code de
+# l'outil (un court préambule collé devant le runner, sans `preexec_fn` : la doc
+# Python le déclare « NOT SAFE » en présence de threads). Sans `limits=`, le
+# préambule est la chaîne vide : le runner par défaut reste octet pour octet
+# celui d'avant.
+# ---------------------------------------------------------------------------
+
+_MO = 1024 * 1024
+_LIMITE_MAX = 2**62         # sous le plus grand `long` C : au-delà, `resource.setrlimit` lève OverflowError
+
+
+@dataclass(frozen=True)
+class SandboxLimits:
+    """Plafonds de ressources d'un :class:`SubprocessSandbox` (0.23.1, opt-in, Linux).
+
+    * ``memory_mb`` : espace d'adressage du processus (``RLIMIT_AS``). Au-delà,
+      l'allocation échoue : l'outil reçoit ``MemoryError``. C'est de la mémoire
+      VIRTUELLE : un outil qui lance des threads réserve plus qu'il n'utilise —
+      garde de la marge. Le PLANCHER dépend de la compilation de Python (mesuré,
+      Linux : un outil trivial tient dès 16 Mo avec le python3 3.12.3 d'Ubuntu,
+      mais il en faut 64 avec les 3.12.15 et 3.13.16 d'``uv``, 32 avec le 3.10.22
+      du même ``uv``) : pars de 128 Mo ou plus, et mesure sur TON interpréteur.
+    * ``cpu_s`` : secondes de CPU du processus (``RLIMIT_CPU``). Au-delà, le
+      processus est tué (SIGKILL, limite souple = limite dure). C'est du temps
+      CPU, pas du temps mur — pour celui-ci, ``timeout``. Refusé avec
+      ``warm=True`` : le plafond compterait tous les appels du worker. Il compte en
+      secondes ENTIÈRES (≥ 1 ; 1,5 s s'applique comme 2 s, et `isolation()` le dit).
+    * ``fsize_mb`` : taille maximale d'un fichier écrit (``RLIMIT_FSIZE``). Au-delà,
+      l'écriture échoue (``OSError: File too large``).
+
+    Posés par le runner avant le code de l'outil, limite souple = limite dure :
+    un processus non-root ne peut pas les relever. Un processus ROOT le peut
+    (CAP_SYS_RESOURCE) : ce sont des garde-fous contre un outil qui s'emballe,
+    PAS une frontière de sécurité — la frontière, c'est ``DockerSandbox``. Non
+    couverts, dits : le nombre de processus (``RLIMIT_NPROC`` est sans effet en
+    root, où tourne souvent la prod), le volume de sortie standard, le réseau et
+    le système de fichiers. Hors Linux, ``SubprocessSandbox(limits=...)``
+    REFUSE de se construire plutôt que de tourner sans plafond."""
+
+    memory_mb: float | None = None
+    cpu_s: float | None = None
+    fsize_mb: float | None = None
+
+    def __post_init__(self) -> None:
+        brut = (("memory_mb", self.memory_mb), ("cpu_s", self.cpu_s), ("fsize_mb", self.fsize_mb))
+        fixes = {nom: valeur for nom, valeur in brut if valeur is not None}
+        if not fixes:
+            raise ValueError("SandboxLimits() sets no limit: give at least one of memory_mb, cpu_s, fsize_mb")
+        for nom, valeur in fixes.items():
+            if isinstance(valeur, bool) or not isinstance(valeur, (int, float)):
+                raise ValueError(f"SandboxLimits.{nom} must be a finite number > 0, got {valeur!r}")
+            try:
+                fini = math.isfinite(valeur)
+            except OverflowError:                       # un entier trop grand pour un flottant
+                fini = False
+            if not fini or valeur <= 0:
+                raise ValueError(f"SandboxLimits.{nom} must be a finite number > 0, got {valeur!r}")
+        # Ce que le noyau accepte (relecture : des valeurs « valides » échouaient à CHAQUE appel, à l'exécution) :
+        # `RLIMIT_CPU` compte en secondes ENTIÈRES, `RLIMIT_AS` ne descend pas sous 1 Mo, et aucune valeur ne dépasse
+        # un `long` C — au-delà `setrlimit` lève `OverflowError`.
+        if self.memory_mb is not None and self.memory_mb < 1:
+            raise ValueError(f"SandboxLimits.memory_mb must be >= 1 MB (an interpreter cannot run below), got {self.memory_mb!r}")
+        if self.cpu_s is not None and self.cpu_s < 1:
+            raise ValueError(f"SandboxLimits.cpu_s must be >= 1 (RLIMIT_CPU counts whole seconds), got {self.cpu_s!r}")
+        for nom, fixe, facteur in (("memory_mb", self.memory_mb, _MO), ("fsize_mb", self.fsize_mb, _MO),
+                                   ("cpu_s", self.cpu_s, 1)):
+            if fixe is not None and fixe * facteur > _LIMITE_MAX:
+                raise ValueError(f"SandboxLimits.{nom}={fixe!r} is out of range")
+
+    def as_dict(self) -> dict[str, float]:
+        """Seuls les plafonds FIXÉS, par nom — ce que `isolation()` déclare. `cpu_s` est déclaré tel qu'il est
+        APPLIQUÉ : `RLIMIT_CPU` arrondit à la seconde au-dessus (1,5 → 2)."""
+        brut = (("memory_mb", self.memory_mb), ("cpu_s", self.cpu_s), ("fsize_mb", self.fsize_mb))
+        fixes = {nom: valeur for nom, valeur in brut if valeur is not None}
+        if "cpu_s" in fixes:
+            fixes["cpu_s"] = math.ceil(fixes["cpu_s"])
+        return fixes
+
+
+def _plafonds_applicables() -> bool:
+    """Les rlimit sont appliqués ET mesurés sous Linux. Ailleurs on refuse : Windows n'a pas le module
+    `resource`, et `RLIMIT_AS` n'est pas fiable sous macOS (non mesuré ici)."""
+    return sys.platform.startswith("linux")
+
+
+def _amorce_plafonds(limits: SandboxLimits | None) -> str:
+    """Le préambule à coller DEVANT un runner : pose les rlimit puis s'efface. Chaîne vide sans plafond.
+
+    Seuls des entiers calculés ici y sont écrits (aucune donnée de l'outil, aucune injection possible). Si
+    `setrlimit` échoue, le préambule lève AVANT le code de l'outil : le processus sort en erreur, l'outil
+    ne tourne jamais sans le plafond demandé (fail-closed)."""
+    if limits is None:
+        return ""
+    reglages: list[tuple[str, int]] = []
+    if limits.memory_mb is not None:
+        reglages.append(("RLIMIT_AS", int(limits.memory_mb * _MO)))
+    if limits.cpu_s is not None:
+        reglages.append(("RLIMIT_CPU", max(1, math.ceil(limits.cpu_s))))
+    if limits.fsize_mb is not None:
+        reglages.append(("RLIMIT_FSIZE", max(1, int(limits.fsize_mb * _MO))))
+    lignes = ["import resource as _resource"]
+    lignes += [f"_resource.setrlimit(_resource.{nom}, ({valeur}, {valeur}))" for nom, valeur in reglages]
+    lignes.append("del _resource")
+    return "\n".join(lignes) + "\n"
+
+
+def _indice_plafonds(limits: SandboxLimits | None) -> str:
+    """Ce qu'on ajoute à une erreur du bac à sable quand des plafonds étaient en vigueur : sans lui, un
+    `stdout='' stderr=''` (plafond CPU) ou un amorçage d'interpréteur coupé (plafond mémoire trop bas) ne laissent
+    pas deviner la cause. Chaîne vide SANS plafond : les messages par défaut ne bougent pas d'un caractère."""
+    if limits is None:
+        return ""
+    return (f" [sandbox limits in force: {limits.as_dict()} — a limit may be what stopped it: cpu_s kills the "
+            "process, a memory_mb that is too low stops the interpreter from even starting (the floor depends on "
+            "the Python build, 16 to 64 MB measured: start at 128 MB or more)]")
+
+
+def _echec_du_runner(completed: "subprocess.CompletedProcess[str]", limits: SandboxLimits | None) -> str:
+    """Le message d'un runner sorti en erreur. Avec des plafonds, il nomme ceux qui étaient en vigueur, dit si un
+    signal a tué le processus, et montre la FIN de stderr (la ligne qui dit pourquoi), pas son amorçage."""
+    sorties = f"stdout={completed.stdout[:500]!r} stderr={completed.stderr[:500]!r}"
+    if limits is not None and completed.returncode < 0:
+        try:
+            nom = signal.Signals(-completed.returncode).name
+        except ValueError:
+            nom = f"signal {-completed.returncode}"
+        return (
+            f"Generated tool runner was killed by {nom}{_indice_plafonds(limits)}: a limit was most likely hit "
+            f"(cpu_s kills the process; memory_mb and fsize_mb normally surface as MemoryError / OSError inside "
+            f"the tool). {sorties}"
+        )
+    if limits is not None:
+        return (f"Generated tool runner failed{_indice_plafonds(limits)}: stdout={completed.stdout[:500]!r} "
+                f"stderr(tail)={completed.stderr[-500:]!r}")
+    return f"Generated tool runner failed: {sorties}"
+
+
+# ---------------------------------------------------------------------------
 # Warm worker (0.22.0) — one persistent Python process per tool, so the ~115 ms
 # interpreter start-up is paid once, not at every call. Opt-in
 # (`SubprocessSandbox(warm=True)`). Line-delimited JSON over the child's stdio:
@@ -195,9 +342,13 @@ class _WarmWorker:
     TUÉ puis relancé au dépassement du délai — un outil qui boucle ne bloque
     jamais le suivant. Environnement épuré comme en mode normal."""
 
-    def __init__(self, path: Path, code: str, sha: str, timeout: float, max_calls: int) -> None:
+    def __init__(
+        self, path: Path, code: str, sha: str, timeout: float, max_calls: int,
+        limits: SandboxLimits | None = None,
+    ) -> None:
         self.path, self.code, self.sha = path, code, sha
         self.timeout, self.max_calls = timeout, max_calls
+        self.limits = limits
         self.calls = 0
         self.proc: subprocess.Popen[str] | None = None
         self.verrou = threading.Lock()
@@ -217,7 +368,7 @@ class _WarmWorker:
 
     def _demarrer(self) -> None:
         proc = subprocess.Popen(
-            [sys.executable, "-X", "utf8", "-I", "-S", "-B", "-u", "-c", _WARM_RUNNER_CODE],
+            [sys.executable, "-X", "utf8", "-I", "-S", "-B", "-u", "-c", _amorce_plafonds(self.limits) + _WARM_RUNNER_CODE],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", bufsize=1,
             env=_child_env(), cwd=str(self.path.parent),
@@ -233,11 +384,11 @@ class _WarmWorker:
             msg = json.loads(ligne) if ligne.strip() else {}
         except (OSError, ValueError) as exc:
             self.arreter()
-            raise ToolError(f"Warm worker failed to start: {exc}") from exc
+            raise ToolError(f"Warm worker failed to start: {exc}{_indice_plafonds(self.limits)}") from exc
         if msg.get("t") != "ready":
             erreur = msg.get("error") or f"no handshake. stderr={''.join(self._stderr)[:300]!r}"
             self.arreter()
-            raise ToolError(f"Generated tool failed to load: {erreur}")
+            raise ToolError(f"Generated tool failed to load: {erreur}{_indice_plafonds(self.limits)}")
 
     def arreter(self) -> None:
         proc, self.proc = self.proc, None
@@ -286,7 +437,7 @@ class _WarmWorker:
                 self.arreter()
                 raise ToolError(
                     f"Generated tool timed out after {self.timeout}s (or ended without a result). "
-                    f"stderr={''.join(self._stderr)[:300]!r}"
+                    f"stderr={''.join(self._stderr)[:300]!r}{_indice_plafonds(self.limits)}"
                 )
             try:
                 msg = json.loads(ligne)
@@ -311,6 +462,7 @@ def _drive_bridge(
     *,
     env: dict[str, str] | None = None,
     cwd: str | None = None,
+    diagnostic: str = "",
 ) -> JsonDict:
     """Run the interactive runner and service host_function calls until the
     tool returns. Each call name MUST be in ``host_functions`` or it is
@@ -358,7 +510,7 @@ def _drive_bridge(
                 if timed_out["value"]:
                     raise ToolError(f"Generated tool timed out after {timeout}s")
                 raise ToolError(
-                    f"Sandbox ended without a result. stderr={''.join(stderr_chunks)[:400]!r}"
+                    f"Sandbox ended without a result. stderr={''.join(stderr_chunks)[:400]!r}{diagnostic}"
                 )
             try:
                 msg = json.loads(line)
@@ -492,19 +644,58 @@ class SubprocessSandbox:
     ``warm_max_workers`` plafonne les processus vivants (le plus ancien est fermé).
     Appelle ``close()`` (ou utilise ``with``) pour fermer les workers ; sinon ils
     sont fermés à la sortie du processus.
+
+    ``limits=SandboxLimits(...)`` (0.23.1, opt-in, Linux) pose des plafonds de
+    mémoire, de CPU et de taille de fichier ; sans eux, RIEN n'est borné hormis le
+    délai mur. Ce ne sont pas une frontière — voir :class:`SandboxLimits` et
+    :meth:`isolation`, qui dit ce que ce bac à sable fait réellement respecter.
     """
 
     timeout: float = 10.0
     warm: bool = False
     warm_max_calls: int = 200
     warm_max_workers: int = 8
+    limits: SandboxLimits | None = None
     _workers: dict[str, _WarmWorker] = field(default_factory=dict, init=False, repr=False, compare=False)
     _verrou: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if self.limits is not None:
+            if not isinstance(self.limits, SandboxLimits):
+                raise TypeError(f"limits must be a SandboxLimits (or None), got {type(self.limits).__name__}")
+            if not _plafonds_applicables():
+                raise ToolError(
+                    f"SubprocessSandbox(limits=...): resource limits are applied (and measured) on Linux only; on "
+                    f"this platform ({sys.platform}) the tool would run with NO limit, so this is refused. Drop "
+                    "limits=, or use DockerSandbox (memory, cpus, pids_limit)."
+                )
+            if self.warm and self.limits.cpu_s is not None:
+                raise ValueError(
+                    "limits.cpu_s does not apply to a warm worker: RLIMIT_CPU counts the CPU time of the whole "
+                    "process, which serves many calls. Use warm=False, or drop cpu_s (memory_mb and fsize_mb "
+                    "stay allowed)."
+                )
         # Fermeture garantie à la sortie, sans référencer `self` (sinon il ne
         # serait jamais ramassé) : on ne passe que le dictionnaire des workers.
         weakref.finalize(self, _fermer_workers, self._workers)
+
+    def isolation(self) -> dict[str, Any]:
+        """Ce que ce bac à sable fait RÉELLEMENT respecter (0.23.1) — à lire avant de lui confier du
+        code qu'on ne maîtrise pas. Un sous-processus ``-I -S`` à environnement épuré derrière une liste
+        d'interdits AST : PAS une frontière (``os_boundary`` est faux), ni réseau ni système de fichiers
+        isolés (``allow_network`` n'est pas appliqué ici). ``limits`` ne liste que les plafonds RÉELS : le
+        délai mur, plus ceux de ``SandboxLimits`` s'ils sont posés."""
+        plafonds: dict[str, float] = {"timeout_s": float(self.timeout)}
+        if self.limits is not None:
+            plafonds.update(self.limits.as_dict())
+        return {
+            "kind": "subprocess",
+            "os_boundary": False,
+            "network_isolated": False,
+            "filesystem_isolated": False,
+            "env_scrubbed": True,
+            "limits": plafonds,
+        }
 
     def close(self) -> None:
         """Ferme tous les workers chauds (sans effet hors ``warm=True``)."""
@@ -533,7 +724,7 @@ class SubprocessSandbox:
             if worker is None:
                 while len(self._workers) >= max(1, self.warm_max_workers):
                     a_fermer.append(self._workers.pop(next(iter(self._workers))))
-                worker = _WarmWorker(path, code, sha, self.timeout, max(1, self.warm_max_calls))
+                worker = _WarmWorker(path, code, sha, self.timeout, max(1, self.warm_max_calls), self.limits)
             self._workers[cle] = worker
         for ancien in a_fermer:                    # hors du verrou global ; attend l'appel en cours
             with ancien.verrou:
@@ -557,17 +748,18 @@ class SubprocessSandbox:
         path = Path(file_path).resolve()
         if host_functions:
             code = path.read_text(encoding="utf-8")
-            cmd = [sys.executable, "-X", "utf8", "-I", "-S", "-u", "-c", _BRIDGE_RUNNER_CODE]
+            cmd = [sys.executable, "-X", "utf8", "-I", "-S", "-u", "-c", _amorce_plafonds(self.limits) + _BRIDGE_RUNNER_CODE]
             return _drive_bridge(
                 cmd, {"code": code, "args": args, "context": context or {}}, host_functions, self.timeout,
-                env=_child_env(), cwd=str(path.parent),
+                env=_child_env(), cwd=str(path.parent), diagnostic=_indice_plafonds(self.limits),
             )
         if self.warm:
             return self._run_warm(path, args, context or {})
         payload = json.dumps({"args": args, "context": context or {}}, ensure_ascii=False)
         try:
             completed = subprocess.run(
-                [sys.executable, "-X", "utf8", "-I", "-S", "-B", "-c", RUNNER_CODE, str(path)],
+                [sys.executable, "-X", "utf8", "-I", "-S", "-B", "-c", _amorce_plafonds(self.limits) + RUNNER_CODE,
+                 str(path)],
                 input=payload,
                 text=True,
                 encoding="utf-8",
@@ -581,10 +773,7 @@ class SubprocessSandbox:
             raise ToolError(f"Generated tool timed out after {self.timeout}s") from exc
 
         if completed.returncode != 0:
-            raise ToolError(
-                "Generated tool runner failed: "
-                f"stdout={completed.stdout[:500]!r} stderr={completed.stderr[:500]!r}"
-            )
+            raise ToolError(_echec_du_runner(completed, self.limits))
         try:
             parsed: dict[str, Any] = json.loads(completed.stdout)
         except json.JSONDecodeError as exc:
@@ -776,6 +965,22 @@ class DockerSandbox:
     cpus: str = "1.0"
     pids_limit: int = 128
 
+    def isolation(self) -> dict[str, Any]:
+        """Ce que ce bac à sable fait RÉELLEMENT respecter (0.23.1) : une vraie frontière de l'OS (conteneur
+        éphémère, racine en lecture seule, capacités retirées, utilisateur non-root). ``network_isolated`` :
+        le réseau est COUPÉ (``--network none``) tant que l'outil n'a pas la permission ``network``."""
+        return {
+            "kind": "docker",
+            "os_boundary": True,
+            "network_isolated": True,
+            "filesystem_isolated": True,
+            "env_scrubbed": True,
+            "limits": {
+                "timeout_s": float(self.timeout), "memory": self.memory, "cpus": str(self.cpus),
+                "pids": self.pids_limit,
+            },
+        }
+
     def _ensure_image(self) -> None:
         key = f"image:{self.image}"
         if _DOCKER_STATE.get(key):
@@ -873,12 +1078,35 @@ def discard_generated_tool(tool: GeneratedPythonTool | Path) -> None:
 
 
 def make_sandbox(
-    *, prefer_docker: bool = True, timeout: float = 10.0, image: str = "python:3.11-slim"
+    *, prefer_docker: bool = True, timeout: float = 10.0, image: str = "python:3.11-slim",
+    require_docker: bool = False,
 ) -> "SubprocessSandbox | DockerSandbox":
     """Return a DockerSandbox when a Docker daemon is available (real
-    OS-level isolation), else the hardened SubprocessSandbox as a fallback."""
+    OS-level isolation), else the hardened SubprocessSandbox as a fallback.
+
+    The fallback is NOT an isolation boundary (an AST denylist behind ``-I -S``),
+    so it is no longer silent (0.23.1) : a warning, once per process, says so.
+    ``require_docker=True`` refuses instead of falling back — raises ``ToolError``
+    when no usable Docker daemon is reachable. Pass ``prefer_docker=False`` to
+    choose the subprocess knowingly (no warning). ``sandbox.isolation()`` tells
+    what the returned sandbox really enforces."""
+    if require_docker and not prefer_docker:
+        raise ValueError("require_docker=True contradicts prefer_docker=False")
     if prefer_docker and docker_available():
         return DockerSandbox(image=image, timeout=timeout)
+    if require_docker:
+        raise ToolError(
+            "make_sandbox(require_docker=True): no usable Docker daemon (Linux containers) is reachable, and "
+            "the fallback SubprocessSandbox is not an isolation boundary, so nothing is run. Start Docker, or "
+            "drop require_docker=True to accept the weaker sandbox."
+        )
+    if prefer_docker:
+        warn_once(
+            _log, "sandbox.make_sandbox_fallback",
+            "make_sandbox() found no usable Docker daemon and fell back to SubprocessSandbox (AST denylist + "
+            "`-I -S`, not an isolation boundary). Pass require_docker=True to refuse instead of falling back, "
+            "or prefer_docker=False to choose the subprocess knowingly.",
+        )
     return SubprocessSandbox(timeout=timeout)
 
 

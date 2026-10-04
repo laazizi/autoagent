@@ -17,11 +17,14 @@ from __future__ import annotations
 
 import http.client
 import json
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 
+from autoagent import http as http_mod
 from autoagent.errors import ProviderError
 from autoagent.http import close_connections, post_json, post_sse
 
@@ -286,3 +289,90 @@ class TestPostSse:
         with p:
             list(post_sse("https://example/stream", {}))
         assert resp.closed, "la réponse doit être fermée pour que la connexion soit réutilisable"
+
+
+class TestRelancesAlignees:
+    """0.23.1 — la politique de relance rejoint celle du SDK officiel d'Anthropic (code relu le 3 oct. 2026) :
+    408, 409, 429 et tout 5xx (529 « overloaded » compris) ; un jitter pour que cent clients ne se réveillent
+    pas à la même seconde ; `retry-after-ms` puis `retry-after` en secondes ou en date HTTP. Sur la 0.23.0 :
+    529/408/409 non relancés, attente déterministe, `retry-after-ms` et dates HTTP ignorés."""
+
+    @pytest.mark.parametrize("statut", [408, 409, 429, 500, 502, 503, 504, 520, 529])
+    def test_statuts_transitoires_relances(self, statut: int) -> None:
+        p, conns = _mock([_resp(statut, b"busy"), _resp(200, b'{"ok": true}')])
+        with p, patch("autoagent.http.time.sleep"):
+            assert post_json("https://example/x", {}) == {"ok": True}
+        assert len(conns[0].requests) == 2
+
+    @pytest.mark.parametrize("statut", [400, 401, 403, 404, 422, 501, 505])
+    def test_statuts_permanents_non_relances(self, statut: int) -> None:
+        p, conns = _mock([_resp(statut, b"no")])
+        with p, patch("autoagent.http.time.sleep") as dormir, pytest.raises(ProviderError) as info:
+            post_json("https://example/x", {})
+        assert len(conns[0].requests) == 1
+        assert info.value.retryable is False
+        dormir.assert_not_called()
+
+    def test_529_epuise_garde_ses_metadonnees(self) -> None:
+        corps = b'{"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}'
+        p, conns = _mock([_resp(529, corps)] * 3)
+        with p, patch("autoagent.http.time.sleep"), pytest.raises(ProviderError, match="HTTP 529") as info:
+            post_json("https://example/x", {}, retries=2)
+        assert len(conns[0].requests) == 3
+        assert info.value.status_code == 529 and info.value.retryable is True
+
+    def test_529_avant_le_flux_est_relance_en_sse(self) -> None:
+        p, conns = _mock([_resp(529, b"busy"), _resp(200, b'data: {"ok": true}\n')])
+        with p, patch("autoagent.http.time.sleep"):
+            assert list(post_sse("https://example/stream", {})) == [{"ok": True}]
+        assert len(conns[0].requests) == 2
+
+    @pytest.mark.parametrize("aleatoire, attendu", [(0.0, 1.0), (1.0, 0.75)])
+    def test_le_repli_exponentiel_a_un_jitter(self, aleatoire: float, attendu: float) -> None:
+        """jitter = 1 - 0,25 x aléa (formule du SDK) : entre 75 % et 100 % de la valeur nominale."""
+        p, _ = _mock([_resp(503, b"x"), _resp(200, b'{"ok": true}')])
+        attentes: list[float] = []
+        # Le jitter tire dans un générateur PRIVÉ (`_RNG`) : le `random` global de l'hôte n'est pas décalé.
+        with p, patch.object(http_mod._RNG, "random", return_value=aleatoire),                 patch("autoagent.http.time.sleep", attentes.append):
+            post_json("https://example/x", {})
+        assert attentes == [pytest.approx(attendu)]
+
+    def test_deux_clients_ne_se_reveillent_pas_a_la_meme_seconde(self) -> None:
+        attentes: list[float] = []
+        for _ in range(40):
+            p, _ = _mock([_resp(503, b"x"), _resp(200, b'{"ok": true}')])
+            with p, patch("autoagent.http.time.sleep", attentes.append):
+                post_json("https://example/x", {})
+        assert len(set(attentes)) > 1, "attente déterministe : tous les clients se réveillent ensemble"
+        assert all(0.75 <= a <= 1.0 for a in attentes)
+
+    def test_retry_after_ms_prioritaire_sur_retry_after(self) -> None:
+        p, _ = _mock([_resp(429, b"x", {"retry-after-ms": "1500", "retry-after": "9"}),
+                      _resp(200, b'{"ok": true}')])
+        attentes: list[float] = []
+        with p, patch("autoagent.http.time.sleep", attentes.append):
+            post_json("https://example/x", {})
+        assert attentes == [1.5]
+
+    def test_retry_after_en_date_http(self) -> None:
+        date = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=10), usegmt=True)
+        p, _ = _mock([_resp(429, b"x", {"retry-after": date}), _resp(200, b'{"ok": true}')])
+        attentes: list[float] = []
+        with p, patch("autoagent.http.time.sleep", attentes.append):
+            post_json("https://example/x", {})
+        assert len(attentes) == 1 and 7.0 <= attentes[0] <= 10.0, attentes
+
+    def test_retry_after_reste_plafonne_a_15_secondes(self) -> None:
+        p, _ = _mock([_resp(429, b"x", {"retry-after": "120"}), _resp(200, b'{"ok": true}')])
+        attentes: list[float] = []
+        with p, patch("autoagent.http.time.sleep", attentes.append):
+            post_json("https://example/x", {})
+        assert attentes == [15.0]
+
+    @pytest.mark.parametrize("valeur", ["bientot", "0", "-3", "", "nan"])
+    def test_retry_after_inutilisable_retombe_sur_le_repli(self, valeur: str) -> None:
+        p, _ = _mock([_resp(429, b"x", {"retry-after": valeur}), _resp(200, b'{"ok": true}')])
+        attentes: list[float] = []
+        with p, patch("autoagent.http.time.sleep", attentes.append):
+            post_json("https://example/x", {})
+        assert len(attentes) == 1 and 0.75 <= attentes[0] <= 1.0, attentes

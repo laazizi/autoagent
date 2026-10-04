@@ -19,6 +19,8 @@ __all__ = [
     "ToolCall",
     "ToolSpec",
     "frame_untrusted",
+    "invisible_report",
+    "strip_invisible",
 ]
 
 # ── Marqueurs de teinte (0.15/0.17) ──────────────────────────────────────────
@@ -37,12 +39,118 @@ TAINT_SENTINEL = "[taint:external-content-seen]"
 # neutralise donc toute variante du marqueur (casse, espaces, ouvrant ou fermant)
 # AVANT d'encadrer (0.22.0). Les gardes en code (teinte, trifecta) n'en
 # dépendaient pas ; c'est le cadrage montré au MODÈLE qui était contournable.
-_MARQUEUR_FORGE = re.compile(r"\[\s*/?\s*EXTERNAL\s+UNTRUSTED\s+CONTENT[^\]]*\]", re.IGNORECASE)
+#
+# 0.23.1 (relecture) : l'expression exigeait des espaces entre les mots, et un caractère que l'on ne retire PAS
+# (une marque gauche-droite, un sélecteur d'emoji, un trait d'union conditionnel, une lettre de remplissage Hangul,
+# un blanc braille…) glissé dans « EXTERNAL UNTRUSTED CONTENT » la contournait — le modèle lisait pourtant un
+# marqueur. Entre les lettres et les mots : jusqu'à 8 caractères non alphanumériques, tirets bas ou remplissages ;
+# la répétition est BORNÉE (jamais d'explosion sur « [[[[… » ou « [ [ [ »).
+_REMPLISSAGES = "".join(chr(c) for c in (0x3164, 0xFFA0, 0x115F, 0x1160))
+_SEP = "(?:[^\\w]|_|[" + _REMPLISSAGES + "]){0,8}"
+
+
+def _epele(mot: str) -> str:
+    return _SEP.join(re.escape(c) for c in mot)
+
+
+_MARQUEUR_FORGE = re.compile(
+    r"\[(?:[^\w]|_|[" + _REMPLISSAGES + "]){0,16}" + _epele("EXTERNAL") + _SEP + _epele("UNTRUSTED") + _SEP
+    + _epele("CONTENT") + r"[^\]]*\]", re.IGNORECASE)
+
+
+# ── Contenu INVISIBLE (0.23.1) ───────────────────────────────────────────────────────────
+#
+# Un contenu externe peut cacher des instructions que l'humain qui relit ne voit pas mais que le
+# modèle lit : les « tags » Unicode (U+E0000 a U+E007F : de l'ASCII caché, une instruction entière dans
+# une phrase d'apparence anodine), les caractères de largeur nulle, les contrôles bidirectionnels. Toute
+# la plage invisible du plan 14 part avec eux, U+E0000 a U+E0FFF : un encodeur naïf (U+E0000 + le code du
+# caractère) range « é » en U+E00E9, hors du bloc des tags — trouvé avec un vrai modèle, où une
+# instruction cachée en français laissait un résidu.
+# Reproduit sur la 0.23.0 : tout traversait `frame_untrusted` intact. On retire ce qui n'a AUCUN usage
+# légitime dans un texte lu par un modèle, et on GARDE ce qui en a un : les jointures ZWJ/ZWNJ entre des
+# lettres non latines (persan, langues indiennes) ou dans une séquence d'emojis (une famille, un
+# drapeau), les sélecteurs de variation d'emoji, les marques gauche-droite/droite-gauche, et les drapeaux de
+# SUBDIVISION bien formés (Angleterre, Écosse, pays de Galles : un drapeau noir, 2 à 7 lettres ou chiffres en
+# tags, la balise d'annulation) — l'usage légitime des tags, que la relecture a vu détruit. Ce que cela COÛTE,
+# dit : les sélecteurs d'IDÉOGRAMMES (U+E0100…, rares variantes de glyphes dans des noms japonais) sont retirés
+# — c'est le canal de stéganographie des sélecteurs de variation, et on ne peut pas les garder sans le rouvrir —,
+# ainsi que le séparateur mongol U+180E, les opérateurs mathématiques invisibles (U+2061-2064), les contrôles
+# bidirectionnels d'embarquement et d'isolat, et un ZWNJ entre deux caractères ASCII. Un texte ASCII n'en
+# contient pas : chemin rapide, rien n'est lu ; un texte accentué sans rien de caché ne coûte qu'UN balayage.
+def _classe(*plages: tuple[int, int]) -> str:
+    """Une classe de caractères d'expression régulière à partir de plages de points de code : le source
+    reste en ASCII (aucun caractère invisible dans le code qui les traque)."""
+    return "[" + "".join(chr(a) if a == b else f"{chr(a)}-{chr(b)}" for a, b in plages) + "]"
+
+
+_TAGS = re.compile(_classe((0xE0000, 0xE00FF)))                            # tags + le prolongement non assigné (Latin-1 caché)
+_BIDI = re.compile(_classe((0x202A, 0x202E), (0x2066, 0x2069)))            # LRE RLE PDF LRO RLO / LRI RLI FSI PDI
+_ZERO_WIDTH = re.compile(_classe((0x200B, 0x200B), (0x2060, 0x2060), (0xFEFF, 0xFEFF), (0x2061, 0x2064),
+                                 (0x180E, 0x180E)))                         # ZWSP, WJ, BOM, opérateurs invisibles, MVS
+_VARIATION_SUP = re.compile(_classe((0xE0100, 0xE0FFF)))                    # VS17-256 + le reste de la plage : canal de stéganographie
+_JOINTURES = _classe((0x200C, 0x200D))                                      # ZWNJ, ZWJ
+_JOINERS_ENTRE_ASCII = re.compile("(?<=[ -~])" + _JOINTURES + "+(?=[ -~])")  # jamais légitime ici (espace compris)
+_JOINERS_EN_SERIE = re.compile(_JOINTURES + "{2,}")                         # des jointures collées = un message codé
+# Un drapeau de subdivision BIEN FORMÉ : drapeau noir, 2 à 7 lettres minuscules ou chiffres en tags, balise
+# d'annulation. Une charge déguisée en drapeau n'y entre pas : trop longue, un espace, pas de balise de fin.
+_DRAPEAU_RE = re.compile("(" + chr(0x1F3F4) + "[" + chr(0xE0030) + "-" + chr(0xE0039) + chr(0xE0061) + "-"
+                         + chr(0xE007A) + "]{2,7}" + chr(0xE007F) + ")")
+# Tout ce que `strip_invisible` peut retirer, en UNE classe : un texte qui n'en contient aucun est rendu tel quel
+# après un seul balayage (avant : six passes de substitution, même sur du français propre de 5 Mo).
+_SUSPECT = re.compile(_classe((0xE0000, 0xE0FFF), (0x202A, 0x202E), (0x2066, 0x2069), (0x200B, 0x200D),
+                              (0x2060, 0x2064), (0xFEFF, 0xFEFF), (0x180E, 0x180E)))
+_OBJET = chr(0xFFFC)                                                         # remplace un drapeau dans le rapport
+
+
+def strip_invisible(text: str) -> str:
+    """Retire les caractères cachés d'un texte (voir plus haut). Idempotent ; ne touche pas un texte ASCII."""
+    if not text or text.isascii() or _SUSPECT.search(text) is None:
+        return text
+    parties = _DRAPEAU_RE.split(text)       # [hors drapeau, drapeau, hors drapeau, …] : les drapeaux restent intacts
+    for i in range(0, len(parties), 2):
+        propre = parties[i]
+        for motif in (_TAGS, _BIDI, _ZERO_WIDTH, _VARIATION_SUP, _JOINERS_ENTRE_ASCII, _JOINERS_EN_SERIE):
+            propre = motif.sub("", propre)
+        parties[i] = propre
+    return "".join(parties)
+
+
+def invisible_report(text: str) -> dict[str, Any]:
+    """Ce que `strip_invisible` retirerait, par catégorie — `{}` si rien. `hidden_text` : le texte caché
+    dans les tags Unicode, décodé (≤ 200 caractères) — c'est l'instruction que l'attaquant voulait faire lire."""
+    if not text or text.isascii() or _SUSPECT.search(text) is None:
+        return {}
+    # Les drapeaux bien formés ne comptent pas (ils ne sont pas retirés) ; un OBJET les remplace pour que le
+    # voisinage des jointures reste celui du vrai texte. Les comptes se font par DIFFÉRENCE de longueur : pas un
+    # objet `str` par caractère caché (508 Mo au pic sur 5 millions de tags).
+    hors = _DRAPEAU_RE.sub(_OBJET, text)
+    rapport: dict[str, Any] = {}
+    for nom, motif in (("tags", _TAGS), ("bidi", _BIDI), ("zero_width", _ZERO_WIDTH), ("variation", _VARIATION_SUP)):
+        n = len(hors) - len(motif.sub("", hors))
+        if n:
+            rapport[nom] = n
+    jointures = len(hors) - len(strip_invisible(hors)) - sum(rapport.values())
+    if jointures > 0:
+        rapport["joiners"] = jointures
+    caches: list[str] = []
+    for essai, trouve in enumerate(_TAGS.finditer(hors)):        # décoder les 4 000 premiers suffit à lire l'ordre
+        o = ord(trouve.group()) - 0xE0000
+        if 0x20 <= o <= 0x7E or 0xA0 <= o <= 0xFF:               # ASCII, puis Latin-1
+            caches.append(chr(o))
+        if len(caches) >= 200 or essai >= 4000:
+            break
+    if caches:
+        rapport["hidden_text"] = "".join(caches)
+    return rapport
 
 
 def frame_untrusted(text: str) -> str:
-    """Encadre un contenu externe non fiable, marqueurs forgés neutralisés."""
-    propre = _MARQUEUR_FORGE.sub("[marker removed]", text or "")
+    """Encadre un contenu externe non fiable : caractères cachés retirés, marqueurs forgés neutralisés.
+
+    Les caractères cachés partent AVANT la neutralisation des marqueurs : un marqueur forgé avec un
+    caractère de largeur nulle glissé dans « EXTERNAL UNTRUSTED CONTENT » échappait à l'expression
+    régulière et se lisait pourtant comme un marqueur."""
+    propre = _MARQUEUR_FORGE.sub("[marker removed]", strip_invisible(text or ""))
     return "\n".join([UNTRUSTED_OPEN, propre, UNTRUSTED_CLOSE])
 
 

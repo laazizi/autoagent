@@ -59,10 +59,13 @@ class _ResumableError(AutoAgentError):
 class AgentCancelled(_ResumableError):
     """Raised when an agent run is cancelled cooperatively via `cancel_token`.
 
-    The lib checks the token at the start of every loop iteration. When the
-    token is set, the next iteration raises `AgentCancelled` instead of
-    issuing a new provider call. Pre-existing tool calls in flight are not
-    interrupted — cancellation happens at the next safe boundary.
+    The lib reads the token at four moments (0.23.1): at the start of every
+    loop iteration (no new provider call), between the chunks of a stream, before
+    each tool call that has not started (it does NOT run — its result says so),
+    and at the step boundary. A sub-agent run through `as_tool` / `delegate_to`
+    receives the same token. A provider call already sent (not streamed) and a
+    tool already running are not interrupted — cancellation happens at the next
+    safe boundary.
 
     Attributes: ``state`` (resumable snapshot), ``step``.
     """

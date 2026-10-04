@@ -172,7 +172,18 @@ class ProjectWorkspace:
                 after=after,
                 reason=reason,
             )
-        return {"ok": True, "replaced": min(occurrences, limit), "change": change.summary()}
+        replaced = min(occurrences, limit)
+        result: dict[str, Any] = {
+            "ok": True, "replaced": replaced, "occurrences": occurrences, "change": change.summary(),
+        }
+        if occurrences > replaced:
+            # 0.23.1 : avec `count=1` (le défaut) les AUTRES occurrences restaient en place sans un mot —
+            # « replaced: 1 », et le modèle croyait avoir tout remplacé.
+            result["note"] = (
+                f"{occurrences - replaced} other occurrence(s) of the text were NOT replaced "
+                f"(count={count}); pass count=0 to replace all of them."
+            )
+        return result
 
     def list_changes(self) -> dict[str, Any]:
         with self._lock:

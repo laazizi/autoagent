@@ -6,7 +6,68 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from typing import Any
 
+from autoagent.errors import ProviderError
+from autoagent.http import is_retryable_status
 from autoagent.schema import LLMRequest, LLMResponse, ModelConfig, StreamChunk
+
+# Codes TEXTUELS qui disent « transitoire » (OpenAI : `rate_limit_exceeded`, `server_error` ; Anthropic :
+# `overloaded_error` ; Gemini : `UNAVAILABLE`, `RESOURCE_EXHAUSTED`…). Une meilleure estimation, pas une table
+# officielle : un code textuel inconnu n'est PAS réessayable.
+_CODES_TRANSITOIRES = frozenset({
+    "rate_limit_exceeded", "rate_limit_error", "rate_limit", "server_error", "overloaded", "overloaded_error",
+    "service_unavailable", "unavailable", "timeout", "timeout_error", "api_error", "internal_error", "internal",
+    "resource_exhausted", "deadline_exceeded",
+})
+
+
+def _statut_http(brut: Any) -> int | None:
+    """Un statut HTTP PLAUSIBLE (100-599) lu dans un champ `code` : un entier, un flottant entier ou une chaîne
+    de chiffres. NaN, l'infini, un nombre hors plage ou une chaîne comme « ² » ne sont pas des statuts — et ne
+    font jamais lever l'analyse d'une erreur (c'est elle qu'on est en train de signaler)."""
+    if isinstance(brut, bool):
+        return None
+    try:
+        if isinstance(brut, float):
+            n = int(brut) if brut.is_integer() else None
+        elif isinstance(brut, int):
+            n = brut
+        elif isinstance(brut, str) and brut.strip().isdecimal() and len(brut.strip()) <= 3:
+            n = int(brut.strip())
+        else:
+            n = None
+    except (ValueError, OverflowError):
+        return None
+    return n if n is not None and 100 <= n <= 599 else None
+
+
+def stream_error(provider: str, error: Any) -> ProviderError:
+    """Une erreur reçue EN COURS de flux → `ProviderError` typée (0.23.1).
+
+    Le statut HTTP 200 est déjà passé : le fournisseur annonce son échec DANS le flux
+    (OpenRouter et les passerelles compatibles : `{"error": {"message", "code"}}` ;
+    Gemini : `{"error": {"code", "message", "status"}}`). La 0.23.0 ne regardait que
+    `choices` / `candidates` et ignorait l'événement : le run finissait en « succès »
+    sur une réponse vide ou coupée. `retryable` suit la même règle que pour une
+    erreur HTTP (`is_retryable_status`) — l'hôte branche dessus sans lire le message.
+    """
+    code: int | None = None
+    transitoire = False
+    if isinstance(error, dict):
+        code = _statut_http(error.get("code"))
+        # Un code TEXTUEL (`type`, `code` ou `status` : « server_error », « UNAVAILABLE »…) peut dire « transitoire »
+        # quand il n'y a pas de statut numérique.
+        textes = {str(error[k]).strip().lower() for k in ("code", "type", "status")
+                  if isinstance(error.get(k), str)}
+        transitoire = bool(textes & _CODES_TRANSITOIRES)
+        message = str(error.get("message") or error.get("status") or error)
+    else:
+        message = str(error)
+    etiquette = f" ({code})" if code is not None else ""
+    return ProviderError(
+        f"{provider} stream error{etiquette}: {message[:500]}",
+        status_code=code,
+        retryable=is_retryable_status(code) if code is not None else transitoire,
+    )
 
 
 def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:

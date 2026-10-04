@@ -15,16 +15,45 @@ from autoagent.schema import (
     normalize_finish_reason,
 )
 
-from .base import LLMProvider, synthetic_call_id
+from .base import LLMProvider, stream_error, synthetic_call_id
+
+
+def _entier(x: Any) -> int | None:
+    return x if isinstance(x, int) and not isinstance(x, bool) else None
 
 
 def _usage_from(meta: Any) -> TokenUsage | None:
     if not isinstance(meta, dict):
         return None
+    entree = meta.get("promptTokenCount")
+    sortie = meta.get("candidatesTokenCount")
+    total = meta.get("totalTokenCount")
+    pensees = meta.get("thoughtsTokenCount")
+    # LA SORTIE FACTURÉE, pensées comprises (0.23.1). Chez Gemini les jetons de RÉFLEXION se facturent
+    # comme de la sortie (« response pricing is the sum of output tokens and thinking tokens », doc
+    # Gemini, page « thinking » du 25 sept. 2026), mais `thoughtsTokenCount` est RAPPORTÉ À PART : sur
+    # les modèles qui le séparent, `candidatesTokenCount` ne les contient pas. La 0.23.0 ne lisait que
+    # `candidatesTokenCount` : `token_budget`, `AgentResult.usage` et `cost_per_success` ignoraient la
+    # réflexion (reproduit : 120 comptés pour 420 facturés). La doc ne dit pas, champ par champ, quels
+    # modèles incluent ou non les pensées dans `candidatesTokenCount` : on ne parie sur aucun. La sortie
+    # est donc DÉRIVÉE du total que le fournisseur annonce lui-même — total - entrée (- les jetons
+    # d'outils intégrés, facturés en entrée) — juste dans les deux cas ; sans total, on ajoute les
+    # pensées. On ne la fait jamais passer SOUS `candidatesTokenCount`.
+    # Des ENTIERS seulement : un champ inattendu (une chaîne) ne doit pas faire lever l'extraction d'un usage
+    # (fail-open) — on retombe alors sur ce que le fournisseur a dit de la sortie, sans arithmétique.
+    total_n, entree_n, pensees_n = _entier(total), _entier(entree), _entier(pensees)
+    if total_n is not None and entree_n is not None:
+        derivee = total_n - entree_n - (_entier(meta.get("toolUsePromptTokenCount")) or 0)
+        # `candidatesTokenCount` absent et rien d'autre que le prompt dans le total (prompt refusé) : on ne
+        # transforme pas un « non rapporté » en un « zéro » inventé.
+        if derivee >= (_entier(sortie) or 0) and not (sortie is None and derivee == 0):
+            sortie = derivee
+    elif pensees_n:
+        sortie = (_entier(sortie) or 0) + pensees_n
     return TokenUsage(
-        input_tokens=meta.get("promptTokenCount"),
-        output_tokens=meta.get("candidatesTokenCount"),
-        total_tokens=meta.get("totalTokenCount"),
+        input_tokens=entree,
+        output_tokens=sortie,
+        total_tokens=total,
         # Gemini met en cache implicitement et compte la part servie ainsi.
         cached_tokens=meta.get("cachedContentTokenCount"),
     )
@@ -185,6 +214,9 @@ class GeminiProvider(LLMProvider):
             headers=self._headers(),
             timeout=self.config.timeout,
         ):
+            if event.get("error"):
+                # `{"error": {"code", "message", "status"}}` DANS le flux : ignoré par la 0.23.0 (0.23.1).
+                raise stream_error("gemini", event["error"])
             candidate = (event.get("candidates") or [{}])[0]
             content = candidate.get("content") or {}
             if isinstance(event.get("usageMetadata"), dict):

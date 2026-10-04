@@ -5,8 +5,10 @@ import threading
 import time
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
 
 from .bounds import Bounds
 from .dynamic import DynamicToolBuilder, PythonRunner, ToolBuildRequest, _safe_tool_name
@@ -31,7 +33,7 @@ from .logging import get_logger
 from .memory import Memory
 from .providers import create_provider
 from .providers.base import LLMProvider
-from .registry import ToolRegistry
+from .registry import ToolRegistry, ToolResult
 from .sandbox import discard_generated_tool as _discard_generated
 from .schema import (
     UNTRUSTED_CLOSE,
@@ -45,6 +47,7 @@ from .schema import (
     ToolCall,
     ToolSpec,
     frame_untrusted,
+    invisible_report,
     is_tainted,
 )
 from .trace import TraceEmitter, truncate_preview
@@ -61,6 +64,28 @@ __all__ = [
 ]
 
 _log = get_logger("agent")
+
+# Le jeton d'annulation du run qui exécute l'outil courant, lisible depuis le thread de l'outil (0.23.1) —
+# même mécanisme que la porte de `gate.py`. `as_tool` et `delegate_to` le lisent pour le passer au
+# sous-agent : sans cela, un « stop » posé sur le parent laissait le spécialiste finir TOUS ses pas.
+_JETON_ACTIF: ContextVar[threading.Event | None] = ContextVar("autoagent_cancel_token", default=None)
+
+
+@contextmanager
+def _jeton_scope(jeton: threading.Event | None) -> Iterator[None]:
+    if jeton is None:
+        yield
+        return
+    marque = _JETON_ACTIF.set(jeton)
+    try:
+        yield
+    finally:
+        _JETON_ACTIF.reset(marque)
+
+
+def _jeton_actif() -> threading.Event | None:
+    return _JETON_ACTIF.get()
+
 
 DEFAULT_SYSTEM_PROMPT = """You are an AI agent with tools.
 Use tools when they are useful. If a required capability is missing and the
@@ -330,12 +355,33 @@ def _score_tools(query: str, specs: Sequence[ToolSpec]) -> list[ToolSpec]:
     return [spec for _, _, spec in scored]
 
 
+class _ResultatAnnule(ToolResult):
+    """Le résultat d'un appel que le « stop » de l'hôte a arrêté AVANT qu'il ne parte (0.23.1). Il n'a rien lu :
+    il ne teinte pas le run — sinon, après `resume`, un envoi serait refusé pour du contenu qui n'est jamais
+    entré dans la conversation."""
+
+
 _PRUNE_MARK = "[PRUNED"
+_PRUNE_NOTE_ERREUR = (
+    "[PRUNED — the {chars}-character result of `{name}` was dropped from this history to keep the "
+    "context bounded. That call had FAILED (it returned an error, not a valid result). Call the tool "
+    "again if you need the details.]"
+)
 _PRUNE_NOTE = (
     "[PRUNED — the {chars}-character result of `{name}` was dropped from this "
     "history to keep the context bounded. It was VALID when produced; nothing "
     "about it failed. Call the tool again if you still need that data.]"
 )
+
+
+def _resultat_en_erreur(content: str) -> bool:
+    """Le message d'un résultat d'outil ÉCHOUÉ, reconnu à sa tête (0.23.1).
+
+    `ToolResult.to_message_content()` écrit toujours ``{"ok": false, ...}`` en premier. Ni le cadre « non
+    fiable » (un préfixe d'une ligne) ni la troncature (qui garde la tête) ne le masquent. Un test garde le
+    lien avec le sérialiseur : si son format changeait, l'élagage cesserait de reconnaître les erreurs."""
+    tete = content[len(UNTRUSTED_OPEN) + 1:] if content.startswith(UNTRUSTED_OPEN) else content
+    return tete.startswith('{"ok": false')
 
 
 def _prune_tool_results(
@@ -367,6 +413,11 @@ def _prune_tool_results(
       VIEW handed to the provider is pruned, so the trace, the returned
       messages and any checkpoint keep the full result.
 
+    A FAILED result (``{"ok": false, ...}``) is pruned like any other (0.23.1
+    changes no pruning decision) but its note says the call FAILED: "It was
+    VALID… nothing about it failed" was false for it, and a model told an error
+    was valid re-plans as if the step had succeeded.
+
     ``batch`` (0.21.0) makes pruning CACHE-FRIENDLY. Pruning at every step
     mutates the view at every step, so the provider's prompt cache — which
     matches on a byte-identical prefix — restarts from zero each turn
@@ -397,7 +448,10 @@ def _prune_tool_results(
         content = message.content or ""
         if _PRUNE_MARK in content:  # idempotent: never prune a marker again
             continue
-        note = _PRUNE_NOTE.format(chars=len(content), name=message.name or "tool")
+        # Une ERREUR est élaguée comme avant (0.23.1 ne change aucune décision d'élagage), mais sa note dit
+        # qu'elle a ÉCHOUÉ : « It was VALID… nothing about it failed » était FAUX pour elle.
+        modele = _PRUNE_NOTE_ERREUR if _resultat_en_erreur(content) else _PRUNE_NOTE
+        note = modele.format(chars=len(content), name=message.name or "tool")
         if UNTRUSTED_OPEN in content:
             note = f"{UNTRUSTED_OPEN}\n{note}\n{UNTRUSTED_CLOSE}"
         if len(note) >= len(content):
@@ -1212,7 +1266,13 @@ class Agent:
             if parent is not None:
                 agent_self._parent_gate = parent
             try:
-                result = agent_self.run(request, context=context)
+                # 0.23.1 : le « stop » du parent vaut aussi pour le sous-agent (le jeton de l'agent qui
+                # exécute CET outil, lu dans le thread de l'appel) ; sans lui il finissait tous ses pas.
+                # Le mot-clé n'est transmis QUE s'il y a un jeton : une sous-classe d'`Agent` dont `run` n'a
+                # pas ce paramètre (valide jusqu'en 0.23.0) ne doit pas échouer sur une délégation sans « stop ».
+                jeton = _jeton_actif()
+                suite: dict[str, Any] = {"cancel_token": jeton} if jeton is not None else {}
+                result = agent_self.run(request, context=context, **suite)
             except Exception as exc:
                 # Un sous-agent qui ÉCHOUE a dépensé aussi (0.22.0) : 5 étapes
                 # avant MaxStepsExceeded, c'est 5 appels payés. Rien ne remontait,
@@ -1751,11 +1811,11 @@ class Agent:
                 spec = next((s for s in self.registry.specs() if s.name == call.name), None)
                 cle = journal.record_intent(journal_run[0], call, step=step,
                                             idempotent=bool(spec is not None and spec.idempotent))
-                with key_scope(cle), gate_scope(gate):
+                with key_scope(cle), gate_scope(gate), _jeton_scope(cancel_token):
                     result = self.registry.execute(call, context=context)
                 journal.record_result(journal_run[0], call, result, tainted=gate.tainted_by_host)
             else:
-                with gate_scope(gate):
+                with gate_scope(gate), _jeton_scope(cancel_token):
                     result = self.registry.execute(call, context=context)
             if gate.tainted_by_host:
                 guards.bridge_tainted.add(call.id)
@@ -1835,6 +1895,17 @@ class Agent:
                                {"name": call.name, "call_id": call.id, "step": step},
                                parent_id=req_span)
                     return repris, 0, None
+                if cancel_token is not None and cancel_token.is_set() and call.id not in en_avance:
+                    # 0.23.1 : l'hôte a dit « stop » — un appel qui n'a PAS encore commencé ne part pas
+                    # (une réservation, un envoi). La 0.23.0 exécutait les trois outils d'un tour même
+                    # si « stop » arrivait pendant le premier. Le transcript reste bien formé : un résultat
+                    # par appel, et celui-ci dit au modèle (à la reprise) qu'il n'a PAS eu lieu. Un outil
+                    # DÉJÀ parti (exécution anticipée) n'est pas concerné : on ne tue pas un thread.
+                    return _ResultatAnnule(
+                        ok=False,
+                        error="Cancelled: the host asked to stop (cancel_token) before this call ran — "
+                              "it was NOT executed.",
+                    ), 0, None
                 started_at = time.monotonic()
                 avance = en_avance.pop(call.id, None)
                 if avance is not None:
@@ -1880,9 +1951,11 @@ class Agent:
                         tool_name=call.name,
                         tool_status="ok" if tool_result.ok else "error",
                     )
-                    untrusted = self._is_untrusted(call) or call.id in guards.bridge_tainted
+                    untrusted = ((self._is_untrusted(call) and not isinstance(tool_result, _ResultatAnnule))
+                                 or call.id in guards.bridge_tainted)
                     if untrusted:
                         taint[0] = True                     # teinte monotone
+                        self._signaler_invisible(call, tool_result, run_span)
                     working_messages.append(
                         _tool_message(call, tool_result, untrusted=untrusted,
                                       max_chars=self.max_tool_result_chars)
@@ -1900,9 +1973,11 @@ class Agent:
                         tool_name=call.name,
                         tool_status="ok" if tool_result.ok else "error",
                     )
-                    untrusted = self._is_untrusted(call) or call.id in guards.bridge_tainted
+                    untrusted = ((self._is_untrusted(call) and not isinstance(tool_result, _ResultatAnnule))
+                                 or call.id in guards.bridge_tainted)
                     if untrusted:
                         taint[0] = True                     # teinte monotone
+                        self._signaler_invisible(call, tool_result, run_span)
                     working_messages.append(
                         _tool_message(call, tool_result, untrusted=untrusted,
                                       max_chars=self.max_tool_result_chars)
@@ -1920,6 +1995,18 @@ class Agent:
         if resume_from is not None:
             run_start_payload["resumed_from_step"] = resume_from.step
         run_span = self._emit("run_start", run_start_payload)
+
+        def _lever_annulation(step: int) -> NoReturn:
+            """Lève `AgentCancelled` : `step` est l'étape qui NE PARTIRA PAS ; l'état rendu est celui de
+            la fin de l'étape d'avant (reprenable par `Agent.resume`). Un seul endroit pour les quatre
+            moments où le jeton est lu : tête d'itération, plein flux, avant chaque outil, frontière
+            d'étape (0.23.1)."""
+            self._emit("cancelled", {"step": step}, parent_id=run_span)
+            cancelled = AgentCancelled(f"Agent cancelled by caller at step {step}")
+            cancelled.step = step  # consumed by run_messages_stream
+            cancelled.state = _snapshot(step - 1)  # resumable via Agent.resume
+            raise cancelled
+
         try:
             if (
                 resume_from is not None
@@ -1944,11 +2031,7 @@ class Agent:
                 # provider call so we don't waste a request when the user has
                 # already pressed "Cancel".
                 if cancel_token is not None and cancel_token.is_set():
-                    self._emit("cancelled", {"step": step}, parent_id=run_span)
-                    cancelled = AgentCancelled(f"Agent cancelled by caller at step {step}")
-                    cancelled.step = step  # consumed by run_messages_stream
-                    cancelled.state = _snapshot(step - 1)  # resumable via Agent.resume
-                    raise cancelled
+                    _lever_annulation(step)
 
                 # Token budget: checked BEFORE the next provider call — the
                 # call that crossed the line completed normally, we just
@@ -2028,13 +2111,32 @@ class Agent:
                     #     ré-exécuter : un seul appel, ordre des événements et du
                     #     transcript inchangé.
                     final_response: LLMResponse | None = None
-                    for chunk in self.provider.stream(request):
-                        if chunk.type == "text" and chunk.text:
-                            yield StreamEvent(type="text", text=chunk.text)
-                        elif chunk.type == "tool_call" and chunk.tool_call is not None:
-                            _lancer_en_avance(chunk.tool_call, step, req_span)
-                        elif chunk.type == "final":
-                            final_response = chunk.response
+                    flux = self.provider.stream(request)
+                    try:
+                        for chunk in flux:
+                            # 0.23.1 : « stop » posé PENDANT que le modèle parle (l'appelant l'interrompt).
+                            # La 0.23.0 ne lisait le jeton qu'en tête d'itération : le flux allait au bout
+                            # et le texte continuait de sortir. On s'arrête au prochain morceau, AVANT de
+                            # le transmettre ; l'état rendu est celui d'avant cette étape, la réponse
+                            # coupée n'y entre pas. Un appel HTTP déjà parti n'est pas interrompu.
+                            if cancel_token is not None and cancel_token.is_set():
+                                _lever_annulation(step)
+                            if chunk.type == "text" and chunk.text:
+                                yield StreamEvent(type="text", text=chunk.text)
+                            elif chunk.type == "tool_call" and chunk.tool_call is not None:
+                                _lancer_en_avance(chunk.tool_call, step, req_span)
+                            elif chunk.type == "final":
+                                final_response = chunk.response
+                    finally:
+                        # Fermer le générateur du fournisseur, pas seulement l'abandonner : la
+                        # connexion est jetée et libérée tout de suite (annulation, erreur, hôte qui
+                        # cesse d'itérer), au lieu d'attendre le ramasse-miettes.
+                        fermer = getattr(flux, "close", None)
+                        if fermer is not None:
+                            try:
+                                fermer()
+                            except Exception:            # un nettoyage ne fait jamais échouer le run, ni ne
+                                _log.exception("provider stream close() failed (ignored)")   # masque une annulation
                     if final_response is None:
                         # Provider yielded no final chunk — treat as empty answer.
                         final_response = LLMResponse(content="", model=model)
@@ -2138,6 +2240,12 @@ class Agent:
                 _checkpoint(step)
                 _journal_state(step)
 
+                # 0.23.1 : un « stop » reçu pendant les outils de cette étape arrête ICI, à la frontière
+                # (état exactement reprenable), sans attendre l'itération suivante — qui, à `max_steps`,
+                # n'existe pas : la 0.23.0 levait alors MaxStepsExceeded après avoir tout exécuté.
+                if cancel_token is not None and cancel_token.is_set():
+                    _lever_annulation(step + 1)
+
             self._emit("max_steps_exceeded", {"max_steps": self.max_steps}, parent_id=run_span)
             self._emit(
                 "run_end",
@@ -2193,6 +2301,20 @@ class Agent:
             f"governs what happens once the run is tainted "
             f"({'blocked' if self.trifecta_guard == 'deny' else self.trifecta_guard})."
         ]
+
+    def _signaler_invisible(self, call: ToolCall, tool_result: Any, parent: str | None) -> None:
+        """0.23.1 : `frame_untrusted` retire les caractères cachés d'un contenu non fiable ; la TRACE
+        dit qu'il y en avait, et ce que disait le texte caché — la preuve d'une tentative d'injection.
+        Observabilité : fail-open, jamais d'exception."""
+        try:
+            rapport = invisible_report(tool_result.to_message_content())
+            if rapport:
+                # Parent : le RUN. La requête (`req_span`) est déjà fermée par `llm_response` quand les outils
+                # tournent : l'exporteur OTel jetait l'événement (« has no open span »).
+                self._emit("untrusted_sanitized", {"name": call.name, "call_id": call.id, **rapport},
+                           parent_id=parent)
+        except Exception:
+            _log.exception("untrusted_sanitized: rapport impossible (ignoré)")
 
     def _emit_tool_start(self, call: ToolCall, req_span: str | None) -> str | None:
         return self._emit(
@@ -2453,13 +2575,15 @@ def delegate_to(
     )
 
     def _une(cible: str, demande: str, context: dict[str, Any] | None,
-             parent: ActionGate | None = None) -> tuple[dict[str, Any], Any]:
+             parent: ActionGate | None = None,
+             jeton: threading.Event | None = None) -> tuple[dict[str, Any], Any]:
         agent = specialistes[cible]
         anterieur = agent._parent_gate
         if parent is not None:
             agent._parent_gate = parent
         try:
-            resultat = agent.run(demande, context=context)
+            suite: dict[str, Any] = {"cancel_token": jeton} if jeton is not None else {}   # voir `as_tool`
+            resultat = agent.run(demande, context=context, **suite)
         except Exception as exc:                       # remonte au LLM, pas au parent
             # …mais sa DÉPENSE remonte au parent (0.22.0), comme pour `as_tool`.
             return {"specialist": cible, "error": f"{type(exc).__name__}: {exc}"}, _depense_d_un_echec(exc)
@@ -2490,6 +2614,9 @@ def delegate_to(
         # La porte du parent se lit ICI, dans le thread de l'appel : les threads du pool
         # qui font tourner les spécialistes ne la voient pas (contexte vide).
         parent = active_gate() if inherit_policy else None
+        # Le jeton d'annulation de l'agent appelant, lu ICI pour la même raison (0.23.1) : les spécialistes
+        # tournent dans les threads du pool, qui ne voient pas le contexte de l'appel.
+        jeton = _jeton_actif()
 
         # Regroupement par spécialiste : un Agent ne sert qu'un appelant à la
         # fois, donc deux demandes pour la même cible ne peuvent PAS partir
@@ -2511,7 +2638,7 @@ def delegate_to(
             # Chaque index n'est écrit que par UN thread : pas de verrou requis.
             for index in groupes[cible]:
                 demande = str((requests[index] or {}).get("request", ""))
-                reponses[index], usages[index] = _une(cible, demande, context, parent)
+                reponses[index], usages[index] = _une(cible, demande, context, parent, jeton)
 
         if len(groupes) > 1:
             with ThreadPoolExecutor(

@@ -17,7 +17,7 @@ from autoagent.schema import (
     normalize_finish_reason,
 )
 
-from .base import LLMProvider, parse_tool_arguments, synthetic_call_id
+from .base import LLMProvider, parse_tool_arguments, stream_error, synthetic_call_id
 
 
 def _uses_max_completion_tokens(model: str) -> bool:
@@ -138,6 +138,10 @@ class OpenAICompatibleProvider(LLMProvider):
             headers=self._headers(),
             timeout=self.config.timeout,
         ):
+            if event.get("error"):
+                # Erreur annoncée DANS le flux (OpenRouter, passerelles) : statut 200 déjà passé, et
+                # pas de `choices`. La 0.23.0 l'ignorait — réponse vide, run « réussi » (0.23.1).
+                raise stream_error(self.config.provider, event["error"])
             model = event.get("model") or model
             if isinstance(event.get("usage"), dict):
                 usage_raw = event["usage"]

@@ -158,6 +158,11 @@ ATTENDUS = {
     "jrn": ("journal = Journal(", "journal=journal", "resume_from_journal(", "except OutcomeUnknown",
             "journal.resolve(", "journal.close()"),
     "evol": ("EvolutionRuntime(", "enable_software_evolution(", "validation_command="),
+    # 0.23.1 : des plafonds de ressources pour le sous-processus (opt-in, Linux), et « Docker exigé » —
+    # l'import ET l'option doivent être émis, sinon le preset montrerait une case sans effet.
+    "plafonds": ("from autoagent.sandbox import SandboxLimits, SubprocessSandbox",
+                 "SubprocessSandbox(timeout=10, limits=SandboxLimits(memory_mb=256, cpu_s=10, fsize_mb=10))"),
+    "docker_exige": ("make_sandbox(prefer_docker=True", "require_docker=True"),
     # Outils dynamiques, lots A-C : tout ce que les options émettent doit exister dans la lib.
     "dynpro": ("allowed_permissions=set()", "max_repairs=2", "persist=True", "PythonRunner(sandbox=bac)",
                "enable_run_python(", "DockerSandbox("),

@@ -7,6 +7,255 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-10-04
+
+**0.23.1 is a fixes release: nine defects, each reproduced on 0.23.0 by a script (no
+network, no key) before being fixed and pinned by a test that fails on 0.23.0 and
+passes here — plus a sandbox that says what it guarantees.** They come from a research
+pass of 3 October 2026 (the agent-harness literature, the official SDKs' code, and this
+library read against both). Not everything the pass proposed is in: what was verified
+and fixed is here, what was not is listed at the bottom. Two independent reviews (fresh
+eyes, code AND execution, with reproduction scripts and mutation checks) went over the
+result before release: no blocker, one compatibility point, two real bypasses of the new
+policy operators and a dozen minor defects — all reproduced, fixed and pinned; each
+section ends with what the review changed.
+
+**Upgrade notes — what changes without you asking.** (1) An Anthropic stream that is cut
+short or announces an error now raises `ProviderError`; it used to end as a truncated
+"success". (2) More HTTP statuses are retried (408, 409, 529 and every 5xx except
+501/505) and the waits carry a jitter. (3) `cancel_token` acts earlier: a tool that has
+not started no longer runs after "stop", a stream stops, a sub-agent receives the token
+(the keyword is passed to `run` only when a token is active, so an `Agent` subclass with
+a narrow `run` signature keeps working). (4) Gemini `output_tokens` now includes thinking
+tokens, so `token_budget` can trip earlier on a model that thinks. (5) Untrusted content is
+stripped of hidden characters before it is framed. (6) The note on a pruned FAILED tool
+result now says it FAILED (it said "VALID"); no pruning decision changes. (7)
+`replace_text` returns `occurrences`, and a `note` when some are left. Log lines only:
+`make_sandbox()` falling back to the subprocess, and `starts_with` on a path-like or
+URL-like argument, are now reported once per process. **Everything else is opt-in:**
+`make_sandbox(require_docker=True)`, `SubprocessSandbox(limits=SandboxLimits(...))`,
+`sandbox.isolation()`, the `path_within` / `url_host` / `not` policy operators,
+`http.is_retryable_status`.
+
+### Fixed — a stream that fails or is cut was a "success"
+
+- **Anthropic.** An SSE `error` event (`overloaded_error` under load…) was ignored, and a
+  stream cut mid-sentence ended with a normal "final" chunk — truncated text,
+  `finish_reason=None`, no exception. A voice agent played a cut sentence as if it were
+  complete. Now the `error` event raises a typed `ProviderError` (`status_code`,
+  `retryable`: 529 / 429 / 500 / 504 retryable, 400 / 401 / 402 / 403 / 404 / 413 not), and
+  a stream that ends with neither `stop_reason` nor `message_stop` raises
+  `ProviderError("… ended before the message was complete … truncated", retryable=True)`.
+  An error-shaped event without the top-level `"type": "error"` (some gateways) is an error
+  too, with its real cause — it used to fall into the "truncated" branch.
+- **OpenAI-compatible providers (OpenRouter, gateways) and Gemini.** The HTTP 200 is
+  already behind us and the failure is announced IN the stream (`{"error": {…}}`, no
+  `choices` / `candidates`): 0.23.0 read it as an empty answer. Same treatment
+  (`providers.base.stream_error`), which never raises on an odd error object: only a
+  plausible HTTP status (100–599) becomes `status_code`, and a text code such as
+  `server_error`, `rate_limit_exceeded` or `UNAVAILABLE` marks the error retryable.
+
+### Fixed — retries aligned on the official SDK
+
+0.23.0 retried only `{429, 500, 502, 503, 504}`: the **529 "overloaded"** — exactly what
+Anthropic returns when saturated — failed at once. Now (the official Anthropic SDK's rule,
+code read on 3 Oct 2026): 408, 409, 429 and every 5xx except 501 / 505 are retried
+(`http.is_retryable_status`, also used to classify an error received mid-stream). The wait
+is `retry-after-ms`, then `retry-after` in seconds, then `retry-after` as an HTTP date
+(capped at 15 s, never randomised — the server computed it), else `min(2ⁿ, 8)` s × a
+jitter in [0.75, 1.0]: without it, a hundred clients that get the same error at the same
+instant all wake on the same second and saturate the service again. The first retry after
+a network error stays immediate. After the review: a `Retry-After` date with an absurd
+year no longer leaks an `OverflowError` (CPython ≤ 3.12), and the jitter draws from a
+private generator, so a retry does not shift the sequence of a host that called
+`random.seed(...)`.
+
+### Security — confining a path or a URL: `path_within`, `url_host`, `not`
+
+`{"path": {"starts_with": "rapports/"}}` — the rule our own docs taught — let
+`rapports/../../etc/cron.d/x` through, and `{"url": {"starts_with": "https://api.exemple.fr"}}`
+let `https://api.exemple.fr.evil.example/…` and `https://api.exemple.fr@evil.example/…`
+through (the same class of flaw as CVE-2025-53110, a "naive string prefix-matching check"
+in Anthropic's Filesystem MCP server — Cymulate, updated 17 March 2026, re-read on 4 Oct).
+Reproduced on 0.23.0 by a script: `rapports/../../etc/cron.d/x`, `rapports/../secrets.env`
+and three URL forms all allowed. `starts_with` compares strings; `path_within` and
+`url_host` compare the thing itself, once normalised, and are fail-closed (anything they
+cannot read cleanly does not match): empty or control-character paths, encoded `..`
+(`%2e`), absolute against relative, full-width dots (NFKC), credentials in a URL,
+backslashes, spaces, punycode look-alikes. `not` negates a predicate: since a `deny`
+always beats an `allow`, "write only under `rapports/`" is written "DENY if the path is
+NOT under `rapports/`". A malformed confinement rule fails at `from_dict`. `starts_with`
+on an argument named like a path or a URL (English or French: `chemin`, `fichier`,
+`dossier`, `lien`, `adresse`…) keeps working and is logged once.
+**The example in the docs contradicted the precedence rule** (an `allow` under
+`rapports/` followed by an unconditional `deny` denied EVERY write — executed on 0.23.0);
+it is fixed in the module docstring and in dev-doc §26.2, with a test that runs it.
+**The review found two real bypasses of the new operators, both fixed:** a host that IDNA
+2003 and IDNA 2008 read differently (`straße` is `strasse` for the standard library and
+`xn--strae-oqa` for requests, urllib3, Node and curl: two domains, one of them registrable
+by an attacker — all 79 divergences from Node over 123 827 URLs were of this class) NEVER
+matches now (write the `xn--…` form); and a Windows drive letter (`C:\x`, `C:x`), which
+`posixpath` reads as a RELATIVE path, passed against the base "." — it is now an absolute
+path (same drive on both sides, or no match). Also: Windows device names (`CON`, `NUL`,
+`COM1`…) are in no directory; `%2e` written in full-width characters is refused like the
+real one; a host name over 253 characters is refused (the punycode encoder is quadratic:
+30 000 characters took 92 s); a `url_host` pattern that is not a host name (scheme, port,
+path, credentials) fails at `from_dict` instead of silently never matching.
+
+### Security — hidden instructions in untrusted content
+
+Unicode "tags" (U+E0000–E007F: hidden ASCII — a whole instruction inside an innocent
+sentence), zero-width characters and bidirectional controls went through
+`frame_untrusted` intact (9 vectors out of 9 on 0.23.0). They are now removed before
+framing — the WHOLE invisible plane-14 range (U+E0000–E0FFF), not only the tags block: a naive
+encoder files "é" at U+E00E9, and a French hidden instruction left a residue until a real-model
+run showed it — and the trace says what was removed: an `untrusted_sanitized` event (attached
+to the RUN: the request span is already closed when tools run, and the OpenTelemetry exporter
+used to drop the event) with the counts and `hidden_text` — the hidden text decoded (≤ 200
+characters), i.e. the instruction the attacker wanted read. What has a legitimate use is KEPT:
+joiners between Persian or Indic letters, emoji sequences, emoji variation selectors, LRM / RLM
+marks, and well-formed subdivision flags (England, Scotland, Wales: a black flag, 2–7 letters or
+digits in tags, the cancel tag — the legitimate use of tags, which the review saw degraded to a
+bare black flag; a payload disguised as a flag — too long, a space, no cancel tag — is not kept).
+ASCII text takes a fast path, and so does clean accented text (one scan: 5 MB of French went
+from 138 ms to 17 ms). Observability stays fail-open. After the review: the report counts
+without one `str` per hidden character (5 million tags peaked at 508 MB), and a forged framing
+marker is neutralised even when it hides an invisible character that is NOT stripped (a
+left-to-right mark, a variation selector, a soft hyphen, a Hangul filler…) — the repetition is
+bounded, so `[[[[…` is not a denial of service. **What it costs, said plainly:** ideographic
+variation selectors (rare glyph variants in Japanese names), the Mongolian vowel separator, the
+invisible math operators, embedding/isolate bidi controls and a ZWNJ between two ASCII letters
+are removed too — the variation-selector channel cannot be kept without reopening it.
+
+### Fixed — Gemini thinking tokens were not counted
+
+Reproduced with a simulated answer (100 input, 20 answer, 300 thinking, announced total
+420): the call costs 420, the run counted 120, and `token_budget=150` never tripped.
+`output_tokens` is now DERIVED from the total the provider announces itself (`total −
+input`, minus built-in tool tokens), never below `candidatesTokenCount`; without a total,
+the thinking tokens are added. Gemini's documentation (page "Thinking", updated 25 Sept
+2026, re-read on 4 Oct) says "When thinking is turned on, response pricing is the sum of
+output tokens and thinking tokens" but does not say whether `candidatesTokenCount`
+contains them: the derivation is right under both readings. **Not verified against the
+real API** (Gemini credits were exhausted, HTTP 402): proven on simulated responses only.
+After the review: the extraction never raises on an unexpected field type (it falls back to
+what the provider said of the output), and a blocked prompt (no `candidatesTokenCount`) stays
+"not reported" instead of becoming an invented zero.
+
+### Fixed — `cancel_token` stops what it promised to stop
+
+The token was read only at the head of an iteration. Now at four moments: head of
+iteration, between the chunks of a stream, before each tool call that has not started
+(it does NOT run: its result says "Cancelled … NOT executed", and the transcript stays
+well formed), and at the step boundary. `as_tool` and `delegate_to` forward the token to
+the sub-agent. Reproduced on 0.23.0: a "stop" set 0.5 s into a 3 s answer let it finish;
+set during the first of three tools, all three ran (a booking, a mail); at `max_steps`,
+`MaxStepsExceeded` was raised after everything had executed. A model call already sent
+(not streamed) and a tool already running are still not interrupted. After the review: the
+keyword is passed to a sub-agent's `run` only when a token is active (an `Agent` subclass
+whose `run` has the 0.23.0 signature failed on EVERY delegation otherwise); a call stopped
+before it started does not taint the run (it read nothing: after `resume`, a mail was
+refused for content that never entered the conversation); a provider stream whose `close()`
+raises no longer turns a successful run into an error or masks the cancellation.
+
+### Added — a sandbox that says what it guarantees
+
+- **`make_sandbox(require_docker=True)`** raises `ToolError` when no usable Docker daemon
+  is reachable — nothing runs. Without it the fallback to `SubprocessSandbox` stays the
+  default (nothing breaks) but is no longer silent: one warning per process. The pattern
+  is CVE-2026-2275, noted by the CERT/CC (VU#221883, 30 March 2026, about CrewAI): "The
+  CrewAI CodeInterpreter tool falls back to SandboxPython when it cannot reach Docker,
+  which can enable code execution through arbitrary C function calls." (note re-read at
+  the source on 4 Oct 2026).
+- **`sandbox.isolation()`** on both sandboxes: `kind`, `os_boundary`, `network_isolated`,
+  `filesystem_isolated`, `env_scrubbed` and the limits actually enforced. `os_boundary` is
+  true for Docker only.
+- **`SubprocessSandbox(limits=SandboxLimits(memory_mb=, cpu_s=, fsize_mb=))`** — opt-in,
+  Linux only. `RLIMIT_AS` → `MemoryError`, `RLIMIT_CPU` → killed, `RLIMIT_FSIZE` →
+  `OSError: File too large`; every sandbox error names the limits that were in force. Set by
+  the runner itself just before the tool's code (a short preamble in front of the runner —
+  not `preexec_fn`, which Python documents as unsafe with threads), in all three execution
+  paths: one process per call, the host-function bridge, the warm worker. **Without
+  `limits=` the runner is byte for byte the 0.23.0 one in all three paths** (tests pin
+  them). If `setrlimit` fails, the preamble raises BEFORE the tool's code: the tool never
+  runs without the limit asked for (pinned on the REAL preamble, not only on a simulated
+  failure). Measured on Linux (WSL2 Ubuntu 24.04, CPython 3.10 / 3.12 / 3.13): each limit
+  stops the tool that exceeds it AND the same tool passes without it; breaking each of the
+  three paths on purpose, one at a time, fails the tests of that path and only those
+  (checked on CPython 3.12). Said plainly: this is a safety net, **not a boundary** (a root
+  process can raise its limits; Docker is the boundary); off Linux the constructor REFUSES
+  rather than run unlimited; `cpu_s` with `warm=True` is refused (it would count every call
+  of the worker); no cap on process count (`RLIMIT_NPROC` does nothing as root), on stdout
+  volume, network or filesystem. After the review: values the kernel cannot apply fail at
+  CONSTRUCTION, not at every call (`memory_mb` ≥ 1, `cpu_s` ≥ 1 in whole seconds — and
+  `isolation()` reports the value actually applied: 1.5 → 2 —, nothing beyond a C `long`);
+  and the **memory floor depends on the Python build**: measured, a trivial tool runs from
+  16 MB with Ubuntu's python3 3.12.3 but needs 64 MB with `uv`'s 3.12.15 and 3.13.16 (32 MB
+  with its 3.10.22) — start at 128 MB or more and measure on YOUR interpreter.
+- The AST validator is still a denylist and still **not** an isolation boundary. The
+  research ran several bypasses against it; their details are deliberately not repeated
+  here. It was not "repaired": this release adds the layer that tells the truth and, on
+  Linux, OS-level guard-rails.
+
+### Fixed — two small lies to the model
+
+- `replace_text(count=1)` (the default) said nothing about the OTHER occurrences:
+  `replaced: 1`, and the model believed it had replaced them all. The result now carries
+  `occurrences` and, when some are left, a `note` ("N other occurrence(s) … NOT replaced
+  … pass count=0").
+- Pruning an old tool result wrote "It was VALID when produced; nothing about it failed"
+  — also for a result that WAS an error. The note of a pruned FAILED result
+  (`{"ok": false, …}`) now says the call FAILED. The pruning DECISION is unchanged — a first
+  version left errors unpruned, and the review pointed out that a 100 kB error body would
+  then ride in every request of the run. Recognised by its head, which neither the untrusted
+  framing nor truncation hides; the view stays stable between `prune_batch` boundaries.
+
+### Verified on a real model (DeepSeek, one run each — not a statistic)
+
+The same script (`deepseek-chat`) against the published 0.23.0 and against this release:
+(A) a write policy and a model asked for `rapports/../secrets/notes.txt` — 0.23.0 with the
+documented `starts_with` rule WROTE it; this release (`path_within` + `not`) denied it and
+the model reported the denial; (B) a "stop" set 12 chunks into a streamed answer — 769 more
+chunks and 4.81 s on 0.23.0, none and 0.44 s here (the stream ends with `error="cancelled"`);
+(C) a page hiding an instruction in Unicode tags — 48 hidden characters reached the model on
+0.23.0, none here, and the trace carries the decoded instruction (the model did not obey it in
+either version: the defect was that it reached the model); (D) a tool loop and a stream — same
+answers. One real-model run also found a hole in the first version of the cleaning (a French
+hidden instruction left an invisible residue: see above), fixed before release.
+
+### Changed — docs, builder, demos
+
+- Dev-doc §41 (this release), §4.8.1 (cancellation), §11.4 / §11.4.1 (sandbox), §22
+  (hidden characters), §26.2 / §26.2.1 (policy), §28.1 (pruning); the stale `ProjectWorkspace`
+  API block (§9.2) now matches the code member by member.
+- Visual builder: sandbox block gains "require Docker" and the three limits, the policy
+  hint documents `path_within` / `url_host` / `not`, and two presets (32 in all):
+  "Sandbox with limits" and "Production: Docker required". `LIB_VERSION` is 0.23.1.
+- The README, the demos README, the dev-doc and the builder flag the "369 tokens vs 307"
+  figure of demo 33 (see below).
+
+### Not done, or not verified
+
+- **Gemini accounting is not verified on the real API**, and the figure published for
+  demo 33 since 0.21.0 — "369 tokens vs 307 for the big model alone" — was measured with
+  the pre-0.23.1 accounting, which ignored thinking tokens: **to be re-measured**.
+- **Stream faults only partly closed.** An OpenAI-compatible or Gemini stream that the server
+  closes CLEANLY before its terminal marker is still returned as a (truncated) answer — only
+  Anthropic is covered — and a connection cut or frozen MID-stream still raises the raw
+  `OSError` / `IncompleteRead` instead of a `ProviderError`; a 200 whose body is an error is
+  still an empty answer for Anthropic and Gemini (not streamed), and a body that is not
+  UTF-8 still raises `UnicodeDecodeError`. A local fault server written right after this
+  release was prepared found all of these (15 cases out of 45); they are fixed in the next
+  release.
+- Sandbox limits: Linux only; Windows Job Objects and macOS are not implemented.
+- An approval requested INSIDE a sub-agent run through `as_tool` still becomes a tool
+  error (the parent finishes "ok", the host is never asked): closed by default — the
+  deletion does not happen — but it cannot be approved. Not changed.
+- Read in the code and not changed: `max_repeated_tool_calls` counts identical calls over
+  the WHOLE run (false positive: re-running the tests after every edit); no per-tool
+  timeout nor total run duration; `MaxStepsExceeded` carries no answer; an exhausted
+  `post_turn_hook` delivers the faulty answer as "ok".
+
 ## [0.23.0] - 2026-10-03
 
 **0.23.0 is three things, each closed by a verification gate — including on a

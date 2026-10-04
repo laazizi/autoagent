@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Any
 
+from autoagent.errors import ProviderError
 from autoagent.http import post_json, post_sse
 from autoagent.schema import (
     LLMRequest,
@@ -15,6 +16,22 @@ from autoagent.schema import (
 )
 
 from .base import LLMProvider, parse_tool_arguments, synthetic_call_id
+
+# Types d'erreur d'un événement SSE `error` → (statut HTTP équivalent, réessayable). Liste de la doc
+# d'Anthropic ; « overloaded_error » est le 529 qu'elle renvoie quand elle est saturée. Un type
+# inconnu n'est PAS réessayable : mieux vaut échouer net que rejouer une erreur qu'on ne comprend pas.
+_ERREURS_FLUX: dict[str, tuple[int, bool]] = {
+    "invalid_request_error": (400, False),
+    "authentication_error": (401, False),
+    "billing_error": (402, False),
+    "permission_error": (403, False),
+    "not_found_error": (404, False),
+    "request_too_large": (413, False),
+    "rate_limit_error": (429, True),
+    "api_error": (500, True),
+    "timeout_error": (504, True),
+    "overloaded_error": (529, True),
+}
 
 
 def _usage_from(u: Any) -> TokenUsage | None:
@@ -162,6 +179,7 @@ class AnthropicProvider(LLMProvider):
         usage_start: dict[str, Any] | None = None   # bloc `usage` du message_start
         usage_out: int | None = None
         raison_brute: str | None = None
+        arret_vu = False            # `message_stop` reçu : le fournisseur a FINI son message
         emis: set[int] = set()
 
         def _assemble(block: dict[str, Any]) -> ToolCall:
@@ -222,7 +240,33 @@ class AnthropicProvider(LLMProvider):
                 if index in tool_blocks and index not in emis:
                     emis.add(index)
                     yield StreamChunk(type="tool_call", tool_call=_assemble(tool_blocks[index]))
-            # message_delta / message_stop need no action here.
+            elif etype == "message_stop":
+                arret_vu = True
+            elif etype == "error" or isinstance(event.get("error"), dict):
+                # (Certaines passerelles omettent le `type` de premier niveau : un événement qui porte un objet
+                # `error` est une erreur, pas un flux « tronqué » dont la vraie cause serait masquée.)
+                # Le statut HTTP 200 est déjà passé : Anthropic annonce son échec DANS le flux
+                # (`overloaded_error` en pleine charge). La 0.23.0 ignorait l'événement et le run
+                # finissait en « succès » sur une réponse vide ou coupée ; le SDK officiel lève.
+                erreur = event.get("error")
+                erreur = erreur if isinstance(erreur, dict) else {}
+                kind = str(erreur.get("type") or "error")
+                statut, reessayable = _ERREURS_FLUX.get(kind, (None, False))
+                raise ProviderError(
+                    f"Anthropic stream error ({kind}): {str(erreur.get('message') or event)[:500]}",
+                    status_code=statut, retryable=reessayable)
+            # message_delta / ping need no action here.
+
+        if not arret_vu and raison_brute is None:
+            # Ni `message_stop` ni `stop_reason` : le flux s'est ARRÊTÉ AVANT la fin du message
+            # (connexion coupée, proxy qui ferme). Le texte reçu est une réponse TRONQUÉE — la rendre
+            # comme une réponse normale, c'est faire entendre une phrase coupée comme si elle était
+            # complète. Un flux qui a envoyé `stop_reason` mais pas `message_stop` (passerelles,
+            # doublures de test) est, lui, COMPLET : le contenu est entier, on ne le refuse pas.
+            raise ProviderError(
+                "Anthropic stream ended before the message was complete (no stop_reason, no "
+                "message_stop): the answer is truncated",
+                retryable=True)
 
         tool_calls: list[ToolCall] = [_assemble(tool_blocks[i]) for i in sorted(tool_blocks)]
 

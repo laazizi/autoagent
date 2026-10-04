@@ -1,26 +1,43 @@
 from __future__ import annotations
 
+import email.utils
 import http.client
 import json
+import random
 import ssl
 import threading
 import time
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
 from .errors import ProviderError
 from .logging import get_logger
 
-__all__ = ["post_json", "post_sse", "close_connections"]
+__all__ = ["post_json", "post_sse", "close_connections", "is_retryable_status"]
 
 _log = get_logger("http")
 
 _DEFAULT_RETRIES = 2  # total attempts = retries + 1
 
-# HTTP statuses worth retrying: rate limits and transient upstream failures.
-# Other 4xx are caller errors — retrying them only wastes time and quota.
-_RETRYABLE_HTTP = {429, 500, 502, 503, 504}
+# HTTP statuses worth retrying: timeouts, conflicts, rate limits and transient
+# upstream failures. Other 4xx are caller errors — retrying them only wastes
+# time and quota.
+#
+# 0.23.1 : la règle est celle du SDK officiel d'Anthropic (code relu le 3 oct.
+# 2026) — 408, 409, 429 et TOUT 5xx, donc le 529 « overloaded » qui est
+# précisément ce qu'Anthropic renvoie quand elle est saturée (la 0.23.0 ne
+# relançait que 429/500/502/503/504, et le 529 échouait tout de suite). Seuls
+# 501 (non implémenté) et 505 (version HTTP) sont permanents : inutile de les
+# rejouer.
+_PERMANENT_5XX = frozenset({501, 505})
+
+
+def is_retryable_status(code: int) -> bool:
+    """Ce statut HTTP est-il transitoire (donc à réessayer) ? Partagé avec les fournisseurs,
+    pour qu'une erreur reçue EN COURS de flux soit classée comme une erreur HTTP."""
+    return code in (408, 409, 429) or (500 <= code <= 599 and code not in _PERMANENT_5XX)
 
 # ── Connexions persistantes (0.21.0) ─────────────────────────────────────────
 #
@@ -101,15 +118,59 @@ def _is_transient(exc: BaseException) -> bool:
     return isinstance(reason, (TimeoutError, ConnectionError))
 
 
-def _retry_wait(exc: _HTTPStatusError, attempt: int) -> float:
-    """Honour the server's Retry-After when present (capped), else backoff."""
+_MAX_RETRY_AFTER = 15.0   # une lib interactive n'attend pas plus : au-delà, c'est l'hôte qui décide
+
+
+# Un générateur PRIVÉ : tirer dans le `random` global décalait, à chaque relance, la séquence d'un hôte qui a posé
+# `random.seed(...)` pour rendre ses tests reproductibles (compare.py et synthesis.py utilisent déjà les leurs).
+_RNG = random.Random()
+
+
+def _jitter() -> float:
+    """Facteur dans [0,75 ; 1,0] — la formule du SDK officiel (`1 - 0,25 x aléa`).
+
+    Sans lui, cent clients qui reçoivent la même erreur au même instant se
+    réveillent TOUS à la même seconde et la resaturent : c'est ainsi qu'une
+    panne d'une minute devient dix. Le délai demandé par le SERVEUR, lui, n'est
+    jamais randomisé — il l'a calculé pour nous."""
+    return 1.0 - 0.25 * _RNG.random()
+
+
+def _retry_after(headers: dict[str, str]) -> float | None:
+    """Le délai que le serveur demande, en secondes, ou None s'il n'en demande pas (ou si c'est illisible).
+
+    Dans l'ordre du SDK officiel : `retry-after-ms` (millisecondes), puis `retry-after`
+    en secondes, puis `retry-after` en DATE HTTP. Nul, négatif ou illisible : ignoré."""
+    millisecondes = headers.get("retry-after-ms")
+    if millisecondes:
+        try:
+            delai = float(millisecondes) / 1000.0
+        except ValueError:
+            delai = 0.0
+        if delai > 0:
+            return delai
+    brut = headers.get("retry-after")
+    if not brut:
+        return None
     try:
-        retry_after = float(exc.headers.get("retry-after", ""))
-        if retry_after > 0:
-            return min(retry_after, 15.0)
-    except (TypeError, ValueError):
-        pass
-    return float(min(2**attempt, 8))
+        delai = float(brut)
+    except ValueError:
+        try:
+            date = email.utils.parsedate_to_datetime(brut)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            delai = (date - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, OverflowError):    # OverflowError : une année géante (CPython <= 3.12)
+            return None
+    return delai if delai > 0 else None      # `nan > 0` est faux : ignoré aussi
+
+
+def _retry_wait(exc: _HTTPStatusError, attempt: int) -> float:
+    """Honour the server's Retry-After when present (capped), else backoff (with jitter)."""
+    retry_after = _retry_after(exc.headers)
+    if retry_after is not None:
+        return min(retry_after, _MAX_RETRY_AFTER)
+    return float(min(2**attempt, 8)) * _jitter()
 
 
 def _send(url: str, body: bytes, headers: dict[str, str], timeout: float,
@@ -158,7 +219,7 @@ def post_json(
             response, scheme, host, port = _send(url, body, entetes, timeout, stream=False)
             data = response.read().decode("utf-8")
         except _HTTPStatusError as exc:
-            retryable = exc.code in _RETRYABLE_HTTP
+            retryable = is_retryable_status(exc.code)
             if retryable and attempt < retries:  # 429/5xx: transient upstream — retry
                 wait = _retry_wait(exc, attempt)
                 _log.warning("HTTP %s from %s - retry %s/%s in %ss",
@@ -176,7 +237,7 @@ def post_json(
             # connexion neuve si l'erreur est transitoire.
             _discard(parts.scheme, parts.hostname or "", parts.port)
             if _is_transient(exc) and attempt < retries:
-                wait = min(2 ** attempt, 8) if attempt else 0.0   # 1er réessai immédiat
+                wait = min(2 ** attempt, 8) * _jitter() if attempt else 0.0   # 1er réessai immédiat
                 _log.warning("Transient network error for %s (%s) - retry %s/%s in %ss",
                              url, exc, attempt + 1, retries, wait)
                 if wait:
@@ -244,7 +305,7 @@ def post_sse(
             response, scheme, host, port = _send(url, body, entetes, timeout, stream=True)
             break
         except _HTTPStatusError as exc:
-            retryable = exc.code in _RETRYABLE_HTTP
+            retryable = is_retryable_status(exc.code)
             if retryable and attempt < retries:
                 wait = _retry_wait(exc, attempt)
                 _log.warning("HTTP %s from %s (SSE) - retry %s/%s in %ss",
@@ -259,7 +320,7 @@ def post_sse(
         except (OSError, http.client.HTTPException) as exc:
             _discard(scheme, host, port)
             if _is_transient(exc) and attempt < retries:
-                wait = min(2**attempt, 8) if attempt else 0.0
+                wait = min(2**attempt, 8) * _jitter() if attempt else 0.0
                 _log.warning("Transient SSE error for %s (%s) - retry %s/%s in %ss",
                              url, exc, attempt + 1, retries, wait)
                 if wait:
