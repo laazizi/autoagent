@@ -15,7 +15,7 @@ from autoagent.schema import (
     normalize_finish_reason,
 )
 
-from .base import LLMProvider, parse_tool_arguments, synthetic_call_id
+from .base import LLMProvider, fermer_flux, parse_tool_arguments, synthetic_call_id
 
 # Types d'erreur d'un événement SSE `error` → (statut HTTP équivalent, réessayable). Liste de la doc
 # d'Anthropic ; « overloaded_error » est le 529 qu'elle renvoie quand elle est saturée. Un type
@@ -59,6 +59,18 @@ def _usage_from(u: Any) -> TokenUsage | None:
         output_tokens=u.get("output_tokens"),
         cached_tokens=lu,
     )
+
+
+def _erreur_annoncee(corps: dict[str, Any], ou: str) -> ProviderError:
+    """Une erreur annoncée DANS une réponse Anthropic (un événement de flux, ou un corps HTTP 200) → `ProviderError`
+    typée : le statut et le caractère réessayable viennent du type d'erreur (`_ERREURS_FLUX`)."""
+    erreur = corps.get("error")
+    erreur = erreur if isinstance(erreur, dict) else {}
+    kind = str(erreur.get("type") or "error")
+    statut, reessayable = _ERREURS_FLUX.get(kind, (None, False))
+    return ProviderError(
+        f"Anthropic {ou} error ({kind}): {str(erreur.get('message') or corps)[:500]}",
+        status_code=statut, retryable=reessayable)
 
 
 class AnthropicProvider(LLMProvider):
@@ -132,6 +144,10 @@ class AnthropicProvider(LLMProvider):
             headers=self._headers(),
             timeout=self.config.timeout,
         )
+        if raw.get("type") == "error" or isinstance(raw.get("error"), dict):
+            # HTTP 200 dont le corps est une erreur (`overloaded_error`…) : avant, une réponse VIDE « réussie »
+            # (0.24.0 — trouvé par le banc de pannes).
+            raise _erreur_annoncee(raw, "response")
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
         for index, block in enumerate(raw.get("content", [])):
@@ -191,71 +207,70 @@ class AnthropicProvider(LLMProvider):
             args = parse_tool_arguments(block["json"].strip())
             return ToolCall(id=block["id"], name=block["name"], arguments=args)
 
-        for event in post_sse(
+        # Fermé EXPLICITEMENT (voir `fermer_flux` : CPython 3.12.3 ne referme pas le générateur interne sur un barge-in).
+        evenements = post_sse(
             self._url(),
             payload,
             headers=self._headers(),
             timeout=self.config.timeout,
-        ):
-            etype = event.get("type")
-            if etype == "message_start":
-                message = event.get("message") or {}
-                model = message.get("model")
-                # On garde le bloc ENTIER : il porte aussi les compteurs de
-                # cache, et c'est `_usage_from` qui sait les normaliser. Ne
-                # prélever que `input_tokens` ici sous-évaluerait l'entrée dès
-                # que le cache mord — le bug que la version non streamée évite.
-                usage_start = message.get("usage") or {}
-            elif etype == "message_delta":
-                # The closing delta carries the final output token count.
-                out = (event.get("usage") or {}).get("output_tokens")
-                if out is not None:
-                    usage_out = out
-                raison_brute = (event.get("delta") or {}).get("stop_reason") or raison_brute
-            elif etype == "content_block_start":
-                index = event.get("index", 0)
-                block = event.get("content_block") or {}
-                if block.get("type") == "tool_use":
-                    tool_blocks[index] = {
-                        "id": block.get("id") or synthetic_call_id("tool_call", index),
-                        "name": block.get("name") or "",
-                        "json": "",
-                    }
-            elif etype == "content_block_delta":
-                index = event.get("index", 0)
-                delta = event.get("delta") or {}
-                dtype = delta.get("type")
-                if dtype == "text_delta":
-                    chunk_text = delta.get("text") or ""
-                    if chunk_text:
-                        text_parts.append(chunk_text)
-                        yield StreamChunk(type="text", text=chunk_text)
-                elif dtype == "input_json_delta" and index in tool_blocks:
-                    tool_blocks[index]["json"] += delta.get("partial_json") or ""
-            elif etype == "content_block_stop":
-                # Le bloc tool_use est COMPLET : on l'émet tout de suite, sans
-                # attendre message_stop — la boucle peut lancer un outil
-                # idempotent pendant que le modèle émet les blocs suivants.
-                index = event.get("index", 0)
-                if index in tool_blocks and index not in emis:
-                    emis.add(index)
-                    yield StreamChunk(type="tool_call", tool_call=_assemble(tool_blocks[index]))
-            elif etype == "message_stop":
-                arret_vu = True
-            elif etype == "error" or isinstance(event.get("error"), dict):
-                # (Certaines passerelles omettent le `type` de premier niveau : un événement qui porte un objet
-                # `error` est une erreur, pas un flux « tronqué » dont la vraie cause serait masquée.)
-                # Le statut HTTP 200 est déjà passé : Anthropic annonce son échec DANS le flux
-                # (`overloaded_error` en pleine charge). La 0.23.0 ignorait l'événement et le run
-                # finissait en « succès » sur une réponse vide ou coupée ; le SDK officiel lève.
-                erreur = event.get("error")
-                erreur = erreur if isinstance(erreur, dict) else {}
-                kind = str(erreur.get("type") or "error")
-                statut, reessayable = _ERREURS_FLUX.get(kind, (None, False))
-                raise ProviderError(
-                    f"Anthropic stream error ({kind}): {str(erreur.get('message') or event)[:500]}",
-                    status_code=statut, retryable=reessayable)
-            # message_delta / ping need no action here.
+        )
+        try:
+            for event in evenements:
+                etype = event.get("type")
+                if etype == "message_start":
+                    message = event.get("message") or {}
+                    model = message.get("model")
+                    # On garde le bloc ENTIER : il porte aussi les compteurs de
+                    # cache, et c'est `_usage_from` qui sait les normaliser. Ne
+                    # prélever que `input_tokens` ici sous-évaluerait l'entrée dès
+                    # que le cache mord — le bug que la version non streamée évite.
+                    usage_start = message.get("usage") or {}
+                elif etype == "message_delta":
+                    # The closing delta carries the final output token count.
+                    out = (event.get("usage") or {}).get("output_tokens")
+                    if out is not None:
+                        usage_out = out
+                    raison_brute = (event.get("delta") or {}).get("stop_reason") or raison_brute
+                elif etype == "content_block_start":
+                    index = event.get("index", 0)
+                    block = event.get("content_block") or {}
+                    if block.get("type") == "tool_use":
+                        tool_blocks[index] = {
+                            "id": block.get("id") or synthetic_call_id("tool_call", index),
+                            "name": block.get("name") or "",
+                            "json": "",
+                        }
+                elif etype == "content_block_delta":
+                    index = event.get("index", 0)
+                    delta = event.get("delta") or {}
+                    dtype = delta.get("type")
+                    if dtype == "text_delta":
+                        chunk_text = delta.get("text") or ""
+                        if chunk_text:
+                            text_parts.append(chunk_text)
+                            yield StreamChunk(type="text", text=chunk_text)
+                    elif dtype == "input_json_delta" and index in tool_blocks:
+                        tool_blocks[index]["json"] += delta.get("partial_json") or ""
+                elif etype == "content_block_stop":
+                    # Le bloc tool_use est COMPLET : on l'émet tout de suite, sans
+                    # attendre message_stop — la boucle peut lancer un outil
+                    # idempotent pendant que le modèle émet les blocs suivants.
+                    index = event.get("index", 0)
+                    if index in tool_blocks and index not in emis:
+                        emis.add(index)
+                        yield StreamChunk(type="tool_call", tool_call=_assemble(tool_blocks[index]))
+                elif etype == "message_stop":
+                    arret_vu = True
+                elif etype == "error" or isinstance(event.get("error"), dict):
+                    # (Certaines passerelles omettent le `type` de premier niveau : un événement qui porte un objet
+                    # `error` est une erreur, pas un flux « tronqué » dont la vraie cause serait masquée.)
+                    # Le statut HTTP 200 est déjà passé : Anthropic annonce son échec DANS le flux
+                    # (`overloaded_error` en pleine charge). La 0.23.0 ignorait l'événement et le run
+                    # finissait en « succès » sur une réponse vide ou coupée ; le SDK officiel lève.
+                    raise _erreur_annoncee(event, "stream")
+                # message_delta / ping need no action here.
+        finally:
+            fermer_flux(evenements)
 
         if not arret_vu and raison_brute is None:
             # Ni `message_stop` ni `stop_reason` : le flux s'est ARRÊTÉ AVANT la fin du message

@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from typing import Any
 from urllib.parse import quote
 
+from autoagent.errors import ProviderError
 from autoagent.http import post_json, post_sse
 from autoagent.schema import (
     LLMRequest,
@@ -15,7 +16,7 @@ from autoagent.schema import (
     normalize_finish_reason,
 )
 
-from .base import LLMProvider, stream_error, synthetic_call_id
+from .base import LLMProvider, fermer_flux, stream_error, synthetic_call_id
 
 
 def _entier(x: Any) -> int | None:
@@ -178,6 +179,9 @@ class GeminiProvider(LLMProvider):
             headers=self._headers(),
             timeout=self.config.timeout,
         )
+        if isinstance(raw.get("error"), dict) and raw["error"]:
+            # HTTP 200 dont le corps est une erreur : avant, une réponse VIDE « réussie » (0.24.0).
+            raise stream_error("gemini", raw["error"], where="response")
         candidate = (raw.get("candidates") or [{}])[0]
         content = candidate.get("content") or {}
         text_parts: list[str] = []
@@ -207,28 +211,41 @@ class GeminiProvider(LLMProvider):
         tool_calls: list[ToolCall] = []
         usage_meta: dict[str, Any] | None = None
         raison: str | None = None
+        fin: dict[str, bool] = {}          # comment le flux s'est terminé (voir `post_sse(signals=)`)
 
-        for event in post_sse(
+        # Fermé EXPLICITEMENT (voir `fermer_flux` : CPython 3.12.3 ne referme pas le générateur interne sur un barge-in).
+        evenements = post_sse(
             f"{self._url('streamGenerateContent')}?alt=sse",
             self._build_payload(request),
             headers=self._headers(),
             timeout=self.config.timeout,
-        ):
-            if event.get("error"):
-                # `{"error": {"code", "message", "status"}}` DANS le flux : ignoré par la 0.23.0 (0.23.1).
-                raise stream_error("gemini", event["error"])
-            candidate = (event.get("candidates") or [{}])[0]
-            content = candidate.get("content") or {}
-            if isinstance(event.get("usageMetadata"), dict):
-                usage_meta = event["usageMetadata"]  # cumulative; last one wins
-            raison = _finish_reason(event, candidate, False) or raison   # le dernier événement la porte
-            deja = len(tool_calls)
-            for fragment in self._parse_parts(content.get("parts") or [], tool_calls, text_parts):
-                yield StreamChunk(type="text", text=fragment)
-            # Chez Gemini un functionCall arrive ENTIER dans son événement : il
-            # est complet dès qu'on l'a vu. On l'émet tout de suite.
-            for call in tool_calls[deja:]:
-                yield StreamChunk(type="tool_call", tool_call=call)
+            signals=fin,
+        )
+        try:
+            for event in evenements:
+                if event.get("error"):
+                    # `{"error": {"code", "message", "status"}}` DANS le flux : ignoré par la 0.23.0 (0.23.1).
+                    raise stream_error("gemini", event["error"])
+                candidate = (event.get("candidates") or [{}])[0]
+                content = candidate.get("content") or {}
+                if isinstance(event.get("usageMetadata"), dict):
+                    usage_meta = event["usageMetadata"]  # cumulative; last one wins
+                raison = _finish_reason(event, candidate, False) or raison   # le dernier événement la porte
+                deja = len(tool_calls)
+                for fragment in self._parse_parts(content.get("parts") or [], tool_calls, text_parts):
+                    yield StreamChunk(type="text", text=fragment)
+                # Chez Gemini un functionCall arrive ENTIER dans son événement : il
+                # est complet dès qu'on l'a vu. On l'émet tout de suite.
+                for call in tool_calls[deja:]:
+                    yield StreamChunk(type="tool_call", tool_call=call)
+        finally:
+            fermer_flux(evenements)
+
+        if fin.get("eof") and raison is None:
+            # 0.24.0 : réponse fermée proprement SANS `finishReason` : le texte reçu est TRONQUÉ (voir OpenAI).
+            raise ProviderError(
+                "gemini stream ended before the answer was complete (no finishReason): the answer is truncated",
+                retryable=True)
 
         yield StreamChunk(
             type="final",

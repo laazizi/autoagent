@@ -31,12 +31,13 @@ Exemple::
     )
     print(rapport.summary())
     # k=8 · pass@1=0.75 (6/8) · pass^8=0.00 (toutes réussies : non)
-    # · estimation pass^8=0.10 · étapes 2-5 (méd. 3)
+    # · estimation pass^8=0.10 · étapes 2-5 (méd. 3) · méd. 1.20 s
 """
 
 from __future__ import annotations
 
 import statistics
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -63,6 +64,15 @@ class Attempt:
     input_tokens: int | None = None
     output_tokens: int | None = None
     cached_tokens: int | None = None
+    # Durée MURALE du run, en secondes (0.24.0) — le coût d'un score se paie aussi en attente. Mesurée autour
+    # de `agent.run` SEUL (`time.perf_counter`) : le temps du juge n'est pas de la latence de l'agent. Un run qui
+    # lève a quand même une durée (il a pris du temps). None = non mesurée (tentative construite à la main).
+    # `perf_counter` et non `monotonic` : sous Windows (mesuré, Python 3.11) `monotonic` avance par pas de ~15 ms.
+    seconds: float | None = None
+
+
+def _duree(secondes: float) -> str:
+    return f"{secondes:.2f} s" if secondes >= 0.01 else "<0.01 s"
 
 
 @dataclass
@@ -108,6 +118,20 @@ class ReliabilityReport:
     @property
     def errors(self) -> list[str]:
         return [a.error for a in self.attempts if a.error]
+
+    # ── Durée (0.24.0) — comme le coût : jamais inventée, None quand rien n'est mesuré ──
+
+    @property
+    def median_seconds(self) -> float | None:
+        """Durée médiane d'UNE tentative (réussie ou non), ou None si aucune durée n'est mesurée."""
+        mesurees = [a.seconds for a in self.attempts if a.seconds is not None]
+        return statistics.median(mesurees) if mesurees else None
+
+    @property
+    def max_seconds(self) -> float | None:
+        """La tentative la plus lente — c'est elle qu'un utilisateur au téléphone a vécue."""
+        mesurees = [a.seconds for a in self.attempts if a.seconds is not None]
+        return max(mesurees) if mesurees else None
 
     # ── Coût normalisé (0.21.0) — « score à dépense fixe », pas score tout seul ──
     #
@@ -185,6 +209,8 @@ class ReliabilityReport:
             f"étapes {low}-{high} (méd. {self.median_steps:g})"
             + (f" · {self.tokens_per_success:.0f} jetons/succès"
                if self.tokens_per_success is not None else "")
+            + (f" · méd. {_duree(self.median_seconds)}"
+               if self.median_seconds is not None else "")
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -198,11 +224,13 @@ class ReliabilityReport:
             "median_steps": self.median_steps,
             "total_tokens": self.usage.total_tokens if self.usage else None,
             "tokens_per_success": self.tokens_per_success,
+            "median_seconds": self.median_seconds,
+            "max_seconds": self.max_seconds,
             "attempts": [
                 {"index": a.index, "ok": a.ok, "steps": a.steps,
                  "total_tokens": a.total_tokens, "input_tokens": a.input_tokens,
                  "output_tokens": a.output_tokens, "cached_tokens": a.cached_tokens,
-                 "error": a.error}
+                 "error": a.error, "seconds": a.seconds}
                 for a in self.attempts
             ],
         }
@@ -222,8 +250,10 @@ def _tentative(
     juge qui lève — est un échec mesuré, jamais une exception du banc.
     """
     attempt = Attempt(index=index, ok=False)
+    debut = time.perf_counter()
     try:
         result = agent.run(prompt, context=context)
+        attempt.seconds = time.perf_counter() - debut       # le run seul : pas le juge, ci-dessous
         attempt.steps = getattr(result, "steps", 0)
         usage = getattr(result, "usage", None)
         attempt.total_tokens = getattr(usage, "total_tokens", None)
@@ -238,6 +268,8 @@ def _tentative(
     except Exception as exc:
         # Un run qui plante EST un échec de fiabilité, pas une erreur du banc.
         attempt.error = f"{type(exc).__name__}: {exc}"
+        if attempt.seconds is None:                           # un run qui lève a pris du temps, lui aussi
+            attempt.seconds = time.perf_counter() - debut
     return attempt
 
 

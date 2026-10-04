@@ -40,7 +40,19 @@ def _statut_http(brut: Any) -> int | None:
     return n if n is not None and 100 <= n <= 599 else None
 
 
-def stream_error(provider: str, error: Any) -> ProviderError:
+def fermer_flux(evenements: Any) -> None:
+    """Ferme un flux d'événements SSE s'il sait se fermer — un générateur ; un double de test peut rendre une simple liste.
+
+    Les `stream()` des fournisseurs l'appellent dans un `finally` : sur CPython 3.12.3 (le Python système d'Ubuntu 24.04),
+    `close()` d'un générateur externe ne referme pas le générateur interne (`post_sse`) — la connexion d'un flux abandonné
+    (barge-in, `cancel_token`) restait dans le pool et le serveur continuait d'émettre (mesuré). Sur un flux épuisé,
+    `close()` ne fait rien : la connexion normale est gardée pour la réutilisation."""
+    fermer = getattr(evenements, "close", None)
+    if callable(fermer):
+        fermer()
+
+
+def stream_error(provider: str, error: Any, where: str = "stream") -> ProviderError:
     """Une erreur reçue EN COURS de flux → `ProviderError` typée (0.23.1).
 
     Le statut HTTP 200 est déjà passé : le fournisseur annonce son échec DANS le flux
@@ -64,7 +76,7 @@ def stream_error(provider: str, error: Any) -> ProviderError:
         message = str(error)
     etiquette = f" ({code})" if code is not None else ""
     return ProviderError(
-        f"{provider} stream error{etiquette}: {message[:500]}",
+        f"{provider} {where} error{etiquette}: {message[:500]}",
         status_code=code,
         retryable=is_retryable_status(code) if code is not None else transitoire,
     )

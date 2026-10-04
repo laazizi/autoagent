@@ -69,13 +69,14 @@ import inspect
 import json
 import math
 import random
+import statistics
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from statistics import NormalDist
 from typing import Any
 
-from .eval import Attempt, ReliabilityReport, _tentative
+from .eval import Attempt, ReliabilityReport, _duree, _tentative
 from .logging import get_logger
 from .schema import TokenUsage
 
@@ -84,6 +85,7 @@ __all__ = [
     "ControlResult",
     "CostComparison",
     "EvalTask",
+    "LatencyComparison",
     "TaskComparison",
     "Variant",
     "compare_configs",
@@ -362,6 +364,22 @@ class CostComparison:
 
 
 @dataclass(frozen=True)
+class LatencyComparison:
+    """La durée des deux bras (0.24.0) : médiane d'UNE tentative, écart relatif, intervalle bootstrap.
+
+    Médiane, pas moyenne : une durée a une queue lourde (un appel réseau lent), et la moyenne d'un
+    petit échantillon suit cette queue. L'intervalle est un bootstrap (tentatives rééchantillonnées
+    tâche par tâche) : sur peu d'essais il est LARGE, et c'est ce qu'il faut lire."""
+
+    median_seconds_a: float
+    median_seconds_b: float
+    relative_change: float | None
+    interval: tuple[float, float] | None
+    n_a: int
+    n_b: int
+
+
+@dataclass(frozen=True)
 class ControlResult:
     """Le contrôle A/A : A contre sa propre copie. Il DOIT sortir « indistinguable »."""
 
@@ -408,6 +426,7 @@ class ComparisonReport:
     control: ControlResult | None = None
     detectable: float | None = None
     notes: list[str] = field(default_factory=list)
+    latency: LatencyComparison | None = None
 
     @property
     def trustworthy(self) -> bool:
@@ -448,6 +467,15 @@ class ComparisonReport:
                 ligne += (f" · par succès {c.tokens_per_success_a:.0f} → "
                           f"{c.tokens_per_success_b:.0f}")
             lignes.append(ligne)
+        # Sous 10 ms des deux côtés (un modèle scripté, un cache), la durée ne dit rien : on ne l'affiche pas
+        # (elle reste dans `latency` et dans `to_dict()`).
+        if self.latency is not None and max(self.latency.median_seconds_a, self.latency.median_seconds_b) >= 0.01:
+            d = self.latency
+            ligne = f"Durée : médiane {_duree(d.median_seconds_a)} → {_duree(d.median_seconds_b)} par tentative"
+            if d.relative_change is not None and d.interval is not None:
+                ligne += (f" ({d.relative_change:+.0%}, intervalle bootstrap "
+                          f"[{d.interval[0]:+.0%} ; {d.interval[1]:+.0%}])")
+            lignes.append(ligne)
         if self.control is not None:
             c2 = self.control
             etat = "indistinguable, comme attendu" if c2.ok else "A ET SA COPIE DIFFÈRENT"
@@ -471,6 +499,7 @@ class ComparisonReport:
             "detectable_difference": self.detectable,
             "tasks": [asdict(x) for x in self.tasks],
             "cost": None if self.cost is None else asdict(self.cost),
+            "latency": None if self.latency is None else asdict(self.latency),
             "control": None if self.control is None else {**asdict(self.control), "ok": self.control.ok},
             "fingerprints": dict(self.fingerprints),
             "notes": list(self.notes),
@@ -603,6 +632,47 @@ def _comparer_couts(
         cost_per_success_a=None if cost_fn is None else rep_a.cost_per_success(cost_fn),
         cost_per_success_b=None if cost_fn is None else rep_b.cost_per_success(cost_fn),
     )
+
+
+# ── Durée : bootstrap de la médiane, par tâche (0.24.0) ──────────────────────
+
+def _comparer_durees(
+    att_a: dict[str, list[Attempt]],
+    att_b: dict[str, list[Attempt]],
+    *,
+    confidence: float,
+    bootstrap: int,
+    seed: int,
+) -> LatencyComparison | None:
+    """None dès qu'une tentative n'a pas de durée mesurée : on n'invente pas un zéro.
+
+    Un flux aléatoire À PART (`seed` décalé) : le bootstrap du coût, lui, ne bouge pas d'un bit."""
+    for tentatives in (*att_a.values(), *att_b.values()):
+        if any(a.seconds is None for a in tentatives):
+            return None
+    listes_a = [[float(a.seconds or 0.0) for a in v] for v in att_a.values()]
+    listes_b = [[float(a.seconds or 0.0) for a in v] for v in att_b.values()]
+    pool_a = [x for v in listes_a for x in v]
+    pool_b = [x for v in listes_b for x in v]
+    if not pool_a or not pool_b:
+        return None
+    med_a, med_b = statistics.median(pool_a), statistics.median(pool_b)
+    relatif: float | None = None
+    intervalle: tuple[float, float] | None = None
+    if med_a > 0:
+        relatif = med_b / med_a - 1.0
+        rng = random.Random(f"{seed!r}:latence")      # un flux à PART, sans arithmétique : `seed` peut être str, bytes, None…
+        tirages: list[float] = []
+        for _ in range(bootstrap):
+            ma = statistics.median([x for v in listes_a for x in rng.choices(v, k=len(v))])
+            mb = statistics.median([x for v in listes_b for x in rng.choices(v, k=len(v))])
+            if ma > 0:
+                tirages.append(mb / ma - 1.0)
+        if tirages:
+            tirages.sort()
+            alpha = 1.0 - confidence
+            intervalle = (_quantile(tirages, alpha / 2), _quantile(tirages, 1 - alpha / 2))
+    return LatencyComparison(med_a, med_b, relatif, intervalle, len(pool_a), len(pool_b))
 
 
 # ── Le banc ──────────────────────────────────────────────────────────────────
@@ -759,6 +829,12 @@ def compare_configs(
         except Exception:
             _log.exception("detectable_difference failed")  # fail-open : une aide, pas la mesure
 
+    latence: LatencyComparison | None = None
+    try:
+        latence = _comparer_durees(att_a, att_b, confidence=confidence, bootstrap=bootstrap, seed=seed)
+    except Exception:
+        _log.exception("latency comparison failed")  # fail-open : une aide, pas la mesure — jamais perdre des runs payés
+
     fingerprints = {"suite": _empreinte_suite(taches)}
     for variante in bras:
         fingerprints[variante.name] = sorted(empreintes_vues[variante.name])[0]
@@ -771,4 +847,5 @@ def compare_configs(
         cost=_comparer_couts(att_a, att_b, confidence=confidence, bootstrap=bootstrap,
                              seed=seed, cost_fn=cost_fn),
         control=resultat_controle, detectable=detectable, notes=notes,
+        latency=latence,
     )

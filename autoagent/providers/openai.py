@@ -17,7 +17,7 @@ from autoagent.schema import (
     normalize_finish_reason,
 )
 
-from .base import LLMProvider, parse_tool_arguments, stream_error, synthetic_call_id
+from .base import LLMProvider, fermer_flux, parse_tool_arguments, stream_error, synthetic_call_id
 
 
 def _uses_max_completion_tokens(model: str) -> bool:
@@ -87,6 +87,9 @@ class OpenAICompatibleProvider(LLMProvider):
             headers=self._headers(),
             timeout=self.config.timeout,
         )
+        if isinstance(raw.get("error"), dict) and raw["error"]:
+            # HTTP 200 dont le corps est une erreur (passerelles) : sa vraie cause et son caractère réessayable (0.24.0).
+            raise stream_error(self.config.provider, raw["error"], where="response")
         choices = raw.get("choices") or []
         if not choices:
             # Corps inattendu (filtrage en amont, passerelle qui reformule) : une
@@ -126,56 +129,73 @@ class OpenAICompatibleProvider(LLMProvider):
         usage_raw: dict[str, Any] | None = None
         raison_brute: str | None = None
         emis: set[int] = set()
+        fin: dict[str, bool] = {}          # comment le flux s'est terminé (voir `post_sse(signals=)`)
 
         def _assemble(index: int, slot: dict[str, Any]) -> ToolCall:
             args = parse_tool_arguments(slot["arguments"].strip())
             return ToolCall(id=slot["id"] or synthetic_call_id("tool_call", index),
                             name=slot["name"], arguments=args)
 
-        for event in post_sse(
+        # Fermé EXPLICITEMENT (voir `fermer_flux` : CPython 3.12.3 ne referme pas le générateur interne sur un barge-in).
+        evenements = post_sse(
             f"{self.base_url}/chat/completions",
             payload,
             headers=self._headers(),
             timeout=self.config.timeout,
-        ):
-            if event.get("error"):
-                # Erreur annoncée DANS le flux (OpenRouter, passerelles) : statut 200 déjà passé, et
-                # pas de `choices`. La 0.23.0 l'ignorait — réponse vide, run « réussi » (0.23.1).
-                raise stream_error(self.config.provider, event["error"])
-            model = event.get("model") or model
-            if isinstance(event.get("usage"), dict):
-                usage_raw = event["usage"]
-            choices = event.get("choices") or []
-            if not choices:
-                continue
-            raison_brute = choices[0].get("finish_reason") or raison_brute
-            delta = choices[0].get("delta") or {}
-            fragment = delta.get("content")
-            if fragment:
-                text_parts.append(fragment)
-                yield StreamChunk(type="text", text=fragment)
-            reasoning = delta.get("reasoning_content")
-            if reasoning:
-                reasoning_parts.append(reasoning)
-            for tc in delta.get("tool_calls") or []:
-                index = tc.get("index", 0)
-                # Un NOUVEL index ouvre : les appels d'index inférieur sont
-                # COMPLETS (OpenAI streame les arguments d'un appel d'un bloc,
-                # index par index). On les émet tout de suite — le dernier ne
-                # peut être connu complet qu'à la fin du flux.
-                for fini in sorted(k for k in tool_deltas if k < index and k not in emis):
-                    emis.add(fini)
-                    yield StreamChunk(type="tool_call", tool_call=_assemble(fini, tool_deltas[fini]))
-                slot = tool_deltas.setdefault(
-                    index, {"id": None, "name": "", "arguments": ""}
-                )
-                if tc.get("id"):
-                    slot["id"] = tc["id"]
-                function = tc.get("function") or {}
-                if function.get("name"):
-                    slot["name"] = function["name"]
-                if function.get("arguments"):
-                    slot["arguments"] += function["arguments"]
+            signals=fin,
+        )
+        try:
+            for event in evenements:
+                if event.get("error"):
+                    # Erreur annoncée DANS le flux (OpenRouter, passerelles) : statut 200 déjà passé, et
+                    # pas de `choices`. La 0.23.0 l'ignorait — réponse vide, run « réussi » (0.23.1).
+                    raise stream_error(self.config.provider, event["error"])
+                model = event.get("model") or model
+                if isinstance(event.get("usage"), dict):
+                    usage_raw = event["usage"]
+                choices = event.get("choices") or []
+                if not choices:
+                    continue
+                raison_brute = choices[0].get("finish_reason") or raison_brute
+                delta = choices[0].get("delta") or {}
+                fragment = delta.get("content")
+                if fragment:
+                    text_parts.append(fragment)
+                    yield StreamChunk(type="text", text=fragment)
+                reasoning = delta.get("reasoning_content")
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+                for tc in delta.get("tool_calls") or []:
+                    index = tc.get("index", 0)
+                    # Un NOUVEL index ouvre : les appels d'index inférieur sont
+                    # COMPLETS (OpenAI streame les arguments d'un appel d'un bloc,
+                    # index par index). On les émet tout de suite — le dernier ne
+                    # peut être connu complet qu'à la fin du flux.
+                    for fini in sorted(k for k in tool_deltas if k < index and k not in emis):
+                        emis.add(fini)
+                        yield StreamChunk(type="tool_call", tool_call=_assemble(fini, tool_deltas[fini]))
+                    slot = tool_deltas.setdefault(
+                        index, {"id": None, "name": "", "arguments": ""}
+                    )
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    function = tc.get("function") or {}
+                    if function.get("name"):
+                        slot["name"] = function["name"]
+                    if function.get("arguments"):
+                        slot["arguments"] += function["arguments"]
+        finally:
+            fermer_flux(evenements)
+
+        if fin.get("eof") and not fin.get("done") and raison_brute is None:
+            # 0.24.0 : le serveur a fermé PROPREMENT la réponse sans `[DONE]` ni `finish_reason` (un proxy, une
+            # passerelle qui coupe) : le texte reçu est TRONQUÉ. Le rendre comme une réponse, c'est faire entendre
+            # une phrase coupée comme si elle était complète — trouvé par le banc de pannes. On ne refuse que sur
+            # PREUVE (`eof` observé) : un `post_sse` remplacé par un test ne dit rien, et garde le comportement d'avant.
+            raise ProviderError(
+                f"{self.config.provider} stream ended before the answer was complete (no finish_reason, no "
+                "[DONE]): the answer is truncated",
+                retryable=True)
 
         tool_calls: list[ToolCall] = [_assemble(i, tool_deltas[i]) for i in sorted(tool_deltas)]
 

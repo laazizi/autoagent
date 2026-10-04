@@ -218,6 +218,13 @@ def post_json(
         try:
             response, scheme, host, port = _send(url, body, entetes, timeout, stream=False)
             data = response.read().decode("utf-8")
+        except UnicodeDecodeError as exc:
+            # 0.24.0 : un corps qui n'est pas de l'UTF-8 (une page de passerelle, un octet corrompu) levait cette
+            # exception BRUTE, que ni `ProviderError` ni le fail-over d'un hôte n'attrapent — trouvé par le banc de pannes.
+            raise ProviderError(
+                f"Provider returned a response body that is not valid UTF-8 ({exc.reason} at byte {exc.start})",
+                retryable=False,
+            ) from exc
         except _HTTPStatusError as exc:
             retryable = is_retryable_status(exc.code)
             if retryable and attempt < retries:  # 429/5xx: transient upstream — retry
@@ -262,6 +269,8 @@ def post_sse(
     headers: dict[str, str] | None = None,
     timeout: float = 60.0,
     retries: int = _DEFAULT_RETRIES,
+    *,
+    signals: dict[str, bool] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """POST a JSON body and yield parsed ``data:`` events from an SSE stream.
 
@@ -274,16 +283,25 @@ def post_sse(
 
     We yield the JSON-decoded payload of every ``data:`` line. Lines that
     aren't ``data:`` (``event:``, comments, blanks) are skipped. The
-    sentinel ``data: [DONE]`` (OpenAI-style) is swallowed — the iterator
-    just ends. Malformed ``data:`` payloads are skipped with a debug log
-    rather than aborting the whole stream.
+    sentinel ``data: [DONE]`` (OpenAI-style) is swallowed (it is recorded in
+    ``signals``) and reading goes on to the end of the response. Malformed
+    ``data:`` payloads — not JSON, or JSON that is not an object — are
+    skipped with a debug log rather than aborting the whole stream.
 
     Errors during the initial connection are retried with the same policy
     as ``post_json`` (429/5xx + transient network errors), then raise
-    ``ProviderError``. Errors mid-stream propagate as the underlying
-    exception so the caller's ``try/except`` around iteration can decide
-    what to do (the agent treats them as a failed turn) — a mid-stream
-    retry would replay already-yielded events, so we never do it here.
+    ``ProviderError``. A network failure MID-stream (connection reset, cut
+    chunk, read timeout) raises a ``ProviderError`` too (0.24.0 — it used to
+    propagate as the raw ``OSError`` / ``IncompleteRead``, which a host
+    catching ``ProviderError`` never saw; the original exception is
+    ``__cause__``, and ``retryable`` is True). A mid-stream retry would replay
+    already-yielded events, so we never do it here.
+
+    ``signals`` (0.24.0), when given, is filled with how the stream ENDED —
+    ``{"done": <a ``[DONE]`` sentinel was seen>, "eof": <the server closed the
+    response cleanly>}`` — so a provider can tell a stream that ended without
+    its terminal marker (a proxy that closed: the text is TRUNCATED) from a
+    complete one, without the events changing shape.
 
     The response is read to the end (or the connection discarded on error)
     so the persistent connection can be reused by the next call.
@@ -296,6 +314,8 @@ def post_sse(
         "content-length": str(len(body)),
         **(headers or {}),
     }
+    if signals is not None:
+        signals.update({"done": False, "eof": False})
     _log.debug("POST(SSE) %s (timeout=%s)", url, timeout)
     parts = urlsplit(url)
     response = None
@@ -336,21 +356,41 @@ def post_sse(
         while True:
             raw_line = response.readline()
             if not raw_line:
+                if signals is not None:
+                    signals["eof"] = True
                 break
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line or not line.startswith("data:"):
                 continue
             data = line[len("data:") :].strip()
-            if not data or data == "[DONE]":
+            if data == "[DONE]":
+                if signals is not None:
+                    signals["done"] = True
+                continue
+            if not data:
                 continue
             try:
-                yield json.loads(data)
+                evenement = json.loads(data)
             except json.JSONDecodeError:
                 _log.debug("Skipping non-JSON SSE data line: %.120s", data)
                 continue
+            if not isinstance(evenement, dict):
+                # `null`, `[]`, `"x"`, `42` : pas un événement de fournisseur. Rendu tel quel, il faisait lever un
+                # `AttributeError` brut dans le fournisseur (`event.get(...)`) — jamais une exception brute (0.24.0).
+                _log.debug("Skipping non-object SSE data: %.120s", data)
+                continue
+            yield evenement
+    except (OSError, http.client.HTTPException) as exc:
+        # Une panne RÉSEAU en plein flux : la connexion n'est plus sûre, et l'hôte attend une `ProviderError`
+        # (contrat de `ProviderError` : « network-level failures — DNS, timeout, connection reset »).
+        _discard(scheme, host, port)
+        _log.warning("SSE stream interrupted for %s: %s", url, exc)
+        raise ProviderError(
+            f"Stream interrupted for {url}: {type(exc).__name__}: {exc}", retryable=True,
+        ) from exc
     except BaseException:
-        # Flux interrompu (erreur réseau, ou l'appelant a arrêté d'itérer) :
-        # la connexion n'est plus dans un état sûr pour être réutilisée.
+        # L'appelant a arrêté d'itérer (GeneratorExit), ou autre chose : la connexion n'est plus dans un état
+        # sûr pour être réutilisée.
         _discard(scheme, host, port)
         raise
     finally:
