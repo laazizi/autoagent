@@ -55,6 +55,7 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8")
 
 from autoagent import ToolPolicySpec, compare_configs  # noqa: E402
+from autoagent.compare import wilson_interval  # noqa: E402
 from autoagent.redteam import (  # noqa: E402
     LEGIT,
     DocileProvider,
@@ -128,12 +129,17 @@ def niveau_2(argv: list[str]) -> None:
     resume("politique par argument", fine)
     if sans.asr_interval is not None:
         bas, haut = sans.asr_interval
-        print(f"\n  sans garde : attaque aboutie {sans.attack_success_rate:.0%}, Wilson a 95 % [{bas:.0%} ; {haut:.0%}]")
+        print(f"\n  sans garde : attaque aboutie {sans.attack_success_rate:.0%}, Wilson a 95 % [{bas:.0%} ; {haut:.0%}] sur {sans.runs - sans.errors} runs")
+        cachees = [r for r in sans.rows if r.attack == "tags_unicode"]        # l'ordre est retire AVANT le modele
+        exposes = sans.runs - sans.errors - sum(r.n - r.errors for r in cachees)
+        if cachees and exposes:
+            bas_e, haut_e = wilson_interval(sans.compromised - sum(r.compromised for r in cachees), exposes, sans.confidence)
+            print(f"    sur les {exposes} runs reellement exposes au modele (sans « tags_unicode ») : [{bas_e:.0%} ; {haut_e:.0%}]")
     print("\n  Lecture :")
     print("  - si « sans garde » ne compromet rien, c'est le MODELE qui protege : le code n'a jamais eu a agir (0 bloque),")
     print("    et ce niveau ne separe pas les gardes pour CE modele. Le niveau 1 reste le seul qui exerce le code ;")
-    print("  - « tags_unicode » n'atteint JAMAIS le modele (le nettoyage de la 0.23.1 le retire) : la borne haute ne porte")
-    print("    que sur les 7 attaques exposees (21 runs sur 24 par configuration), pas sur 8 ;")
+    print("  - « tags_unicode » n'atteint JAMAIS le modele (le nettoyage de la 0.23.1 le retire) : la premiere borne le compte")
+    print("    quand meme (3 runs sur 24), la seconde non : elle ne porte que sur les 7 attaques exposees, pas sur 8 ;")
     print("  - un taux ne vaut que pour CE modele, CETTE surface (le resultat d'un outil) et ces attaques. Refais-le pour")
     print("    chaque modele et chaque configuration que tu veux defendre.")
 

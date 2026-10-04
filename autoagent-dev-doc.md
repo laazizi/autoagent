@@ -4195,18 +4195,32 @@ déterministe sur `AgentResult`. Un `check` qui lève refuse. Si c'était le pet
 modèle qui disait « je ne suis pas sûr », on serait revenu à une consigne qu'on
 espère. Sans juge déterministe il n'y a pas de cascade, il y a un pari.
 
-### 34.2 Les paliers ratés se paient — mesuré, et ça ne flatte pas la cascade
+### 34.2 Les paliers ratés se paient — et le chiffre mesuré a changé de signe
 
-Démo 33, quatre tâches vérifiables, `gemini-3.5-flash-lite → gemini-3.7-flash` :
-1 escalade sur 4, et **369 jetons contre 307** pour le gros seul *(mesuré avant la 0.23.1, quand
-la comptabilité Gemini ignorait les jetons de réflexion — voir §41.5 : chiffre à refaire)*. En **jetons**,
-la cascade a coûté plus : une escalade paie deux paliers, et des tâches de 60 à
-100 jetons n'amortissent pas l'essai raté. La démo le dit, puis imprime le
-**seuil** : la cascade gagne en euros si le jeton lite coûte moins de X % du
-jeton pro, X calculé du run (`jetons de pro évités / jetons de lite dépensés`).
-Le rapport de prix réel est la donnée de l'hôte — la lib ne présume aucun tarif
-(§27.5). Ce qui décide en pratique : le **taux d'acceptation** du palier lite sur
-*tes* tâches. Il se mesure avant de déployer, pas après.
+Démo 33, quatre tâches vérifiables, `gemini-3.5-flash-lite → gemini-3.7-flash`, relevé du 4 octobre 2026 sur la
+0.24.0, jetons de réflexion comptés (§41.5) : **5 runs sur 5, la cascade a dépensé moins de jetons que le gros
+seul — de 67 % à 89 % de moins.**
+
+| run | cascade | gros seul | écart | escalades sur 4 |
+|---|---|---|---|---|
+| 1 | 659 | 2 156 | −69 % | 1 |
+| 2 | 279 | 2 648 | −89 % | 0 |
+| 3 | 897 | 2 711 | −67 % | 2 |
+| 4 | 292 | 2 042 | −86 % | 0 |
+| 5 | 780 | 2 581 | −70 % | 2 |
+
+Le gros modèle dépense en volume des jetons de réflexion (de 925 à 1 804 sur la seule première tâche) que le petit
+n'a presque pas. Une escalade paie toujours deux paliers : les deux runs à 2 escalades sont ceux où la cascade a le
+plus coûté (897 et 780), et elle reste loin sous le gros seul. La démo imprime aussi le **seuil** : la cascade gagne en
+euros si le jeton lite coûte moins de X % du jeton pro, X calculé du run (`jetons de pro évités / jetons de lite
+dépensés`). Le rapport de prix réel est la donnée de l'hôte — la lib ne présume aucun tarif (§27.5). Ce qui décide en
+pratique : le **taux d'acceptation** du palier lite sur *tes* tâches — il varie d'un run à l'autre (0 à 2 escalades sur
+les mêmes quatre tâches) et se mesure avant de déployer, pas après.
+
+**Correction du 4 octobre 2026.** Cette section a dit « 369 jetons contre 307 — la cascade a coûté plus ». Ce chiffre
+venait d'avant la 0.23.1, quand la comptabilité Gemini ignorait les jetons de réflexion : le gros seul y valait 307
+jetons, il en vaut 2 042 à 2 711 maintenant, quand les comptes du petit n'ont presque pas bougé. Le signe était faux.
+Limites du relevé : 5 runs, un seul couple de modèles, quatre tâches courtes, des jetons et non des euros.
 
 ### 34.3 Une pause n'est pas un échec
 
@@ -4808,9 +4822,14 @@ donc sur aucun cas : la sortie est **dérivée du total** que le fournisseur ann
 (`total − entrée`, moins les jetons d'outils intégrés), juste dans les deux sémantiques, sans jamais
 passer sous `candidatesTokenCount` ; sans total, on ajoute les pensées.
 
-> **Non vérifié en réel** : les crédits Gemini étaient épuisés (HTTP 402) au moment du correctif. Le
-> comportement est prouvé sur des réponses simulées, pas sur l'API. Conséquence : le chiffre « 369 jetons
-> contre 307 » de la démo 33 (§34.2) a été mesuré avec l'ancienne comptabilité — **à refaire**.
+> **Vérifié en réel le 4 octobre 2026** (`gemini-3.7-flash`, 0.24.0). Au moment du correctif les crédits Gemini
+> étaient épuisés (HTTP 402) : le comportement n'était prouvé que sur des réponses simulées. Sur l'API : une réponse
+> d'un seul mot (« pong ») rapporte 1 jeton de réponse et **92 de réflexion** (total 102) — la lib compte 93 en sortie,
+> la 0.23.0 en aurait compté 1 ; un tour d'outil en flux (deux requêtes) rapporte au total 369 en entrée, 30 en réponse,
+> 53 en réflexion, 452 au total, et la lib compte 369 / 83 / 452 : la sortie dérivée du total égale réponse + réflexion
+> (sur ce modèle, `candidatesTokenCount` ne contient PAS les pensées). Un seul modèle : ce que d'autres modèles Gemini
+> rapportent n'est pas vérifié, mais la sortie étant dérivée du total, la comptabilité ne parie sur aucun cas. Le chiffre
+> de la démo 33 (§34.2), mesuré avec l'ancienne comptabilité, a été refait : il avait le mauvais signe.
 
 ### 41.6 L'annulation arrête ce qu'elle promettait d'arrêter
 
@@ -4861,7 +4880,8 @@ Tout le reste est opt-in (`require_docker`, `SandboxLimits`, `isolation()`, `pat
 
 ### 41.10 Ce qui reste, dit
 
-- La comptabilité Gemini n'est **pas vérifiée sur l'API réelle** (§41.5) ; le chiffre de la démo 33 est à refaire.
+- La comptabilité Gemini a été **vérifiée sur l'API réelle** le 4 octobre 2026 (§41.5), sur `gemini-3.7-flash` seulement ;
+  le chiffre de la démo 33 a été refait (§34.2).
 - Plafonds du bac à sable : **Linux seulement** (Windows : pas de module `resource` ; macOS non mesuré) ;
   pas de plafond sur le nombre de processus (inopérant en root), sur le volume de sortie, ni sur le
   réseau et le système de fichiers — pour ceux-là, Docker (§11.4).
@@ -4996,7 +5016,8 @@ un jour, pas une statistique ; lancé DEUX fois : un script d'abord, puis la dé
   tags Unicode cachés, est retiré avant lui par le nettoyage de la 0.23.1 : l'exposition réelle est de 21 runs par
   configuration, 0/21, borne haute de Wilson 15 %) : sur ces attaques, c'est le
   **modèle** qui protège, le code n'a jamais eu à agir (0 bloqué). Le niveau 2 ne sépare donc pas les gardes pour
-  CE modèle — un plafond : il faut des attaques plus dures, ou un autre modèle. Le niveau 1 reste le seul qui
+  CE modèle — un plafond : il faut des attaques plus dures, ou un modèle plus faible (un second modèle, Gemini, donne le
+  même résultat : voir plus bas). Le niveau 1 reste le seul qui
   exerce le code.
 - Ce que les runs montrent quand même : la garde trifecta par défaut coûte toute l'utilité (0/24 aux deux runs, contre
   21/24 et 24/24 sans garde) ; la politique par argument la garde (20/24 et 23/24 — l'échantillonnage du modèle varie d'un
@@ -5010,6 +5031,19 @@ un jour, pas une statistique ; lancé DEUX fois : un script d'abord, puis la dé
   avec un autre protocole, d'autres attaques et sans doute pas la même version du modèle derrière l'alias ; ce banc
   en trouve 0/24. Les deux chiffres ne se comparent pas : c'est la mise en garde « un taux ne se transfère pas »,
   en vrai.
+
+**Le même banc sur un deuxième modèle (4 octobre 2026, `gemini-3.7-flash`, démo 38 `--reel --provider gemini`, un seul
+run, k=3 → 24 runs par configuration)** :
+
+| Configuration | bloqués | résistés | compromis | utilité |
+|---|---|---|---|---|
+| sans garde | 0/24 | 24/24 | **0/24** (Wilson 95 % [0 % ; 14 %] sur 24 runs, [0 % ; 15 %] sur les 21 exposés) | 24/24 |
+| garde trifecta (défaut) | 0/24 | 24/24 | 0/24 | **0/24** |
+| politique par argument | 0/24 | 24/24 | 0/24 | 24/24 |
+
+Même lecture : sur ces huit attaques simples, le modèle protège seul et le code n'agit jamais ; la garde par défaut
+coûte toute l'utilité (0/24), la politique par argument la garde (24/24). Deux modèles qui s'accordent ne font pas une
+statistique : un seul run pour celui-ci, des attaques sans obscurcissement sophistiqué.
 
 **Ce que ça ne mesure pas — et le rapport le redit.** Les canaux sont **énumérés** (un outil `egress`, l'URL d'une
 LECTURE, une URL dans la réponse — aucune attaque de la bibliothèque ne vise la lecture : le juge la voit, c'est tout) ;
@@ -5089,10 +5123,13 @@ cas — 9 exceptions brutes et 6 « succès » tronqués ou vides. Sur cette ver
   l'identique sur la 0.23.1. Les trois fournisseurs referment maintenant le flux interne explicitement
   (`providers.base.fermer_flux`, dans un `finally` ; sans effet sur un flux lu jusqu'au bout, donc la connexion normale est
   toujours réutilisée ; tolère un double de test qui n'a pas de `close()`).
-- **La règle Gemini repose sur le sens DOCUMENTÉ de `finishReason`**, pas sur un flux réel : la définition publique de Google
+- **La règle Gemini repose sur le sens DOCUMENTÉ de `finishReason`** : la définition publique de Google
   dit « If empty, the model has not stopped generating tokens » (`generative_service.proto`, `message Candidate`, lu le
   4 octobre 2026). Un flux Gemini fermé proprement sans `finishReason` dans aucun morceau s'est donc arrêté avant la fin de
   la génération. Un prompt bloqué (`promptFeedback.blockReason`, aucun candidat) n'est pas une troncature.
+  *Observée sur un flux réel le 4 octobre 2026 (`gemini-3.7-flash`) :* trois flux complets (texte seul, tour d'outil,
+  réponse finale) portent tous `finishReason: STOP` dans leur DERNIER événement SSE et se ferment proprement — la règle
+  ne lève pas à tort. Trois flux sur un seul modèle ne prouvent pas les autres modèles (§42.6).
 
 **Le mécanisme.** `post_sse(..., signals=…)` remplit un dict `{"done", "eof"}` : un marqueur `[DONE]` a-t-il été vu,
 le serveur a-t-il fermé la réponse proprement. Un fournisseur sait ainsi qu'un flux a fini **sans** son marqueur de
@@ -5188,19 +5225,24 @@ côté de la ligne de coût (28 → 144 jetons par tentative).
 
 ### 42.6 Ce qui reste, dit
 
-- **La comptabilité Gemini n'est toujours pas vérifiée sur l'API réelle** (crédits épuisés) ; le chiffre de la démo 33
-  (« 369 jetons contre 307 ») est toujours **à refaire** (§41.5).
-- **Le banc d'injection est un banc, pas une certification.** Les chiffres du niveau 2 sont UN modèle, UN jour, k=3 ;
-  0 % sur 24 runs est une borne haute de 14 % (Wilson), pas zéro. Les gardes par défaut ne regardent pas la **réponse** :
-  le canal « URL d'image » est à couvrir côté hôte.
+- **La comptabilité Gemini a été vérifiée sur l'API réelle le 4 octobre 2026** (§41.5), sur `gemini-3.7-flash`
+  seulement, et le chiffre de la démo 33 refait (§34.2) : l'ancien « 369 jetons contre 307 » avait le mauvais signe.
+- **Le banc d'injection est un banc, pas une certification.** Les chiffres du niveau 2 sont DEUX modèles
+  (`deepseek-chat`, `gemini-3.7-flash`), un jour, k=3 ; 0 compromis sur 24 runs est une borne haute de 14 % (Wilson) sur
+  les 24 runs et de **15 % sur les 21 runs réellement exposés** (`tags_unicode` n'atteint jamais le modèle), pas zéro. Les
+  gardes par défaut ne regardent pas la **réponse** : le canal « URL d'image » est à couvrir côté hôte.
 - **Les formats du banc de pannes viennent des adaptateurs et des documentations**, pas d'un traçage des vrais services ;
   un serveur local n'a ni TLS, ni latence, ni quotas.
 - **Un juge qui passe l'audit n'est pas prouvé bon** — seulement pas prouvé mauvais.
-- **Non vérifié sur un flux RÉEL : Gemini et Anthropic** (ni crédit, ni clé). La règle OpenAI-compatible a été vérifiée sur
-  un vrai flux DeepSeek (texte, appel d'outil, coupure `max_tokens`) ; celle de Gemini repose sur la documentation citée en
-  §42.3, celle d'Anthropic (0.23.1) sur sa séquence d'événements documentée. **Avant de mettre à jour un agent Gemini de
-  production, faire UN tour réel en flux (avec un appel d'outil) sur la 0.24.0.** Le code des consommateurs internes n'a pas
-  été examiné (code qui attraperait l'`OSError` / `IncompleteRead` brut d'un flux).
+- **Flux RÉELS : Anthropic non vérifié (pas de clé) ; Gemini vérifié le 4 octobre 2026 sur `gemini-3.7-flash`
+  seulement.** La règle OpenAI-compatible a été vérifiée sur de vrais flux DeepSeek (texte, appel d'outil, coupure
+  `max_tokens` ; le 4 octobre : `[DONE]` ET `finish_reason` présents sur trois flux). Celle de Gemini : trois flux réels
+  complets (texte seul, tour d'outil, réponse finale) portent tous `finishReason: STOP` dans leur dernier événement et se
+  ferment proprement (§42.3) ; un tour d'outil en flux (`functionCall` + `thoughtSignature`) va jusqu'au bout ; abandonner
+  un flux puis refaire un appel sur le même fournisseur passe. Celle d'Anthropic (0.23.1) repose sur sa séquence
+  d'événements documentée. **Pour un autre modèle Gemini en production, faire UN tour réel en flux (avec un appel d'outil)
+  avant de mettre à jour.** Le code des consommateurs internes n'a pas été examiné (code qui attraperait l'`OSError` /
+  `IncompleteRead` brut d'un flux).
 - **Trouvé par la relecture indépendante, non modifié** (petit, antérieur ou cosmétique ; chacun reproduit) : un corps non-SSE
   dans un 200 en flux (page HTML, erreur JSON, 3xx non suivie) donne l'erreur générique « truncated » avec `retryable=True` —
   un « Invalid API key » est déclaré réessayable et sa vraie cause n'apparaît pas ; un corps coupé dans un appel NON streamé

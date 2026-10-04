@@ -24,7 +24,9 @@ Working method that has proven itself on this codebase:
    bug. For LLM-facing behavior, a real-provider smoke run has repeatedly
    found bugs unit tests missed (new-conversation detection, embedding
    model 404s…).
-3. **Never add a dependency.** stdlib + `jsonschema`. Optional
+3. **Never add a dependency.** stdlib only: the core has had zero
+   runtime dependencies since 0.21.0 (`autoagent/validation.py` replaced
+   `jsonschema`, which is now a `dev` extra). Optional
    integrations = lazy import + `pyproject` extra (see `otel.py`).
 4. **Keep the failure contracts** — observability fails open, security
    fails closed, tool exceptions become tool errors.

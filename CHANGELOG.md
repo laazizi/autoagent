@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Documentation and demos only — nothing in the `autoagent` package changes.
+
+### Fixed
+
+- **The measurement behind demo 33 (`cascade()`) had the wrong sign.** The README, the demos README, the dev-doc
+  (§34.2) and the builder said "369 tokens vs 307 — the cascade cost MORE". That figure predates the 0.23.1 Gemini
+  accounting, which ignored thinking tokens: the big model alone counted 307 tokens then, 2 042–2 711 now, while the
+  small model's counts barely moved. Re-measured on 4 Oct 2026 on 0.24.0 (5 real runs of the four tasks,
+  `gemini-3.5-flash-lite` → `gemini-3.7-flash`): the cascade spent **67 % to 89 % fewer tokens** (279–897 vs
+  2 042–2 711), with 0 to 2 escalations per run. Tokens, not euros; 5 runs, one pair of models, four short tasks.
+- **Demo 38, level 2: the printed Wilson bound.** The interval covers every run that reached a verdict (24:
+  `tags_unicode` never reaches the model, so 3 of them expose nothing), while the demo's own note spoke of the 21
+  exposed runs. The demo now prints both — [0 % ; 14 %] on 24 runs and [0 % ; 15 %] on the 21 exposed ones.
+  `InjectionReport.asr_interval` is unchanged: like `attack_success_rate`, it covers every run with a verdict.
+- `.claude/skills/autoagent-dev/SKILL.md` still said "stdlib + `jsonschema`": the core has had no runtime dependency
+  since 0.21.0 (`jsonschema` is a `dev` extra).
+
+### Verified on a real provider (4 Oct 2026; `gemini-3.7-flash` and DeepSeek)
+
+These close items of the 0.24.0 "Not done, or not verified" list. No code change.
+
+- **Gemini real streams (the 0.24.0 truncation rule).** Three complete streams (text only, a tool turn, the final
+  answer) all carry `finishReason: STOP` in their LAST SSE event and close cleanly: the rule does not raise on a
+  complete answer. A streamed tool turn (`functionCall` + `thoughtSignature`) runs to the end; abandoning a stream, then
+  calling the same provider again, works. One model, three streams: not a proof for the other models.
+  **Anthropic is still unverified** (no key).
+- **DeepSeek real streams:** `[DONE]` AND `finish_reason` present on three streams (text, tool call, final answer).
+- **Gemini thinking-token accounting (0.23.1).** A one-word answer reports 1 answer token and 92 thinking tokens
+  (total 102): the library counts 93, 0.23.0 would have counted 1. A streamed tool turn (two requests) reports
+  369 / 30 / 53 / 452 (input / answer / thinking / total), the library 369 / 83 / 452. On this model
+  `candidatesTokenCount` does not contain the thoughts.
+- **Demo 32 on Gemini:** 5.5 s → 4.0 s (−27 %), 2 tools launched early (the doc said 6.1 s → 4.3 s).
+- **Injection bench, level 2, on Gemini** (`gemini-3.7-flash`, k=3, 72 runs, one run): 0/24 compromised in the three
+  configurations, 0 blocked; utility 24/24 with no guard, **0/24** with the default trifecta guard, 24/24 with the
+  per-argument policy. Same reading as DeepSeek: the model protects on these eight simple attacks, level 2 cannot rank
+  the guards.
+
 ## [0.24.0] - 2026-10-04
 
 **0.24.0 teaches the library to measure itself before you believe it: what your guards
