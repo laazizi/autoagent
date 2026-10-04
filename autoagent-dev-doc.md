@@ -61,6 +61,7 @@
 40. [Le journal durable — une coupure brutale ne refait jamais un effet](#40-le-journal-durable--une-coupure-brutale-ne-refait-jamais-un-effet) *(0.23.0)*
 41. [0.23.1 — correctifs : des défauts reproduits, un bac à sable qui dit ce qu'il garantit](#41-0231--correctifs--des-défauts-reproduits-un-bac-à-sable-qui-dit-ce-quil-garantit) *(0.23.1)*
 42. [0.24.0 — se mesurer : un banc d'injection, un banc de pannes, un juge audité, des durées](#42-0240--se-mesurer--un-banc-dinjection-un-banc-de-pannes-un-juge-audité-des-durées) *(0.24.0)*
+43. [Le code comme action en une ligne — `enable_code_action()`](#43-le-code-comme-action-en-une-ligne--enable_code_action) *(non publiée)*
 
 ---
 
@@ -5273,6 +5274,73 @@ côté de la ligne de coût (28 → 144 jetons par tentative).
   sous-agent (`as_tool`) devient une erreur d'outil ; `max_repeated_tool_calls` compte sur TOUT le run ; ni délai par outil
   ni durée totale de run ; `MaxStepsExceeded` ne porte pas de réponse ; un `post_turn_hook` épuisé livre la réponse
   fautive en « ok ».
+
+## 43. Le code comme action en une ligne — `enable_code_action()`
+
+**Le constat (banc d'efficacité, `evals/eval_efficacite.py`).** Vingt tâches d'un usage de données de mobilité
+(extraction d'une réponse d'enquête, codification dans une nomenclature, SQL, gros journaux et export CSV, plusieurs
+étapes), données simulées, juges en code audités par `audit_check`. Avec la lib telle quelle, 92 à 97 % des jetons
+sont de l'ENTRÉE — ce que la boucle renvoie au modèle — et les six tâches à gros résultat en font 76 %
+(`deepseek-chat`) à 86 % (`gemini-3.7-flash`). Chaque levier de la lib, SEUL, contre les défauts (k=3, runs successifs) :
+
+| levier | `deepseek-chat` | `gemini-3.7-flash` |
+|---|---|---|
+| code comme action (câblé à la main + une consigne) | 60/60 (avant 56) · jetons −17 % · durée méd. +12 % | 60/60 · jetons −49 % · +4 % |
+| `max_tool_result_chars=4000` | 47/60 (−9) | 50/60 (−10) · jetons +96 % |
+| `prune_tool_results_after=1` | 57/60 · jetons +24 % | 60/60 · −2 % · durée +19 % |
+| `parallel_tool_calls=True` | ≈ pareil | ≈ pareil (outils locaux instantanés : rien à gagner ici) |
+
+Couper un journal fait perdre ce qu'il faut compter (le modèle recommence, souvent jusqu'au plafond d'étapes) ;
+élaguer fait relire. Seul le code comme action gagne — mais câblé à la main il coûtait ~500 jetons d'entrée de plus à
+CHAQUE étape (la liste des fonctions de l'hôte dans la description, et la consigne), et il perdait les drapeaux de
+sécurité.
+
+**L'API.**
+
+```python
+agent.enable_code_action()   # sandbox=None, tools=None, timeout=10.0, max_runs_per_run=10, hint=True
+```
+
+Le modèle écrit `def run(args, context)` ; `context["call_host"](nom, {...})` appelle un outil de l'agent et rend son
+résultat brut ; seul ce que `run()` rend revient dans la conversation.
+
+- **Par le registre.** Chaque outil est appelé comme un appel direct : validation du schéma, contexte de l'hôte, échec
+  → exception rendue au programme ; et le MÊME `ToolSpec` pour la porte (§39) : `egress`, `untrusted`, `tool_policy`
+  avec `ctx.source == "host_function"`. Câblé à la main (`PythonRunner(host_functions={...})`), un outil enregistré
+  par `agent.tool(f, egress=True)` perd son drapeau — la porte le lit sur la FONCTION — et l'envoi part après une
+  lecture non fiable : `tests/test_code_action.py` le reproduit.
+- **Résolus à chaque programme** (un outil enregistré après est disponible) ; `tools=[...]` restreint la liste. Jamais
+  exposés : `run_python` lui-même, les outils écrits par le modèle, `create_python_tool`, `find_tools`, et les
+  sous-agents (`as_tool`, `delegate_to`) — appelés depuis un programme, leur dépense échapperait à `token_budget`.
+- **Description courte + une phrase de consigne.** Les outils sont déjà décrits dans la requête : la description ne
+  les reliste pas. Mais elle ne suffit pas à dire QUAND écrire un programme : sans consigne, `deepseek-chat` lisait
+  l'export CSV lui-même PUIS lançait un programme (sur un essai : 55 000 jetons d'entrée contre 18 000 sans l'outil).
+  `hint=True` ajoute `CODE_ACTION_HINT` au prompt système AU RENDU (`render_system_prompt`) : le `system_prompt` de
+  l'hôte n'est jamais modifié, un prompt callable la reçoit aussi. Surcoût mesuré sur une petite tâche : ~210 jetons
+  par étape, contre ~450 câblé à la main.
+- **Un chemin d'exécution de plus, sous contrat.** `appeler` (l'enveloppe d'un outil) est le seul `registry.execute`
+  hors de `_executer` ; `tests/test_gate.py` exige qu'il ne soit remis qu'au pont des fonctions de l'hôte, qui consulte
+  la porte AVANT de lancer. Huit mutations du code (drapeaux, exclusions, validation, contexte, résolution, liste,
+  description) font chacune échouer `tests/test_code_action.py`.
+
+**Confirmé** avec `compare_configs` (§38) : 20 tâches x 3 répétitions par bras, bras ALTERNÉS, `deepseek-chat`,
+le 4 octobre 2026 :
+
+| | telle quelle | `enable_code_action()` |
+|---|---|---|
+| réussite | 57/60 | 59/60 (écart non significatif, p = 0,55) |
+| jetons par tentative | 4 861 | 3 589 — **−26 %**, intervalle bootstrap [−35 % ; −18 %] |
+| durée médiane d'une tentative | 1,72 s | 1,71 s (−1 %, [−8 % ; +5 %]) |
+
+Par famille : plusieurs étapes −74 %, gros résultat −17 %, mais codification +27 %, SQL +59 %, extraction +95 % :
+**à activer pour un agent dont les outils rendent de gros résultats**, pas pour un agent d'extraction.
+
+**Ce qui reste, dit.** Pas confirmé sous cette forme sur Gemini : la version câblée à la main y gagnait 49 % (runs
+successifs, 60/60) ; la confirmation a échoué — HTTP 402 à chaque tentative, crédit épuisé — et `compare_configs` l'a
+signalé (« vérifier l'infrastructure avant de conclure ») au lieu de conclure. Vingt tâches courtes, simulées, k=3 :
+un écart de réussite de moins de ≈30 points n'est pas détectable. `SubprocessSandbox` par défaut — une liste
+d'interdits, pas une frontière : en production, `sandbox=DockerSandbox(...)` et `tool_policy`. Pas encore dans le
+constructeur visuel.
 
 ---
 *Doc maintenue par l'équipe Alyce R&D. Pour questions, ouvrir une issue sur le repo interne ou taper l'auteur sur Slack.*

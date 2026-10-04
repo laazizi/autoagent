@@ -451,8 +451,12 @@ class TestStructure:
 
     def test_la_boucle_n_execute_un_outil_que_dans_la_porte(self) -> None:
         """Tout appel à `registry.execute` du paquet : la boucle (dans `_executer`, qui pose la
-        porte) et les deux enveloppes de record/replay. Un nouvel appelant fait échouer ce test."""
-        attendus = {("agent.py", "_executer"), ("registry.py", "execute"), ("replay.py", "execute")}
+        porte), les deux enveloppes de record/replay, et `appeler` (0.25.0, `enable_code_action`) :
+        un outil enregistré vu comme FONCTION DE L'HÔTE, que seul le pont du bac à sable lance —
+        APRÈS la décision de la porte (voir le test suivant et `test_appeler_n_est_remis_qu_au_pont`).
+        Un nouvel appelant fait échouer ce test."""
+        attendus = {("agent.py", "_executer"), ("registry.py", "execute"), ("replay.py", "execute"),
+                    ("agent.py", "appeler")}
         trouves: set[tuple[str, str]] = set()
         for fichier, arbre in _sources().items():
             englobante = _fonctions_englobantes(arbre)
@@ -462,3 +466,20 @@ class TestStructure:
         corps = next(n for n in ast.walk(_sources()["agent.py"])
                      if isinstance(n, ast.FunctionDef) and n.name == "_executer")
         assert _appels(corps, "gate_scope"), "`_executer` doit poser la porte autour de l'exécution"
+
+    def test_appeler_n_est_remis_qu_au_pont(self) -> None:
+        """`appeler` exécute un outil hors de `_executer` : il ne doit atteindre QUE le pont des fonctions
+        de l'hôte, qui décide avant de lancer. Structure exigée : `_par_le_registre` n'est construit que
+        dans `_outils_pour_le_code`, et celle-ci n'alimente que `runner.host_functions` (dans le
+        `run_python` d'`enable_code_action`)."""
+        arbre = _sources()["agent.py"]
+        englobante = _fonctions_englobantes(arbre)
+        constructions = {englobante[a.lineno] for a in _appels(arbre, "_par_le_registre")}
+        assert constructions == {"_outils_pour_le_code"}, constructions
+        utilisations = _appels(arbre, "_outils_pour_le_code")
+        assert {englobante[a.lineno] for a in utilisations} == {"run_python"}
+        affectations = [n for n in ast.walk(arbre) if isinstance(n, ast.Assign)
+                        and any(isinstance(v, ast.Call) and v in utilisations for v in ast.walk(n.value))]
+        assert len(affectations) == len(utilisations) == 1
+        cible = affectations[0].targets[0]
+        assert isinstance(cible, ast.Attribute) and cible.attr == "host_functions", ast.dump(cible)

@@ -717,6 +717,7 @@ class Agent:
         self.dynamic_builder: DynamicToolBuilder | None = None
         self._dynamic_tools_built_this_run = 0
         self._python_runs_this_run = 0
+        self._consigne_code: str | None = None          # `enable_code_action(hint=True)` : voir render_system_prompt
         # Noms des outils ÉCRITS PAR LE MODÈLE : eux seuls peuvent être remplacés
         # par un nouvel outil généré (re-créer pour corriger). Un outil de l'hôte,
         # jamais — voir `enable_dynamic_tools` (0.22.0).
@@ -960,6 +961,83 @@ class Agent:
             return runner(code, args)
 
         self.registry.replace(spec=_run_python_spec(runner.describe_host_functions()), handler=run_python)
+
+    def enable_code_action(
+        self,
+        sandbox: Any = None,
+        *,
+        tools: Sequence[str] | None = None,
+        timeout: float = 10.0,
+        max_runs_per_run: int = 10,
+        hint: bool = True,
+    ) -> None:
+        """Le « code comme action » en UNE ligne (0.25.0) : le modèle écrit un court programme qui
+        appelle les outils de CET agent — et seul ce que le programme rend revient dans la conversation.
+
+        Mesuré sur `evals/eval_efficacite.py` (20 tâches, k=3) : quand un outil rend un GROS résultat
+        (un journal, un export CSV), le lire en entier le renvoie au modèle à chaque étape ; le programme
+        le garde dans le bac à sable et ne rend que le compte. `enable_run_python(PythonRunner(
+        host_functions=...))` le permettait déjà, mais il fallait recâbler chaque outil à la main — et
+        un outil enregistré par `agent.tool(f, egress=True)` y perdait son drapeau : la porte ne lit
+        les drapeaux que sur la FONCTION, l'agent les garde dans son registre.
+
+        Ici chaque outil passe par le REGISTRE : même validation des arguments qu'un appel direct,
+        même contexte de l'hôte, et le même `ToolSpec` pour la porte (`gate.py`) — `egress`,
+        `untrusted`, `tool_policy` (avec `ctx.source == "host_function"`) s'appliquent comme pour un
+        appel direct. Les outils sont résolus À CHAQUE programme : un outil enregistré après cet appel
+        est disponible. Ne sont jamais exposés : `run_python` lui-même, les outils écrits par le modèle,
+        `create_python_tool`, `find_tools`, et les sous-agents (`as_tool`, `delegate_to`) — appelés
+        depuis un programme, leur dépense échapperait à `token_budget`.
+
+        La description de l'outil est COURTE : les outils sont déjà décrits dans la requête, les relister
+        coûtait des centaines de jetons à CHAQUE étape (mesuré). Mais une description ne suffit pas à dire
+        QUAND s'en servir : sans consigne, `deepseek-chat` lisait le gros résultat lui-même PUIS lançait un
+        programme — plus cher que sans l'outil (mesuré sur un essai : 55 000 jetons d'entrée contre 18 000 sur un
+        export CSV).
+        `hint=True` ajoute donc UNE phrase au prompt système, au rendu (`render_system_prompt`) : le
+        `system_prompt` de l'hôte n'est jamais modifié.
+
+        Args:
+            sandbox: le bac à sable (`SubprocessSandbox` par défaut — une liste d'interdits, PAS une
+                frontière : passe `DockerSandbox(...)` pour du code que tu ne maîtrises pas).
+            tools: les noms des outils exposés au programme ; `None` = tous ceux de l'agent.
+            timeout: secondes accordées à un programme.
+            max_runs_per_run: programmes permis par run (les échecs comptent).
+            hint: ajoute au prompt système la phrase `CODE_ACTION_HINT` (dit au modèle QUAND écrire un
+                programme plutôt que lire un gros résultat). `False` : l'hôte le dit lui-même.
+        """
+        runner = PythonRunner(sandbox, timeout=timeout)
+        noms = None if tools is None else frozenset(tools)
+        self.python_runner = runner
+        self.max_python_runs_per_run = max(1, int(max_runs_per_run))
+        self._consigne_code = CODE_ACTION_HINT if hint else None
+
+        def run_python(code: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
+            if self._python_runs_this_run >= self.max_python_runs_per_run:
+                raise ToolError(
+                    "run_python budget exhausted for this run "
+                    f"(max_runs_per_run={self.max_python_runs_per_run}). "
+                    "Finish the task with what you have."
+                )
+            self._python_runs_this_run += 1
+            runner.host_functions = self._outils_pour_le_code(noms) or None
+            return runner(code, args)
+
+        self.registry.replace(spec=_code_action_spec(), handler=run_python)
+
+    def _outils_pour_le_code(self, noms: frozenset[str] | None) -> dict[str, Callable[..., Any]]:
+        """Les outils de l'agent vus comme fonctions de l'hôte par le code du modèle (`enable_code_action`)."""
+        fonctions: dict[str, Callable[..., Any]] = {}
+        for spec in self.registry.specs():
+            nom = spec.name
+            if nom in _PAS_POUR_LE_CODE or nom in self._dynamic_tool_names:
+                continue
+            if noms is not None and nom not in noms:
+                continue
+            if getattr(self.registry.handler_for(nom), "__autoagent_usage_channel__", None) is not None:
+                continue                        # un sous-agent : sa dépense ne serait pas comptée
+            fonctions[nom] = _par_le_registre(self.registry, spec)
+        return fonctions
 
     def _charger_bibliotheque(self, builder: DynamicToolBuilder) -> None:
         """Remet dans le registre les outils générés ACCEPTÉS lors de runs précédents
@@ -1337,9 +1415,11 @@ class Agent:
                 resolved = prompt()
             except Exception:
                 _log.exception("system_prompt callable raised; falling back to DEFAULT_SYSTEM_PROMPT")
-                return DEFAULT_SYSTEM_PROMPT
-            return str(resolved) if resolved is not None else DEFAULT_SYSTEM_PROMPT
-        return prompt
+                resolved = DEFAULT_SYSTEM_PROMPT
+            prompt = str(resolved) if resolved is not None else DEFAULT_SYSTEM_PROMPT
+        # `enable_code_action(hint=True)` : UNE phrase, ajoutée ici et jamais écrite dans `system_prompt`
+        # (le prompt de l'hôte reste le sien ; un prompt callable la reçoit aussi à chaque run).
+        return f"{prompt}\n\n{self._consigne_code}" if self._consigne_code else prompt
 
     def run(
         self,
@@ -2516,6 +2596,64 @@ def _run_python_spec(host_functions_text: str = ""):
         },
         permissions=[],
     )
+
+
+# La phrase que `enable_code_action(hint=True)` ajoute au prompt système (au rendu). Mesurée : sans elle,
+# la description seule ne suffisait pas à `deepseek-chat` pour préférer un programme sur un gros résultat.
+CODE_ACTION_HINT = (
+    "When an answer needs counting, adding up, sorting, filtering or searching inside a LARGE tool result "
+    "(a log, an export, many rows), do not read that result yourself: write one short program with the "
+    "run_python tool that calls the tools through context['call_host'] and returns only what you need."
+)
+
+# Jamais exposés au code du modèle par `enable_code_action` : l'outil lui-même (pas de récursion), le
+# constructeur d'outils et la recherche d'outils (des méta-outils, pas des actions de l'hôte).
+_PAS_POUR_LE_CODE = frozenset({"run_python", "create_python_tool", _FIND_TOOLS_NAME})
+
+
+def _code_action_spec() -> ToolSpec:
+    """La description COURTE de `run_python` pour `enable_code_action` : les outils appelables sont déjà
+    décrits dans la requête — ne pas les relister (mesuré : ~500 jetons de plus par étape avec la liste
+    et une consigne dans le prompt système, sur des tâches qui n'en avaient pas besoin)."""
+    return ToolSpec(
+        name="run_python",
+        description=(
+            "Run a short Python program in a sandbox: define `def run(args, context):` and return a "
+            "JSON-serializable value. Inside run(), context['call_host'](tool_name, {arguments}) calls any "
+            "of your other tools and returns its raw result (it raises if the tool fails). Use it to count, "
+            "add up, sort, filter or search inside LARGE tool results: only what run() returns comes back "
+            "to you. No network, no files."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "Python source defining def run(args, context): ..."},
+                "args": {"type": "object", "description": "Optional JSON object handed to run() as `args`."},
+            },
+            "required": ["code"],
+            "additionalProperties": False,
+        },
+        permissions=[],
+    )
+
+
+def _par_le_registre(registry: ToolRegistry, spec: ToolSpec) -> Callable[..., Any]:
+    """Un outil ENREGISTRÉ, vu comme fonction de l'hôte par le code du modèle : la même exécution qu'un
+    appel direct (validation du schéma, contexte de l'hôte, échec → exception rendue au programme) et le
+    même `ToolSpec` pour la porte — `egress` / `untrusted` ne se perdent pas en passant par le pont."""
+
+    def appeler(**arguments: Any) -> Any:
+        gate = active_gate()
+        resultat = registry.execute(ToolCall(id=f"code-{spec.name}", name=spec.name, arguments=arguments),
+                                    context=gate.context if gate is not None else None)
+        if not resultat.ok:
+            raise ToolError(resultat.error or f"{spec.name} failed")
+        return resultat.result
+
+    appeler.__name__ = spec.name
+    appeler.__doc__ = spec.description
+    appeler.__autoagent_tool_spec__ = spec  # type: ignore[attr-defined]
+    return appeler
 
 
 def delegate_to(

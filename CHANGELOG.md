@@ -7,9 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Documentation and demos only — nothing in the `autoagent` package changes.
+### Added
 
-### Fixed
+- **`Agent.enable_code_action()` — code as action, in one line.** The model writes one short program that calls
+  the agent's OWN tools through `context['call_host']`, and only what the program returns comes back into the
+  conversation: a 26 000-character CSV stays in the sandbox, the model reads the sum. Measured first on a new
+  efficiency bench (`evals/eval_efficacite.py`: 20 tasks from a mobility-data workload, simulated data, judges in
+  code audited by `audit_check`), each lever of the library alone against the defaults: code as action was the
+  only clear win; `max_tool_result_chars=4000` lost 9 and 10 successes out of 60 (the model loses what it must
+  count, then loops), `prune_tool_results_after=1` brought nothing, `parallel_tool_calls` cannot show anything
+  with instantaneous local tools.
+  - **Each tool goes through the REGISTRY**: the same argument validation and host context as a direct call, and
+    the same `ToolSpec` for the gate — an `egress` tool stays `egress`, an `untrusted` one still taints the run,
+    `tool_policy` sees `ctx.source == "host_function"`. Wiring the tool functions by hand into
+    `PythonRunner(host_functions=...)` loses the flags of a tool registered with `agent.tool(f, egress=True)` (the
+    gate reads them on the FUNCTION; `tests/test_code_action.py` reproduces the send that then goes out).
+  - Tools are resolved at each program (a tool registered later is available). Never exposed: `run_python`
+    itself, model-written tools, `create_python_tool`, `find_tools`, and sub-agents (`as_tool`, `delegate_to`) —
+    called from a program, their spend would escape `token_budget`.
+  - **Short tool description** (the tools are already described in the request: listing them again cost about
+    500 tokens at EVERY step on tasks that did not need it) **plus one system-prompt sentence** (`hint=True`,
+    `CODE_ACTION_HINT`, added at render time — the host's `system_prompt` is never modified). Without the
+    sentence, `deepseek-chat` read the large result itself THEN ran a program: 55 000 input tokens instead of
+    18 000 on one try.
+  - **Confirmed with `compare_configs`** (20 tasks x 3 repetitions per arm, arms alternating, `deepseek-chat`):
+    **−26 % tokens per attempt, bootstrap interval [−35 % ; −18 %]**; median latency 1.72 s → 1.71 s (−1 %,
+    [−8 % ; +5 %]); success 57/60 → 59/60, not significant (p = 0.55). By family: multi-step −74 %, large
+    results −17 %, but small tasks MORE expensive — SQL +59 %, extraction +95 %. Enable it for agents whose
+    tools return large results, not for an extraction agent.
+  - **Not verified on Gemini in its one-line form**: the hand-wired version measured −49 % tokens on
+    `gemini-3.7-flash` (sequential runs, 60/60), but the confirmation run failed — every attempt got HTTP 402
+    (credit exhausted); `compare_configs` flagged it ("check the infrastructure before concluding") instead of
+    concluding. Not in the visual builder yet.
+  - Security: `SubprocessSandbox` by default — an AST denylist, not a boundary. In production pass
+    `sandbox=DockerSandbox(...)` and keep the tools under `tool_policy`.
+
+### Fixed (documentation and demos)
 
 - **The measurement behind demo 33 (`cascade()`) had the wrong sign.** The README, the demos README, the dev-doc
   (§34.2) and the builder said "369 tokens vs 307 — the cascade cost MORE". That figure was taken before 0.23.1, when
