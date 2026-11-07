@@ -64,6 +64,7 @@ from .policy import ToolPolicySpec
 from .providers import (
     AnthropicProvider,
     DeepSeekProvider,
+    GeminiLiveProvider,
     GeminiProvider,
     LLMProvider,
     OpenAIProvider,
@@ -135,6 +136,7 @@ __all__ = [
     "DynamicToolBuilder",
     "EvolutionRuntime",
     "FactMemory",
+    "GeminiLiveProvider",
     "GeminiProvider",
     "LLMProvider",
     "LLMRequest",

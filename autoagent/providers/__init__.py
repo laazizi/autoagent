@@ -5,6 +5,7 @@ from autoagent.schema import ModelConfig
 from .anthropic import AnthropicProvider
 from .base import LLMProvider
 from .gemini import GeminiProvider
+from .gemini_live import GeminiLiveProvider
 from .openai import DeepSeekProvider, GroqProvider, OpenAIProvider
 from .routing import RoutingProvider
 
@@ -21,12 +22,15 @@ def create_provider(config: ModelConfig) -> LLMProvider:
         return GroqProvider(config)
     if provider in {"gemini", "google"}:
         return GeminiProvider(config)
+    if provider in {"gemini_live", "gemini-live"}:
+        return GeminiLiveProvider(config)
     raise ValueError(f"Unsupported provider: {config.provider}")
 
 
 __all__ = [
     "AnthropicProvider",
     "DeepSeekProvider",
+    "GeminiLiveProvider",
     "GeminiProvider",
     "GroqProvider",
     "LLMProvider",

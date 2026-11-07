@@ -62,6 +62,7 @@
 41. [0.23.1 — correctifs : des défauts reproduits, un bac à sable qui dit ce qu'il garantit](#41-0231--correctifs--des-défauts-reproduits-un-bac-à-sable-qui-dit-ce-quil-garantit) *(0.23.1)*
 42. [0.24.0 — se mesurer : un banc d'injection, un banc de pannes, un juge audité, des durées](#42-0240--se-mesurer--un-banc-dinjection-un-banc-de-pannes-un-juge-audité-des-durées) *(0.24.0)*
 43. [Le code comme action en une ligne — `enable_code_action()`](#43-le-code-comme-action-en-une-ligne--enable_code_action) *(non publiée)*
+44. [La voix en continu — Gemini Live sous la boucle](#44-la-voix-en-continu--gemini-live-sous-la-boucle) *(non publiée)*
 
 ---
 
@@ -2198,7 +2199,7 @@ Passe un `post_turn_hook` (§4.7) qui regarde `ctx.tool_calls` et retourne un `M
 
 ### Annexe A — Liste des fichiers de la lib
 
-*(vérifiée contre le disque à la 0.24.0 — `autoagent/` : 33 modules + `__init__.py` ; `providers/` : 5 modules + `__init__.py`)*
+*(vérifiée contre le disque sur `main` après la 0.24.0 — `autoagent/` : 34 modules + `__init__.py` ; `providers/` : 6 modules + `__init__.py`)*
 
 ```
 autoagent/
@@ -2254,6 +2255,7 @@ autoagent/
 ├── redteam.py               # 0.24.0 — banc d'injection à canari : run_injection_bench, positive_control,
 │                            # DocileProvider, injection_variant / injection_tasks (§42.1)
 ├── faults.py                # 0.24.0 — banc de pannes : FaultServer (vrai serveur HTTP local) + run_fault_bench (§42.2)
+├── ws.py                    # main (non publié) — client WebSocket synchrone RFC 6455, stdlib seule (§44)
 └── providers/
     ├── __init__.py          # create_provider (fabrique par nom)
     ├── base.py              # LLMProvider (ABC) + deep-merge de config.extra_body ;
@@ -2263,6 +2265,7 @@ autoagent/
     ├── anthropic.py         # blocs image, tool_choice, JSON best-effort
     ├── gemini.py            # inline_data, thought_signature (Gemini 3),
     │                        # functionResponse groupées sous role "user" (0.18)
+    ├── gemini_live.py       # main (non publié) — GeminiLiveProvider : la voix en continu sous la boucle (§44)
     └── routing.py           # RoutingProvider (dispatch par requête : texte → cheap, image → vision)
 ```
 
@@ -2323,6 +2326,7 @@ from autoagent import (
 
     # Providers (instances directes si besoin)
     AnthropicProvider, DeepSeekProvider, GeminiProvider, OpenAIProvider, LLMProvider,
+    GeminiLiveProvider,         # main (non publié) — la voix en continu (§44)
 
     # 0.16.0 — record / replay
     RecordSession, RecordingProvider, RecordingRegistry,
@@ -2352,6 +2356,7 @@ from autoagent.redteam import (                              # 0.24.0 — le ban
     DocileProvider, positive_control, run_injection_bench, standard_agent, injection_variant, injection_tasks, ATTACKS,
 )
 from autoagent.faults import FaultServer, run_fault_bench, FAULT_CASES      # 0.24.0 — le banc de pannes (§42.2)
+from autoagent.ws import WebSocketClient, WebSocketClosed, WebSocketError   # main (non publié) — WebSocket stdlib (§44)
 ```
 
 ### Annexe C — Cheat-sheet
@@ -5341,6 +5346,85 @@ signalé (« vérifier l'infrastructure avant de conclure ») au lieu de conclur
 un écart de réussite de moins de ≈30 points n'est pas détectable. `SubprocessSandbox` par défaut — une liste
 d'interdits, pas une frontière : en production, `sandbox=DockerSandbox(...)` et `tool_policy`. Pas encore dans le
 constructeur visuel.
+
+## 44. La voix en continu — Gemini Live sous la boucle
+
+*(sur `main`, non publiée)* Une conversation vocale n'est pas une suite de requêtes : le micro envoie en continu,
+le modèle répond quand il a fini d'écouter, et il peut demander un outil en pleine phrase. Jusqu'ici une boucle
+vocale tournait HORS de la bibliothèque (le superviseur du README la regarde de côté) — et ses appels d'outils
+échappaient donc à `tool_policy`, aux gardes, au journal. `GeminiLiveProvider` met la voix SOUS la boucle.
+
+**La conception : un fournisseur de plus, pas un module à part.** Il garde une connexion WebSocket ouverte, un fil
+lit le serveur, et `complete(request)` rend UNE réponse (texte et/ou appels d'outils) comme les autres fournisseurs.
+Chaque outil demandé à la voix traverse donc `_executer`, la porte (§39), les gardes, le journal (§40), la trace :
+aucun second chemin d'exécution — `tests/test_gate.py` n'a pas eu à changer.
+
+```python
+from autoagent import Agent, GeminiLiveProvider
+
+agent = Agent.from_model("gemini_live", "gemini-3.8-live", system_prompt="Tu es un petit robot.")
+
+@agent.tool
+def avancer(cm: float) -> dict:
+    """Fait avancer le robot de `cm` centimètres."""
+    ...
+
+live = agent.provider
+live.on_audio = haut_parleur.write            # PCM 16 bits mono 24 kHz, au fil de l'eau (fil de lecture)
+live.on_interrupted = haut_parleur.vider      # l'utilisateur coupe la parole
+live.open(agent.render_system_prompt(), agent.registry.specs())   # connecter AVANT d'ouvrir le micro
+# un fil du micro : live.send_audio(pcm_16k) en boucle (PCM 16 bits mono 16 kHz) ; live.send_image(jpeg) pour la caméra
+# un événement détecté par l'hôte (réflexe) : live.send_text("Ta caméra voit une pomme…") — le run en écoute rend la réponse
+while conversation:
+    resultat = agent.run(GeminiLiveProvider.LISTEN)   # attend que l'utilisateur parle, exécute les outils, rend la réponse
+```
+
+`LISTEN` est le message utilisateur qui n'envoie RIEN : le run attend la prochaine réponse du modèle, **sans limite**
+(quelqu'un peut se taire des minutes) ; `timeout` borne le silence du serveur une fois qu'il a commencé à répondre.
+Un autre texte part tel quel (`realtimeInput.text`) ; une `ImageAttachment` part en `realtimeInput.video`.
+
+**Ce qui a été observé sur l'API réelle (7 novembre 2026, `gemini-3.8-live`) et fixe le code** — la page de
+documentation était fausse ou muette sur trois points :
+
+| point | la page | l'API réelle |
+|---|---|---|
+| configuration | `setup.responseModalities` | **refusée** (fermeture 1007 « Unknown name ») ; valide : `setup.generationConfig.responseModalities` |
+| trames du serveur | — | le JSON arrive en trames **binaires** |
+| fin d'un tour avec outil | — | `toolCall` suivi IMMÉDIATEMENT de `generationComplete` puis `turnComplete`, avant que l'outil ait tourné ; la réponse parlée vient après la `toolResponse`, et son `turnComplete` arrive ≈ la durée de l'audio plus tard, avec `usageMetadata` |
+
+Le troisième point est un piège : prendre ce premier `turnComplete` pour la fin de la réponse rend une réponse
+**vide** après chaque outil. Le fournisseur absorbe la paire (jusqu'à `GRACE_S`, 2 s) avant de rendre les appels, et
+un run se termine sur `turnComplete`, pas sur `generationComplete` — c'est lui qui porte la consommation.
+
+**Le transport : `autoagent/ws.py`**, un client WebSocket synchrone écrit avec la seule bibliothèque standard
+(AGENTS.md : zéro dépendance). Envois protégés par un verrou (le micro envoie pendant que la boucle lit), attente en
+lecture par `select` — pas par un délai sur la socket, qui s'appliquerait aussi aux envois de l'autre fil. Trames
+invalides refusées avec le bon code (1002, 1007, 1009), taille maximale refusée dès l'en-tête, jamais la chaîne de
+requête dans un message d'erreur. La clé part dans l'en-tête `x-goog-api-key`, jamais dans l'URL.
+
+**Contrats** : une session fermée en pleine réponse est une `ProviderError` typée — `retryable` selon le code (1007
+charge invalide et 1008 politique : non ; 1000, 1001, 1006, 1011, 1013… : oui) ou le statut HTTP d'un refus de
+poignée de main —, jamais une réponse tronquée rendue comme un succès. Un crochet qui lève est journalisé et ignoré
+(fail-open). Le run suivant se reconnecte avec le jeton de reprise du serveur (`sessionResumptionUpdate`) ; refusé,
+il repart d'une session neuve. Une session qui tombe PENDANT un appel d'outil lève (`retryable=True`) : ses résultats
+ne s'appliquent pas à une session neuve. Les outils d'une session sont figés à son ouverture : si l'agent en gagne
+ou en perd, une nouvelle session s'ouvre.
+
+**Vérifié.** `tests/test_ws.py` (43) et `tests/test_gemini_live.py` (36) : un faux serveur reproduit les trois
+points observés (il refuse la forme de la page avec 1007). Mutations : 9 sur 9 détectées pour le client (dont le
+verrou d'envoi, qu'un premier test ne voyait pas — une socket qui envoie en deux moitiés le rend visible), 11 sur 11
+pour le fournisseur (dont l'écoute qui tombait après `timeout` secondes de silence, trouvée ainsi). Contre l'API
+réelle, depuis un PC, texte en entrée : premier audio 0,41 s après l'envoi (une mesure) ; sous la vraie boucle,
+« Avance de dix centimètres » → `avancer(cm=10)` exécuté UNE fois, puis « C'est fait, j'ai avancé de dix
+centimètres. » (2,53 s d'audio, 2 étapes, 1 325 jetons en entrée) ; au run suivant, même session, la question
+« de combien ? » reçoit « dix centimètres ».
+
+**Ce qui reste, dit.** Pas encore de flux AUDIO réel en entrée dans ces mesures (texte seulement) : la latence d'une
+vraie conversation micro → haut-parleur reste à mesurer. Les jetons ne sont rapportés qu'avec `turnComplete` : un run
+interrompu avant n'a pas de consommation, et `token_budget` ne voit pas ce que le serveur n'a pas compté. La
+facturation des jetons de réflexion du mode Live n'est pas documentée ici : on applique la règle du Gemini REST
+(sortie = réponse + réflexion). Pas de mode asynchrone (choix de la bibliothèque), pas d'autre fournisseur Live,
+pas encore de démo numérotée ni d'entrée dans le constructeur visuel.
 
 ---
 *Doc maintenue par l'équipe Alyce R&D. Pour questions, ouvrir une issue sur le repo interne ou taper l'auteur sur Slack.*

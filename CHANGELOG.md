@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`GeminiLiveProvider` — continuous voice UNDER the agent loop** (`provider="gemini_live"`, model e.g.
+  `gemini-3.8-live`). A voice loop used to run outside the library, so its tool calls escaped `tool_policy`, the
+  guards and the journal. The provider keeps one WebSocket session open, a thread reads the server, and
+  `complete()` returns ONE response like any provider — so every tool requested by voice goes through `_executer`,
+  the gate, the guards, the journal and the trace; no second execution path (`tests/test_gate.py` unchanged).
+  `on_audio` (PCM 16-bit mono 24 kHz, as it arrives), `on_interrupted`, `on_input_text` / `on_output_text`,
+  `on_go_away`; `send_audio()` (16 kHz), `end_audio()`, `send_image()`, `send_text()` (a host event — e.g. a
+  reflex "your camera sees an apple" — answered by the listening run, tools included); `open()` connects before the microphone
+  starts; `agent.run(GeminiLiveProvider.LISTEN)` sends nothing and waits — WITHOUT a limit — for the next reply.
+  - **Built from what the real API did (7 Nov. 2026), not from the docs page**, which was wrong or silent on three
+    points: `setup.responseModalities` is REFUSED (close 1007, "Unknown name") — the valid field is
+    `setup.generationConfig.responseModalities`; the server sends JSON in BINARY frames; a `toolCall` is followed at
+    once by `generationComplete` + `turnComplete` that end the turn which produced the call, before the tool ran.
+    Taking that `turnComplete` for the end of the answer returns an EMPTY answer after every tool: the provider
+    absorbs the pair (up to `GRACE_S`) and a run ends on `turnComplete` (which carries `usageMetadata`).
+  - Typed failures: a session closed mid-answer raises `ProviderError` (`retryable` by close code — 1007/1008 no;
+    1000/1001/1006/1011/1013… yes — or by the HTTP status of a refused handshake), never a truncated "success". The
+    API key travels in the `x-goog-api-key` header, never in the URL. The next run reconnects with the server's
+    resumption handle; a refused handle falls back to a fresh session. Hooks that raise are logged (fail-open).
+  - Verified: 36 tests against a fake server that reproduces the three observed points, 11 code mutations all
+    caught (incl. a listen that died after `timeout` seconds of silence — found that way). Real API, text input:
+    first audio 0.41 s after sending (one measurement); under the real loop, "advance ten centimetres" ran the tool
+    ONCE then spoke the confirmation (2 steps), and the next run in the same session remembered the distance. Not
+    yet measured: real microphone audio end to end.
+- **`autoagent.ws` — a synchronous WebSocket client (RFC 6455), stdlib only.** Thread-safe sends (the microphone
+  sends while the loop reads), reads wait in `select` rather than on a socket timeout (which would also hit the
+  other thread's sends), fragmented messages reassembled, ping answered, invalid frames refused with the right close
+  code (1002 / 1007 / 1009), oversize refused from the header alone, never the query string in an error message,
+  `WebSocketError.status` for a refused handshake. 43 tests; 9 mutations all caught (the send lock only after a test
+  socket that sends each frame in two halves — the first concurrency test passed without the lock).
+
 - **`Agent.enable_code_action()` — code as action, in one line.** The model writes one short program that calls
   the agent's OWN tools through `context['call_host']`, and only what the program returns comes back into the
   conversation: a 26 000-character CSV stays in the sandbox, the model reads the sum. Measured first on a new

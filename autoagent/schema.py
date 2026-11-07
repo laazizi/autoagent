@@ -198,6 +198,8 @@ DEFAULT_API_KEY_ENVS = {
     "deepseek": "DEEPSEEK_API_KEY",
     "gemini": "GEMINI_API_KEY",
     "google": "GEMINI_API_KEY",
+    "gemini_live": "GEMINI_API_KEY",
+    "gemini-live": "GEMINI_API_KEY",
     "groq": "GROQ_API_KEY",
 }
 
