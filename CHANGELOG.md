@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`enable_code_action(compact=True)`** — a shorter `run_python` description and a shorter hint (about half the
+  characters), to cut the fixed per-step input cost on small tasks. Measured on `evals/eval_efficacite.py`,
+  `deepseek-chat`, 20 tasks, k=3, `compare_configs`: -29 % tokens versus the default `enable_code_action()`
+  (interval [-33 % ; -24 %], success 100 % in both arms, same median duration). Against no code action, on the
+  small families the surcharge falls to +59 % (extraction), +15 % (coding), +16 % (SQL) but is not removed.
+  Opt-in; the default is unchanged until measured on a second model (Gemini: [non mesure]). A first, weaker
+  wording of the hint ("process them with run_python") made the model read big results itself (D1 18 329 tokens
+  versus 2 611): the three ideas LARGE / not yourself / call_host must stay in the hint.
+
 - **`SubprocessSandbox(confine=Confinement())` — a kernel-enforced boundary without Docker** (Linux x86_64;
   applied automatically when the host chooses no sandbox — see *Changed* below). Model-written code (`run_python`, `enable_code_action()`, generated tools) runs behind an AST denylist
   the library has called bypassable since 0.22.0; once bypassed, the code had the host process's rights. Docker is

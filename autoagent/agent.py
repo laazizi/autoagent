@@ -970,6 +970,7 @@ class Agent:
         timeout: float = 10.0,
         max_runs_per_run: int = 10,
         hint: bool = True,
+        compact: bool = False,
     ) -> None:
         """Le « code comme action » en UNE ligne (0.25.0) : le modèle écrit un court programme qui
         appelle les outils de CET agent — et seul ce que le programme rend revient dans la conversation.
@@ -1005,12 +1006,15 @@ class Agent:
             max_runs_per_run: programmes permis par run (les échecs comptent).
             hint: ajoute au prompt système la phrase `CODE_ACTION_HINT` (dit au modèle QUAND écrire un
                 programme plutôt que lire un gros résultat). `False` : l'hôte le dit lui-même.
+            compact: description de l'outil et phrase de consigne réduites au strict minimum
+                (`CODE_ACTION_HINT_COMPACT`) : moins de jetons d'entrée à CHAQUE étape, donc un
+                surcoût moindre sur les petites tâches qui n'en ont pas besoin.
         """
         runner = PythonRunner(sandbox, timeout=timeout)
         noms = None if tools is None else frozenset(tools)
         self.python_runner = runner
         self.max_python_runs_per_run = max(1, int(max_runs_per_run))
-        self._consigne_code = CODE_ACTION_HINT if hint else None
+        self._consigne_code = (CODE_ACTION_HINT_COMPACT if compact else CODE_ACTION_HINT) if hint else None
 
         def run_python(code: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
             if self._python_runs_this_run >= self.max_python_runs_per_run:
@@ -1023,7 +1027,7 @@ class Agent:
             runner.host_functions = self._outils_pour_le_code(noms) or None
             return runner(code, args)
 
-        self.registry.replace(spec=_code_action_spec(), handler=run_python)
+        self.registry.replace(spec=_code_action_spec(compact=compact), handler=run_python)
 
     def _outils_pour_le_code(self, noms: frozenset[str] | None) -> dict[str, Callable[..., Any]]:
         """Les outils de l'agent vus comme fonctions de l'hôte par le code du modèle (`enable_code_action`)."""
@@ -2606,15 +2610,37 @@ CODE_ACTION_HINT = (
     "run_python tool that calls the tools through context['call_host'] and returns only what you need."
 )
 
+# Version minimale de la consigne (`enable_code_action(compact=True)`) : une phrase courte.
+CODE_ACTION_HINT_COMPACT = (
+    "Never read a LARGE tool result (log, export, many rows) yourself: write one short run_python program "
+    "that calls the tool through context['call_host'] and returns only what you need."
+)
+
 # Jamais exposés au code du modèle par `enable_code_action` : l'outil lui-même (pas de récursion), le
 # constructeur d'outils et la recherche d'outils (des méta-outils, pas des actions de l'hôte).
 _PAS_POUR_LE_CODE = frozenset({"run_python", "create_python_tool", _FIND_TOOLS_NAME})
 
 
-def _code_action_spec() -> ToolSpec:
+def _code_action_spec(*, compact: bool = False) -> ToolSpec:
     """La description COURTE de `run_python` pour `enable_code_action` : les outils appelables sont déjà
     décrits dans la requête — ne pas les relister (mesuré : ~500 jetons de plus par étape avec la liste
     et une consigne dans le prompt système, sur des tâches qui n'en avaient pas besoin)."""
+    if compact:
+        return ToolSpec(
+            name="run_python",
+            description=(
+                "Sandboxed Python: define `def run(args, context):` returning JSON. "
+                "context['call_host'](tool_name, {arguments}) calls your other tools; only run()'s return "
+                "value comes back to you."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {"code": {"type": "string"}, "args": {"type": "object"}},
+                "required": ["code"],
+                "additionalProperties": False,
+            },
+            permissions=[],
+        )
     return ToolSpec(
         name="run_python",
         description=(

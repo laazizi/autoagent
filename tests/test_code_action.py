@@ -249,6 +249,36 @@ class TestLaConsigne:
         agent.enable_code_action(hint=False)
         assert agent.render_system_prompt() == "P"
 
+    def test_compact_reduit_la_description_et_la_consigne(self) -> None:
+        """`compact=True` : moins de jetons à CHAQUE étape, mais la consigne garde les trois idées mesurées
+        comme nécessaires (GROS résultat, ne pas le lire soi-même, passer par call_host)."""
+        from autoagent.agent import CODE_ACTION_HINT, CODE_ACTION_HINT_COMPACT
+
+        complet, court = _agent(system_prompt="P"), _agent(system_prompt="P")
+        complet.enable_code_action()
+        court.enable_code_action(compact=True)
+
+        def poids(agent: Agent) -> int:
+            spec = next(s for s in agent.registry.specs() if s.name == "run_python")
+            return len(spec.description) + len(str(spec.input_schema))
+
+        assert poids(court) < poids(complet) // 2
+        assert court.render_system_prompt() == f"P\n\n{CODE_ACTION_HINT_COMPACT}"
+        assert len(CODE_ACTION_HINT_COMPACT) < len(CODE_ACTION_HINT) * 0.7
+        for mot in ("LARGE", "yourself", "call_host", "run_python"):
+            assert mot in CODE_ACTION_HINT_COMPACT
+
+    def test_compact_marche_comme_le_mode_complet(self) -> None:
+        """Même exécution : le programme appelle l'outil de l'hôte et seul son résultat revient."""
+        agent = _agent(_programme(COMPTER, capteur="CMP-1"))
+        agent.enable_code_action(compact=True)
+        rendu = _resultats_outils(agent.run("combien d'erreurs ?"))
+        assert '"erreurs": 7' in rendu
+        assert "INFO ok" not in rendu
+        spec = next(s for s in agent.registry.specs() if s.name == "run_python")
+        assert spec.input_schema["required"] == ["code"]
+        assert spec.input_schema["additionalProperties"] is False
+
     def test_un_prompt_callable_la_recoit_aussi(self) -> None:
         from autoagent.agent import CODE_ACTION_HINT
 

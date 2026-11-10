@@ -259,6 +259,8 @@ CONFIGS: dict[str, dict[str, Any]] = {
                   "description": "parallel_tool_calls=True (les appels d'un même tour en parallèle)"},
     "code_une_ligne": {"agent": {}, "code": "une_ligne", "consigne": "",
                        "description": "code comme action en une ligne : agent.enable_code_action() (description courte, aucune consigne)"},
+    "code_compact": {"agent": {}, "code": "compact", "consigne": "",
+                     "description": "agent.enable_code_action(compact=True) : description et consigne minimales"},
 }
 
 
@@ -584,6 +586,8 @@ def fabriquer_agent(provider: Any, outils: dict[str, Callable[..., Any]], config
     installer_outils(agent, outils)
     if reglage["code"] == "une_ligne":
         agent.enable_code_action()
+    elif reglage["code"] == "compact":
+        agent.enable_code_action(compact=True)
     elif reglage["code"]:
         from autoagent import PythonRunner
         agent.enable_run_python(PythonRunner(host_functions=outils))
@@ -703,6 +707,8 @@ def main() -> None:
     parser.add_argument("--config", default="telle_quelle", choices=sorted(CONFIGS), help="le réglage mesuré")
     parser.add_argument("--comparer", default="", choices=["", *sorted(CONFIGS)],
                         help="confirmation : compare_configs (bras alternés) entre « telle_quelle » et ce réglage")
+    parser.add_argument("--contre", default="telle_quelle", choices=sorted(CONFIGS),
+                        help="avec --comparer : le bras A (par défaut « telle_quelle »)")
     args, reste = parser.parse_known_args()
 
     monde = construire_monde()
@@ -719,10 +725,10 @@ def main() -> None:
         from _common import make_provider
         provider = make_provider(reste)
         if args.comparer:
-            nom = f"{provider.config.provider}/{provider.config.model} | comparaison telle_quelle vs {args.comparer}"
+            nom = f"{provider.config.provider}/{provider.config.model} | comparaison {args.contre} vs {args.comparer}"
             print(f"Confirmation — {nom} — {len(taches)} tâches x {args.k} répétitions par bras (bras alternés)", flush=True)
             debut = time.perf_counter()
-            resultat = comparer(provider, monde, base, taches, args.k, args.comparer)
+            resultat = comparer(provider, monde, base, taches, args.k, args.comparer, args.contre)
             resultat["secondes_total"] = round(time.perf_counter() - debut)
             archive = json.loads(SORTIE.read_text(encoding="utf-8")) if SORTIE.exists() else {}
             archive[nom] = {"date": time.strftime("%Y-%m-%d %H:%M"), "k": args.k, **resultat}
