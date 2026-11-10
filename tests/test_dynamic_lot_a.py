@@ -304,8 +304,13 @@ class TestSelfTestsMalFormes:
 
 
 class TestAvertissementSandbox:
-    def test_subprocess_avertit_une_fois(self, tmp_path, caplog, avertissements_neufs) -> None:
+    def test_subprocess_avertit_une_fois(self, tmp_path, caplog, avertissements_neufs, monkeypatch) -> None:
         import logging
+
+        from autoagent import sandbox as sandbox_mod
+        # Une machine où le noyau ne peut pas confiner : ailleurs le bac par défaut est CONFINÉ, et il
+        # n'avertit pas (`tests/test_confinement.py`).
+        monkeypatch.setattr(sandbox_mod, "_confinement_impossible", lambda: "pas sur cette machine")
         with caplog.at_level(logging.WARNING, logger="autoagent"):
             DynamicToolBuilder(_Constructeur("{}"), tools_dir=tmp_path)
             DynamicToolBuilder(_Constructeur("{}"), tools_dir=tmp_path)

@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`SubprocessSandbox(confine=Confinement())` — a kernel-enforced boundary without Docker** (Linux x86_64;
+  applied automatically when the host chooses no sandbox — see *Changed* below). Model-written code (`run_python`, `enable_code_action()`, generated tools) runs behind an AST denylist
+  the library has called bypassable since 0.22.0; once bypassed, the code had the host process's rights. Docker is
+  the answer where Docker exists — it does not exist everywhere. `confine=` has the runner apply two kernel
+  mechanisms BEFORE the tool's code, through `ctypes`, no dependency: **Landlock** (file access removed except an
+  allowlist: the standard library, system shared libraries, time zones, the tool's own file — read-only — plus the
+  `read=` / `write=` directories the HOST grants; no execute right is ever granted) and a **seccomp** filter for what
+  Landlock does not cover (network, launching programs, other processes, file modes and times, mounts and
+  namespaces; `kill` only reaches the process itself; a system call added by a future kernel is refused by
+  default). A refusal is an ERROR the code receives (`PermissionError`), not a killed process: the tool fails, the
+  model sees a tool error.
+  - **Measured by a bench written before the code** (`tests/test_confinement.py`; WSL2 Ubuntu 24.04, kernel 6.6,
+    Landlock ABI 3; CPython 3.10, system 3.12.3, 3.12.15, 3.13). Payloads run directly, WITHOUT the validator. 13
+    payloads — read a private file, list its directory, read another process's environment through
+    `/proc/<pid>/environ` (a canary API key) and the parent's, write / truncate / delete / chmod outside the granted
+    directories, TCP connect, UDP send, launch `/bin/sh`, kill another process, read its limits: **13 succeed
+    without `confine=` (positive control), 0 with it**. A forked child stays confined. Twelve legitimate snippets
+    (json, re, time zones, decimal, hashlib, threads, asyncio, in-memory sqlite3, mimetypes, a signal to oneself…) return the
+    SAME result with and without it, as do the `call_host` bridge, the warm worker and `limits=` combined.
+  - 28 code mutations, all caught — after one test was added: removing `execve` from the filter showed nowhere at
+    first, because Landlock already refuses to launch a program (two barriers; the filter now has its own test with
+    hard-coded numbers). The filter is a pure function, simulated instruction by instruction on every platform;
+    its system-call numbers were cross-checked against the kernel 6.12 table.
+  - **Overhead** (median of 50 calls, alternating arms): one process per call 21 → 27 ms (+5.5 to +5.8 ms); warm
+    worker 0.40 → 0.53 ms (+0.14 ms — confinement is applied once, at worker start).
+  - **Fail-closed**: outside Linux x86_64, or without Landlock ABI 3 (kernel 6.2), constructing
+    `SubprocessSandbox(confine=...)` is REFUSED; if confinement cannot be applied in the child, the tool never runs.
+    `isolation()` reports `kind: "subprocess+confine"`, `os_boundary: True` and what is granted.
+    `Confinement()` keeps the network closed even for a tool holding the `network` permission;
+    `Confinement(network=True)` reopens it for those tools only.
+  - **Not guaranteed, stated**: the kernel is SHARED (a kernel flaw crosses this boundary, as it crosses Docker);
+    memory, CPU and file size belong to `limits=`; the number of processes is not bounded; a file's existence and
+    size stay visible (`stat`); in a `write=` directory modes and times cannot be changed (`shutil.copy` fails,
+    `shutil.copyfile` works); the filter is a denylist closed towards the future, not an allowlist. Not covered:
+    ARM64, Windows, macOS, kernels before 6.2. The bench also passes when run as root (uid 0, same machine);
+    nothing was measured INSIDE a container. Not in the visual builder yet, no numbered demo.
+  - `make_sandbox(require_boundary=True)`: Docker or the confined subprocess, never the plain one (`ToolError`).
+
 - **`GeminiLiveProvider` — continuous voice UNDER the agent loop** (`provider="gemini_live"`, model e.g.
   `gemini-3.8-live`). A voice loop used to run outside the library, so its tool calls escaped `tool_policy`, the
   guards and the journal. The provider keeps one WebSocket session open, a thread reads the server, and
@@ -72,6 +110,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     concluding. Not in the visual builder yet.
   - Security: `SubprocessSandbox` by default — an AST denylist, not a boundary. In production pass
     `sandbox=DockerSandbox(...)` and keep the tools under `tool_policy`.
+
+### Changed
+
+- **On Linux x86_64 (Landlock ABI 3), model-written code now runs kernel-confined BY DEFAULT when the host
+  passes no sandbox.** One rule: *the kernel enforces what the permissions already say* — a tool without a
+  `filesystem.*` permission has no file, a tool without `network` has no network. Concerned: `PythonRunner()`
+  (so `enable_run_python()` and `enable_code_action()`), `DynamicToolBuilder` (chosen tool by tool),
+  `load_generated_tool()`, and the fallback of `make_sandbox()` when Docker is absent (Docker, else the confined
+  subprocess, else the plain one — which still warns).
+  - **What can change for an existing host**: a snippet WITHOUT a file permission that still touched files
+    through a module the AST denylist does not know now gets an error. `sqlite3.connect(path)` writes a file
+    with no `open()` and no banned module: the validator lets it through, the kernel refuses it (pinned by a
+    test, with its positive control).
+  - **What does not change**: a tool the host granted `filesystem.*` WITHOUT naming directories runs as before,
+    in the plain subprocess, and the "not an isolation boundary" warning still fires — an allowlist cannot be
+    guessed; name the directories (`Confinement(read=, write=)`) to confine it. A sandbox passed by the host is
+    never replaced: `sandbox=SubprocessSandbox()` gives the previous behaviour. On Windows, macOS, ARM64 and
+    kernels before 6.2 nothing changes.
+  - On the full suite the new default changed the result of no tool test and no demo; three tests that
+    checked the WARNING of the default sandbox now say they describe a machine without confinement. The bench
+    of legitimate snippets caught a real false refusal BEFORE shipping: `mimetypes.guess_type()` opens
+    `/etc/mime.types` and raised `PermissionError`; those tables are now readable.
+  - **Verified on a real model** (`gemini-3.7-flash`, `evals/eval_efficacite.py`, `code_une_ligne`, under
+    Linux, default sandbox): families D and E, one repetition, 8 tasks out of 8; on a second run of 3 tasks, 4
+    model-written programs were counted — 4 ran in the confined sandbox, 0 outside it, one failing on the
+    model's own `TypeError` and fixed on the next turn. Same run on `deepseek-chat`: 8 out of 8, 6
+    model-written programs, 6 in the confined sandbox, 0 outside it, none failing. Not a comparison: one
+    repetition per model.
+
+### Fixed
+
+- **The host-function bridge raised a raw `BrokenPipeError`** when the sandboxed child died before reading its
+  input (a limits or confinement preamble that refuses to start) — or not, depending on which process was faster.
+  Found by the confinement bench on Ubuntu's system Python. It is now a `ToolError` that quotes the child's stderr.
+- `PythonRunner` and `DynamicToolBuilder` warned "not an isolation boundary" for every sandbox that was not a
+  `DockerSandbox` instance; they now ask `isolation()` (`os_boundary`), so a confined subprocess no longer triggers
+  the warning and a plain one still does.
 
 ### Fixed (documentation and demos)
 

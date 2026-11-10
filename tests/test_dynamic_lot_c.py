@@ -267,10 +267,14 @@ class TestRunPython:
         runner = PythonRunner(SubprocessSandbox(timeout=10, warm=True))
         assert runner.sandbox.warm is False
 
-    def test_avertit_une_fois_hors_docker(self, caplog) -> None:
+    def test_avertit_une_fois_hors_docker(self, caplog, monkeypatch) -> None:
         import logging
 
         from autoagent import logging as journal
+        from autoagent import sandbox as sandbox_mod
+        # Une machine où le noyau ne peut pas confiner : ailleurs le lanceur par défaut est CONFINÉ, et il
+        # n'avertit pas (`tests/test_confinement.py`).
+        monkeypatch.setattr(sandbox_mod, "_confinement_impossible", lambda: "pas sur cette machine")
         journal._DEJA_AVERTI.discard("dynamic.run_python_not_docker")
         with caplog.at_level(logging.WARNING, logger="autoagent"):
             PythonRunner()

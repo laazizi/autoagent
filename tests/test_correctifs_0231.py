@@ -833,10 +833,14 @@ class TestRepliSilencieux:
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, avertissements_neufs: None,
     ) -> None:
         monkeypatch.setattr(sandbox_mod, "docker_available", lambda: False)
+        # Ni Docker ni confinement par le noyau (Windows, macOS, ARM64…) : là où le noyau peut confiner, le
+        # repli est le sous-processus CONFINÉ et il n'avertit pas — voir `tests/test_confinement.py`.
+        monkeypatch.setattr(sandbox_mod, "_confinement_impossible", lambda: "pas sur cette machine")
         with caplog.at_level(logging.WARNING, logger="autoagent"):
             premier = sandbox_mod.make_sandbox()
             sandbox_mod.make_sandbox()
         assert isinstance(premier, sandbox_mod.SubprocessSandbox), "le comportement historique est conservé"
+        assert premier.isolation()["os_boundary"] is False
         dits = [r.getMessage() for r in caplog.records if "not an isolation boundary" in r.getMessage()]
         assert len(dits) == 1, f"attendu UN avertissement par processus, vu {len(dits)}"
         assert "require_docker" in dits[0], "l'avertissement dit comment exiger Docker"

@@ -5,10 +5,13 @@ import hashlib
 import json
 import math
 import os
+import platform
 import shutil
 import signal
+import struct
 import subprocess
 import sys
+import sysconfig
 import threading
 import uuid
 import weakref
@@ -27,6 +30,7 @@ __all__ = [
     "ALWAYS_BANNED_CALLS",
     "ALWAYS_BANNED_MODULES",
     "ATTRIBUTE_BANNED_CALLS",
+    "Confinement",
     "DANGEROUS_NAMES",
     "DockerSandbox",
     "FILESYSTEM_MODULES",
@@ -279,6 +283,341 @@ def _echec_du_runner(completed: "subprocess.CompletedProcess[str]", limits: Sand
 
 
 # ---------------------------------------------------------------------------
+# Confinement par le noyau (main, non publié) — OPT-IN, Linux x86_64.
+# La liste d'interdits AST se contourne, et un outil qui la contourne avait les
+# droits du processus hôte : ses fichiers, le réseau, ses clés (lisibles par
+# `/proc/<pid>/environ` alors que l'environnement de l'enfant est épuré), ses
+# voisins. `SubprocessSandbox(confine=Confinement())` fait poser par le RUNNER,
+# avant le code de l'outil, deux mécanismes que le noyau applique quoi que le code
+# écrive ensuite :
+#   * Landlock : le processus se retire l'accès aux fichiers, sauf une liste
+#     blanche (irrévocable, hérité par ses enfants, vaut aussi pour root) ;
+#   * seccomp : un filtre d'appels système pour ce que Landlock ne couvre pas —
+#     le réseau, le lancement de programmes, les autres processus, les droits et
+#     dates des fichiers, les espaces de noms.
+# Un refus rend une ERREUR au code (`PermissionError`), pas la mort du processus :
+# l'outil échoue, le modèle voit une erreur d'outil. Même forme que les plafonds :
+# un préambule collé devant le runner, sans `preexec_fn`, chaîne vide sans
+# `confine=` (le runner par défaut ne bouge pas d'un octet), et fail-closed — si
+# le confinement ne se pose pas, l'outil ne tourne pas. Le noyau reste PARTAGÉ :
+# une faille du noyau traverse cette frontière, comme elle traverse Docker.
+# ---------------------------------------------------------------------------
+
+_LANDLOCK_ABI_MIN = 3                # noyau 6.2 : en dessous, vider un fichier (`truncate`) échappe à Landlock
+_LL_TOUS = (1 << 15) - 1             # les quinze droits « fichiers » des ABI 1 à 3 : tout ce qui n'est pas accordé est refusé
+_LL_ECRIRE_FICHIER, _LL_LIRE_FICHIER, _LL_LIRE_DOSSIER = 1 << 1, 1 << 2, 1 << 3
+_LL_RETIRER_DOSSIER, _LL_RETIRER_FICHIER, _LL_CREER_DOSSIER, _LL_CREER_FICHIER = 1 << 4, 1 << 5, 1 << 7, 1 << 8
+_LL_VIDER = 1 << 14
+# Ni EXECUTE (lancer un programme) ni REFER (lier ou déplacer d'un dossier à l'autre) ne sont jamais accordés.
+_LL_LECTURE = _LL_LIRE_FICHIER | _LL_LIRE_DOSSIER
+_LL_ECRITURE = (_LL_LECTURE | _LL_ECRIRE_FICHIER | _LL_VIDER | _LL_CREER_FICHIER | _LL_CREER_DOSSIER
+                | _LL_RETIRER_FICHIER | _LL_RETIRER_DOSSIER)
+
+# Ce que l'interpréteur doit pouvoir LIRE pour qu'un outil ordinaire tourne (imports paresseux de la
+# bibliothèque standard, bibliothèques partagées, fuseaux horaires). Rien ici n'est un secret.
+_DOSSIERS_SYSTEME = ("/usr/lib", "/usr/lib64", "/lib", "/lib64", "/usr/share/zoneinfo")
+_PERIPHERIQUES = (("/dev/null", _LL_LIRE_FICHIER | _LL_ECRIRE_FICHIER), ("/dev/urandom", _LL_LIRE_FICHIER))
+# Les tables de types MIME que `mimetypes` ouvre au premier appel (`mimetypes.knownfiles`) : sans elles,
+# `mimetypes.guess_type()` levait PermissionError sous confinement (trouvé par le banc des extraits légitimes).
+_FICHIERS_SYSTEME = ("/etc/mime.types", "/etc/httpd/mime.types", "/etc/httpd/conf/mime.types",
+                     "/etc/apache/mime.types", "/etc/apache2/mime.types", "/usr/local/etc/httpd/conf/mime.types",
+                     "/usr/local/lib/netscape/mime.types", "/usr/local/etc/mime.types")
+# Réseau rouvert (`Confinement(network=True)` ET outil porteur de la permission) : la résolution des noms
+# et les certificats se lisent dans ces fichiers.
+_FICHIERS_RESEAU = ("/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/etc/host.conf", "/etc/gai.conf",
+                    "/etc/services", "/etc/protocols")
+_DOSSIERS_RESEAU = ("/etc/ssl", "/etc/pki", "/etc/ca-certificates", "/usr/share/ca-certificates",
+                    "/usr/local/share/ca-certificates")
+
+# Numéros d'appels système x86_64 (`asm/unistd_64.h` ; `tests/test_confinement.py` les recoupe avec les
+# en-têtes du noyau quand ils sont installés). Chaque appel ci-dessous rend EPERM.
+_APPELS_RESEAU = {"socket": 41, "connect": 42, "accept": 43, "bind": 49, "listen": 50, "accept4": 288}
+_APPELS_REFUSES = {
+    # lancer un programme
+    "execve": 59, "execveat": 322,
+    # agir sur un AUTRE processus (kill, tgkill et prlimit64 sont filtrés sur leur cible, plus bas)
+    "ptrace": 101, "process_vm_readv": 310, "process_vm_writev": 311, "kcmp": 312, "pidfd_open": 434,
+    "pidfd_getfd": 438, "pidfd_send_signal": 424, "process_madvise": 440, "process_mrelease": 448,
+    "tkill": 200, "rt_sigqueueinfo": 129, "rt_tgsigqueueinfo": 297, "setpriority": 141,
+    "sched_setparam": 142, "sched_setscheduler": 144, "sched_setaffinity": 203, "sched_setattr": 314,
+    "ioprio_set": 251, "migrate_pages": 256, "move_pages": 279,
+    # droits, propriétaire, attributs et dates d'un fichier : Landlock ne les couvre pas
+    "chmod": 90, "fchmod": 91, "fchmodat": 268, "fchmodat2": 452, "chown": 92, "fchown": 93, "lchown": 94,
+    "fchownat": 260, "setxattr": 188, "lsetxattr": 189, "fsetxattr": 190, "removexattr": 197,
+    "lremovexattr": 198, "fremovexattr": 199, "utime": 132, "utimes": 235, "futimesat": 261, "utimensat": 280,
+    # io_uring exécute des opérations sans repasser par ce filtre
+    "io_uring_setup": 425, "io_uring_enter": 426, "io_uring_register": 427,
+    # montages, espaces de noms, noyau
+    "mount": 165, "umount2": 166, "pivot_root": 155, "chroot": 161, "unshare": 272, "setns": 308,
+    "open_tree": 428, "move_mount": 429, "fsopen": 430, "fsconfig": 431, "fsmount": 432, "fspick": 433,
+    "mount_setattr": 442, "swapon": 167, "swapoff": 168, "reboot": 169, "kexec_load": 246,
+    "kexec_file_load": 320, "init_module": 175, "finit_module": 313, "delete_module": 176, "bpf": 321,
+    "perf_event_open": 298, "userfaultfd": 323, "add_key": 248, "request_key": 249, "keyctl": 250,
+    "acct": 163, "settimeofday": 164, "clock_settime": 227, "adjtimex": 159, "clock_adjtime": 305,
+    "sethostname": 170, "setdomainname": 171, "iopl": 172, "ioperm": 173, "quotactl": 179,
+    "quotactl_fd": 443, "name_to_handle_at": 303, "open_by_handle_at": 304, "personality": 135,
+    "syslog": 103, "vhangup": 153, "modify_ldt": 154, "fanotify_init": 300, "fanotify_mark": 301,
+    "lsm_set_self_attr": 460,
+    # mémoire et files partagées entre processus (System V, POSIX)
+    "shmget": 29, "shmat": 30, "shmctl": 31, "semget": 64, "semop": 65, "semctl": 66, "semtimedop": 220,
+    "msgget": 68, "msgsnd": 69, "msgrcv": 70, "msgctl": 71, "mq_open": 240, "mq_unlink": 241,
+    "mq_timedsend": 242, "mq_timedreceive": 243, "mq_notify": 244, "mq_getsetattr": 245,
+}
+_DERNIER_APPEL_CONNU = 462           # mseal (noyau 6.10). Au-delà : ENOSYS — un appel ajouté par un futur noyau est refusé par défaut
+_PID_A_POSER = 0xFFFFFFFF            # remplacé dans l'enfant par son propre pid (jamais un pid ni un numéro d'appel réels)
+_CLONE_ESPACES = (0x00000080 | 0x00020000 | 0x02000000 | 0x04000000 | 0x08000000 | 0x10000000
+                  | 0x20000000 | 0x40000000)     # CLONE_NEWTIME, NEWNS, NEWCGROUP, NEWUTS, NEWIPC, NEWUSER, NEWPID, NEWNET
+
+
+def _filtre_seccomp(reseau_ouvert: bool) -> tuple[bytes, tuple[int, ...]]:
+    """Le programme BPF du filtre, et les positions (en octets) où l'enfant écrit son propre pid.
+
+    Fonction PURE (aucun appel au noyau) : testée instruction par instruction sur toute plateforme. Dans
+    l'ordre : une autre architecture que x86_64 TUE le processus (la table 32 bits a d'autres numéros) ; un
+    numéro au-delà du dernier connu rend ENOSYS, ce qui couvre aussi la table x32 ; `clone3` rend ENOSYS (ses
+    drapeaux sont derrière un pointeur, illisibles ici : la libc retombe sur `clone`, dont on lit les
+    drapeaux) ; chaque appel refusé rend EPERM ; `kill` / `tgkill` ne passent que vers soi, `prlimit64` que
+    pour soi, `clone` que sans nouvel espace de noms ; tout le reste passe."""
+    permis, eperm, enosys, tuer = 0x7FFF0000, 0x00050000 | 1, 0x00050000 | 38, 0x80000000
+    instructions: list[tuple[int, int, int, int]] = []
+    positions: list[int] = []
+
+    def charger(decalage: int) -> None:
+        instructions.append((0x20, 0, 0, decalage))            # BPF_LD | BPF_W | BPF_ABS
+
+    def si_egal(valeur: int, si_vrai: int, si_faux: int) -> None:
+        instructions.append((0x15, si_vrai, si_faux, valeur))  # BPF_JMP | BPF_JEQ | BPF_K
+
+    def rendre(action: int) -> None:
+        instructions.append((0x06, 0, 0, action))              # BPF_RET | BPF_K
+
+    def si_moi(si_vrai: int, si_faux: int) -> None:
+        positions.append(len(instructions) * 8 + 4)
+        si_egal(_PID_A_POSER, si_vrai, si_faux)
+
+    charger(4)                                                 # seccomp_data.arch
+    si_egal(0xC000003E, 1, 0)                                  # AUDIT_ARCH_X86_64
+    rendre(tuer)
+    charger(0)                                                 # seccomp_data.nr
+    instructions.append((0x25, 0, 1, _DERNIER_APPEL_CONNU))    # BPF_JGT : au-delà du dernier appel connu
+    rendre(enosys)
+    si_egal(435, 0, 1)                                         # clone3
+    rendre(enosys)
+    refuses = dict(_APPELS_REFUSES) if reseau_ouvert else {**_APPELS_REFUSES, **_APPELS_RESEAU}
+    for numero in sorted(set(refuses.values())):
+        si_egal(numero, 0, 1)
+        rendre(eperm)
+    for numero in (62, 234):                                   # kill(pid, …) et tgkill(tgid, …) : vers soi seulement
+        si_egal(numero, 0, 4)
+        charger(16)                                            # premier argument, mot bas : le pid que lit le noyau
+        si_moi(0, 1)
+        rendre(permis)
+        rendre(eperm)
+    si_egal(302, 0, 5)                                         # prlimit64(pid, …) : 0 ou soi
+    charger(16)
+    si_egal(0, 1, 0)
+    si_moi(0, 1)
+    rendre(permis)
+    rendre(eperm)
+    si_egal(56, 0, 4)                                          # clone(drapeaux, …) : un fil ou un enfant, pas un espace de noms
+    charger(16)
+    instructions.append((0x45, 0, 1, _CLONE_ESPACES))          # BPF_JSET
+    rendre(eperm)
+    rendre(permis)
+    rendre(permis)
+    return b"".join(struct.pack("<HBBI", *i) for i in instructions), tuple(positions)
+
+
+def _poser_pid(programme: bytes, positions: tuple[int, ...], pid: int) -> bytes:
+    """Le filtre prêt pour le processus `pid` (ce que fait l'enfant, avec le sien, avant de l'installer)."""
+    tampon = bytearray(programme)
+    for position in positions:
+        struct.pack_into("<I", tampon, position, pid)
+    return bytes(tampon)
+
+
+# Le préambule exécuté par l'ENFANT, avant le runner. Tout échec sort AVANT le code de l'outil (fail-closed).
+_AMORCE_CONFINEMENT = r'''
+def _confiner():
+    import ctypes, os, struct, sys
+    libc = ctypes.CDLL(None, use_errno=True)
+    appel = libc.syscall
+    appel.restype = ctypes.c_long
+    L = ctypes.c_long
+
+    def echec(quoi):
+        numero = ctypes.get_errno()
+        raise OSError(numero, "%s: %s" % (quoi, os.strerror(numero)))
+
+    if libc.prctl(L(38), L(1), L(0), L(0), L(0)) != 0:                     # PR_SET_NO_NEW_PRIVS
+        echec("no_new_privs")
+    if appel(L(444), None, L(0), L(1)) < @ABI_MIN@:                          # landlock_create_ruleset(VERSION)
+        raise OSError("Landlock ABI @ABI_MIN@ is not available in this process")
+    droits = struct.pack("Q", @TOUS@)
+    jeu = appel(L(444), droits, L(len(droits)), L(0))
+    if jeu < 0:
+        echec("landlock_create_ruleset")
+    regles = list(@REGLES@)
+    if len(sys.argv) > 1:
+        regles.append((sys.argv[1], @LIRE_FICHIER@))                         # le fichier de l'outil, et lui seul
+    for chemin, accorde in regles:
+        fd = os.open(chemin, os.O_PATH | os.O_CLOEXEC)
+        try:
+            if appel(L(445), L(jeu), L(1), struct.pack("=Qi", accorde, fd), L(0)) != 0:
+                echec("landlock_add_rule(%s)" % chemin)
+        finally:
+            os.close(fd)
+    if appel(L(446), L(jeu), L(0)) != 0:
+        echec("landlock_restrict_self")
+    os.close(jeu)
+
+    filtre = bytearray(bytes.fromhex("@FILTRE@"))
+    for position in @POSITIONS@:
+        struct.pack_into("<I", filtre, position, os.getpid())
+    tampon = ctypes.create_string_buffer(bytes(filtre), len(filtre))
+
+    class Programme(ctypes.Structure):
+        _fields_ = [("longueur", ctypes.c_ushort), ("instructions", ctypes.c_void_p)]
+
+    programme = Programme(len(filtre) // 8, ctypes.addressof(tampon))
+    if libc.prctl(L(22), L(2), ctypes.byref(programme), L(0), L(0)) != 0:   # PR_SET_SECCOMP, MODE_FILTER
+        echec("seccomp")
+
+
+try:
+    _confiner()
+except BaseException as _exc:
+    raise SystemExit("autoagent confinement could not be applied (%s: %s): the tool was NOT run"
+                     % (type(_exc).__name__, _exc))
+del _confiner
+'''
+
+
+@dataclass(frozen=True)
+class Confinement:
+    """Ce que le noyau laisse au code d'un :class:`SubprocessSandbox` confiné (opt-in, Linux x86_64).
+
+    ``Confinement()`` : aucun fichier hors de l'interpréteur, pas de réseau, aucun programme lancé, aucun
+    signal vers un autre processus. Restent lisibles sans rien accorder : la bibliothèque standard, les
+    bibliothèques partagées du système, les fuseaux horaires, et le fichier de l'outil lui-même. Rien en
+    écriture.
+
+    * ``read`` / ``write`` : dossiers accordés par l'HÔTE (jamais par le modèle), chemins absolus de dossiers
+      existants. ``write`` donne aussi la lecture. On y crée, écrit, vide et supprime ; on n'y change ni les
+      droits ni les dates (``shutil.copy`` échoue, ``shutil.copyfile`` passe), on n'y crée pas de lien.
+    * ``network`` : ``False`` (défaut) coupe le réseau même pour un outil qui porte la permission
+      ``network``. ``True`` le rouvre pour ces outils-là seulement, comme ``DockerSandbox``.
+
+    Non couverts, dits : le noyau est partagé ; mémoire, CPU et taille de fichier relèvent de
+    ``limits=`` ; le nombre de processus n'est pas borné (un enfant hérite du confinement, il n'en sort
+    pas) ; l'existence et la taille d'un fichier restent visibles (``stat``), pas son contenu ni la liste
+    de son dossier ; ce qui passe par le pont ``call_host`` relève de la porte de décision."""
+
+    read: tuple[str, ...] = ()
+    write: tuple[str, ...] = ()
+    network: bool = False
+
+    def __post_init__(self) -> None:
+        for nom in ("read", "write"):
+            valeur = getattr(self, nom)
+            if isinstance(valeur, (str, bytes, os.PathLike)):
+                raise TypeError(f"Confinement.{nom} must be a list of directories, not a single path: {valeur!r}")
+            chemins: list[str] = []
+            for chemin in valeur:
+                if not isinstance(chemin, (str, os.PathLike)):
+                    raise TypeError(f"Confinement.{nom}: each directory must be a path, got {chemin!r}")
+                texte = os.fspath(chemin)
+                if not isinstance(texte, str) or not texte.startswith("/"):
+                    raise ValueError(f"Confinement.{nom}: {texte!r} is not an absolute path")
+                chemins.append(texte)
+            object.__setattr__(self, nom, tuple(chemins))
+        if not isinstance(self.network, bool):
+            raise TypeError(f"Confinement.network must be True or False, got {self.network!r}")
+
+
+def _landlock_abi() -> int:
+    """La version de Landlock que le noyau offre à CE processus (0 : absent, désactivé ou filtré)."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.syscall.restype = ctypes.c_long
+        abi = libc.syscall(ctypes.c_long(444), None, ctypes.c_long(0), ctypes.c_long(1))
+    except Exception:
+        return 0
+    return int(abi) if abi > 0 else 0
+
+
+def _seccomp_disponible() -> bool:
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        return bool(libc.prctl(ctypes.c_long(21), ctypes.c_long(0), ctypes.c_long(0), ctypes.c_long(0),
+                               ctypes.c_long(0)) >= 0)                       # PR_GET_SECCOMP
+    except Exception:
+        return False
+
+
+def _confinement_impossible() -> str | None:
+    """Pourquoi le confinement ne peut PAS être posé sur cette machine — ou `None` s'il le peut. Mesuré
+    sous Linux x86_64 (Landlock ABI 3). Ailleurs on refuse plutôt que de prétendre : la table d'appels
+    système dépend de l'architecture, et Windows comme macOS n'ont ni Landlock ni seccomp."""
+    if not sys.platform.startswith("linux"):
+        return f"Linux only (this platform: {sys.platform})"
+    machine = platform.machine()
+    if machine != "x86_64":
+        return f"x86_64 only for now (this machine: {machine}): the system-call filter is written per architecture"
+    abi = _landlock_abi()
+    if abi < _LANDLOCK_ABI_MIN:
+        return (f"Landlock ABI {_LANDLOCK_ABI_MIN} or later is required (kernel 6.2+, Landlock enabled and not "
+                f"filtered out by an outer sandbox); this process sees {abi or 'none'}")
+    if not _seccomp_disponible():
+        return "seccomp filters are not available to this process"
+    return None
+
+
+def _regles_du_runtime() -> list[tuple[str, int]]:
+    """Ce que tout outil confiné peut lire : l'interpréteur, les bibliothèques du système, les fuseaux."""
+    candidats = [sysconfig.get_path("stdlib"), sysconfig.get_path("platstdlib"),
+                 os.path.join(sys.base_prefix, "lib"), os.path.join(sys.base_exec_prefix, "lib"),
+                 *_DOSSIERS_SYSTEME]
+    regles: dict[str, int] = {}
+    for candidat in candidats:
+        if candidat and os.path.isdir(candidat):
+            regles.setdefault(os.path.realpath(candidat), _LL_LECTURE)
+    for chemin, droits in _PERIPHERIQUES:
+        if os.path.exists(chemin):
+            regles.setdefault(chemin, droits)
+    for chemin in _FICHIERS_SYSTEME:
+        if os.path.isfile(chemin):
+            regles.setdefault(os.path.realpath(chemin), _LL_LIRE_FICHIER)
+    return list(regles.items())
+
+
+def _regles_du_reseau() -> list[tuple[str, int]]:
+    regles: dict[str, int] = {}
+    for chemin in _FICHIERS_RESEAU:
+        if os.path.isfile(chemin):
+            regles.setdefault(os.path.realpath(chemin), _LL_LIRE_FICHIER)
+    for chemin in _DOSSIERS_RESEAU:
+        if os.path.isdir(chemin):
+            regles.setdefault(os.path.realpath(chemin), _LL_LECTURE)
+    return list(regles.items())
+
+
+def _amorce_confinement(regles: list[tuple[str, int]], reseau_ouvert: bool) -> str:
+    """Le préambule à coller devant un runner : pose Landlock puis seccomp, et s'efface. Seules des données
+    calculées par l'hôte y sont écrites (chemins accordés par l'hôte, entiers, filtre) — rien de l'outil."""
+    programme, positions = _filtre_seccomp(reseau_ouvert)
+    return (_AMORCE_CONFINEMENT
+            .replace("@ABI_MIN@", str(_LANDLOCK_ABI_MIN))
+            .replace("@TOUS@", str(_LL_TOUS))
+            .replace("@LIRE_FICHIER@", str(_LL_LIRE_FICHIER))
+            .replace("@REGLES@", repr(regles))
+            .replace("@FILTRE@", programme.hex())
+            .replace("@POSITIONS@", repr(positions)))
+
+
+# ---------------------------------------------------------------------------
 # Warm worker (0.22.0) — one persistent Python process per tool, so the ~115 ms
 # interpreter start-up is paid once, not at every call. Opt-in
 # (`SubprocessSandbox(warm=True)`). Line-delimited JSON over the child's stdio:
@@ -345,10 +684,12 @@ class _WarmWorker:
     def __init__(
         self, path: Path, code: str, sha: str, timeout: float, max_calls: int,
         limits: SandboxLimits | None = None,
+        amorce_confinement: str = "",
     ) -> None:
         self.path, self.code, self.sha = path, code, sha
         self.timeout, self.max_calls = timeout, max_calls
         self.limits = limits
+        self.amorce_confinement = amorce_confinement
         self.calls = 0
         self.proc: subprocess.Popen[str] | None = None
         self.verrou = threading.Lock()
@@ -368,7 +709,8 @@ class _WarmWorker:
 
     def _demarrer(self) -> None:
         proc = subprocess.Popen(
-            [sys.executable, "-X", "utf8", "-I", "-S", "-B", "-u", "-c", _amorce_plafonds(self.limits) + _WARM_RUNNER_CODE],
+            [sys.executable, "-X", "utf8", "-I", "-S", "-B", "-u", "-c",
+             _amorce_plafonds(self.limits) + self.amorce_confinement + _WARM_RUNNER_CODE],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", bufsize=1,
             env=_child_env(), cwd=str(self.path.parent),
@@ -498,20 +840,33 @@ def _drive_bridge(
         if on_timeout:
             on_timeout()
 
+    def _fin_sans_resultat() -> ToolError:
+        """L'enfant est sorti sans rendre de résultat. On laisse au fil qui lit stderr le temps de finir :
+        c'est là qu'est la raison (un préambule de plafonds ou de confinement qui a refusé de démarrer)."""
+        if timed_out["value"]:
+            return ToolError(f"Generated tool timed out after {timeout}s")
+        drainer.join(timeout=2)
+        return ToolError(f"Sandbox ended without a result. stderr={''.join(stderr_chunks)[:400]!r}{diagnostic}")
+
+    def _ecrire(ligne: str) -> None:
+        """Un enfant mort avant de lire (préambule en échec) faisait remonter une `BrokenPipeError` BRUTE,
+        selon qui des deux processus allait le plus vite. C'est une erreur du bac à sable : `ToolError`."""
+        assert proc.stdin is not None
+        try:
+            proc.stdin.write(ligne + "\n")
+            proc.stdin.flush()
+        except OSError as exc:
+            raise _fin_sans_resultat() from exc
+
     timer = threading.Timer(timeout, _kill)
     timer.start()
     try:
         assert proc.stdin is not None and proc.stdout is not None
-        proc.stdin.write(json.dumps(init_payload, ensure_ascii=False) + "\n")
-        proc.stdin.flush()
+        _ecrire(json.dumps(init_payload, ensure_ascii=False))
         while True:
             line = proc.stdout.readline()
             if not line:
-                if timed_out["value"]:
-                    raise ToolError(f"Generated tool timed out after {timeout}s")
-                raise ToolError(
-                    f"Sandbox ended without a result. stderr={''.join(stderr_chunks)[:400]!r}{diagnostic}"
-                )
+                raise _fin_sans_resultat()
             try:
                 msg = json.loads(line)
             except json.JSONDecodeError as exc:
@@ -538,8 +893,7 @@ def _drive_bridge(
                             resp = {"ok": True, "result": fn(**(msg.get("args") or {}))}
                         except Exception as exc:
                             resp = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-                proc.stdin.write(json.dumps(resp, ensure_ascii=False, default=repr) + "\n")
-                proc.stdin.flush()
+                _ecrire(json.dumps(resp, ensure_ascii=False, default=repr))
             elif kind == "result":
                 return {key: value for key, value in msg.items() if key != "t"}
             else:
@@ -649,6 +1003,12 @@ class SubprocessSandbox:
     mémoire, de CPU et de taille de fichier ; sans eux, RIEN n'est borné hormis le
     délai mur. Ce ne sont pas une frontière — voir :class:`SandboxLimits` et
     :meth:`isolation`, qui dit ce que ce bac à sable fait réellement respecter.
+
+    ``confine=Confinement(...)`` (opt-in, Linux x86_64) fait de ce sous-processus une
+    vraie frontière, appliquée par le noyau : fichiers hors liste blanche, réseau,
+    lancement de programmes et autres processus sont refusés quoi que le code écrive
+    — voir :class:`Confinement`. Là où il ne peut pas être posé, la construction est
+    REFUSÉE plutôt que de tourner sans frontière.
     """
 
     timeout: float = 10.0
@@ -656,10 +1016,35 @@ class SubprocessSandbox:
     warm_max_calls: int = 200
     warm_max_workers: int = 8
     limits: SandboxLimits | None = None
+    confine: Confinement | None = None
     _workers: dict[str, _WarmWorker] = field(default_factory=dict, init=False, repr=False, compare=False)
     _verrou: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
+    _confine_abi: int = field(default=0, init=False, repr=False, compare=False)
+    _confine_regles: list[tuple[str, int]] = field(default_factory=list, init=False, repr=False, compare=False)
+    _confine_lecture: list[str] = field(default_factory=list, init=False, repr=False, compare=False)
+    _confine_ecriture: list[str] = field(default_factory=list, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if self.confine is not None:
+            if not isinstance(self.confine, Confinement):
+                raise TypeError(f"confine must be a Confinement (or None), got {type(self.confine).__name__}")
+            raison = _confinement_impossible()
+            if raison is not None:
+                raise ToolError(
+                    f"SubprocessSandbox(confine=...): kernel confinement cannot be applied here — {raison}. The "
+                    "tool would run with NO boundary, so this is refused. Drop confine=, or use DockerSandbox."
+                )
+            regles = dict(_regles_du_runtime())
+            for nom, droits, declares in (("read", _LL_LECTURE, self._confine_lecture),
+                                          ("write", _LL_ECRITURE, self._confine_ecriture)):
+                for chemin in getattr(self.confine, nom):
+                    if not os.path.isdir(chemin):
+                        raise ValueError(f"Confinement.{nom}: {chemin!r} is not an existing directory")
+                    reel = os.path.realpath(chemin)
+                    declares.append(reel)
+                    regles[reel] = regles.get(reel, 0) | droits
+            self._confine_regles = list(regles.items())
+            self._confine_abi = _landlock_abi()
         if self.limits is not None:
             if not isinstance(self.limits, SandboxLimits):
                 raise TypeError(f"limits must be a SandboxLimits (or None), got {type(self.limits).__name__}")
@@ -688,6 +1073,23 @@ class SubprocessSandbox:
         plafonds: dict[str, float] = {"timeout_s": float(self.timeout)}
         if self.limits is not None:
             plafonds.update(self.limits.as_dict())
+        if self.confine is not None:
+            # Confiné : c'est le noyau qui applique les règles (Landlock + seccomp). `kind` reste distinct de
+            # "docker" — le noyau est partagé, et un hôte qui exige un conteneur peut continuer à l'exiger.
+            # `network_isolated` : coupé, sauf `network=True` (rouvert alors pour les outils qui en ont la permission).
+            return {
+                "kind": "subprocess+confine",
+                "os_boundary": True,
+                "network_isolated": not self.confine.network,
+                "filesystem_isolated": True,
+                "env_scrubbed": True,
+                "confinement": {
+                    "landlock_abi": self._confine_abi, "seccomp": "denylist", "arch": "x86_64",
+                    "read": list(self._confine_lecture), "write": list(self._confine_ecriture),
+                    "network": self.confine.network,
+                },
+                "limits": plafonds,
+            }
         return {
             "kind": "subprocess",
             "os_boundary": False,
@@ -708,7 +1110,17 @@ class SubprocessSandbox:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def _run_warm(self, path: Path, args: JsonDict, context: JsonDict) -> JsonDict:
+    def _amorce_du_confinement(self, reseau_ouvert: bool) -> str:
+        if self.confine is None:
+            return ""
+        regles = self._confine_regles + (_regles_du_reseau() if reseau_ouvert else [])
+        return _amorce_confinement(regles, reseau_ouvert)
+
+    def _amorce(self, reseau_ouvert: bool) -> str:
+        """Ce qui précède le runner : les plafonds, puis le confinement. Chaîne vide sans l'un ni l'autre."""
+        return _amorce_plafonds(self.limits) + self._amorce_du_confinement(reseau_ouvert)
+
+    def _run_warm(self, path: Path, args: JsonDict, context: JsonDict, reseau_ouvert: bool = False) -> JsonDict:
         code = path.read_text(encoding="utf-8")
         sha = hashlib.sha256(code.encode("utf-8")).hexdigest()
         cle = str(path)
@@ -724,7 +1136,10 @@ class SubprocessSandbox:
             if worker is None:
                 while len(self._workers) >= max(1, self.warm_max_workers):
                     a_fermer.append(self._workers.pop(next(iter(self._workers))))
-                worker = _WarmWorker(path, code, sha, self.timeout, max(1, self.warm_max_calls), self.limits)
+                worker = _WarmWorker(
+                    path, code, sha, self.timeout, max(1, self.warm_max_calls), self.limits,
+                    amorce_confinement=self._amorce_du_confinement(reseau_ouvert),
+                )
             self._workers[cle] = worker
         for ancien in a_fermer:                    # hors du verrou global ; attend l'appel en cours
             with ancien.verrou:
@@ -743,22 +1158,26 @@ class SubprocessSandbox:
         # `allow_network` is accepted for signature-parity with DockerSandbox
         # but a plain subprocess CANNOT isolate the network — here the AST
         # `network` permission gate is the only control. Real network
-        # isolation requires DockerSandbox.
+        # isolation requires DockerSandbox, or `confine=` : confiné, le réseau
+        # ne se rouvre que si l'HÔTE l'a dit (`Confinement(network=True)`) ET
+        # que l'outil porte la permission.
+        reseau_ouvert = bool(self.confine is not None and self.confine.network and allow_network)
         del allow_network
         path = Path(file_path).resolve()
+        amorce = self._amorce(reseau_ouvert)
         if host_functions:
             code = path.read_text(encoding="utf-8")
-            cmd = [sys.executable, "-X", "utf8", "-I", "-S", "-u", "-c", _amorce_plafonds(self.limits) + _BRIDGE_RUNNER_CODE]
+            cmd = [sys.executable, "-X", "utf8", "-I", "-S", "-u", "-c", amorce + _BRIDGE_RUNNER_CODE]
             return _drive_bridge(
                 cmd, {"code": code, "args": args, "context": context or {}}, host_functions, self.timeout,
                 env=_child_env(), cwd=str(path.parent), diagnostic=_indice_plafonds(self.limits),
             )
         if self.warm:
-            return self._run_warm(path, args, context or {})
+            return self._run_warm(path, args, context or {}, reseau_ouvert)
         payload = json.dumps({"args": args, "context": context or {}}, ensure_ascii=False)
         try:
             completed = subprocess.run(
-                [sys.executable, "-X", "utf8", "-I", "-S", "-B", "-c", _amorce_plafonds(self.limits) + RUNNER_CODE,
+                [sys.executable, "-X", "utf8", "-I", "-S", "-B", "-c", amorce + RUNNER_CODE,
                  str(path)],
                 input=payload,
                 text=True,
@@ -1077,21 +1496,49 @@ def discard_generated_tool(tool: GeneratedPythonTool | Path) -> None:
         pass
 
 
+def _bac_par_defaut(permissions: Any = (), *, timeout: float = 10.0) -> "SubprocessSandbox":
+    """Le bac d'un outil quand l'HÔTE n'en a pas choisi (main, non publié).
+
+    Règle : le noyau fait respecter ce que les permissions disent déjà. Un outil sans permission
+    ``filesystem.*`` n'a pas de fichiers ; sans permission ``network``, pas de réseau — là où le
+    confinement peut être posé (Linux x86_64, Landlock ABI 3). Deux cas rendent le sous-processus
+    SIMPLE d'avant, qui n'est pas une frontière et le dit :
+
+    * la machine ne permet pas le confinement (Windows, macOS, ARM64, noyau trop ancien) ;
+    * l'outil porte une permission ``filesystem.*`` : l'hôte a accordé des fichiers sans dire
+      LESQUELS, et une liste blanche ne s'invente pas. Pour le confiner, passer
+      ``sandbox=SubprocessSandbox(confine=Confinement(read=[...], write=[...]))``.
+
+    Pour retrouver le bac d'avant partout : ``sandbox=SubprocessSandbox()``."""
+    demande_des_fichiers = any(str(p).startswith("filesystem.") for p in (permissions or ()))
+    if not demande_des_fichiers and _confinement_impossible() is None:
+        try:
+            return SubprocessSandbox(timeout=timeout, confine=Confinement(network=True))
+        except (ToolError, ValueError, OSError):
+            _log.exception("kernel confinement could not be set up; falling back to the plain subprocess")
+    return SubprocessSandbox(timeout=timeout)
+
+
 def make_sandbox(
     *, prefer_docker: bool = True, timeout: float = 10.0, image: str = "python:3.11-slim",
-    require_docker: bool = False,
+    require_docker: bool = False, require_boundary: bool = False,
 ) -> "SubprocessSandbox | DockerSandbox":
-    """Return a DockerSandbox when a Docker daemon is available (real
-    OS-level isolation), else the hardened SubprocessSandbox as a fallback.
+    """Return the strongest sandbox available: a DockerSandbox when a Docker
+    daemon is reachable, else a kernel-confined SubprocessSandbox where the
+    kernel allows it (Linux x86_64, Landlock ABI 3 — main, unreleased), else
+    the plain SubprocessSandbox.
 
-    The fallback is NOT an isolation boundary (an AST denylist behind ``-I -S``),
-    so it is no longer silent (0.23.1) : a warning, once per process, says so.
-    ``require_docker=True`` refuses instead of falling back — raises ``ToolError``
-    when no usable Docker daemon is reachable. Pass ``prefer_docker=False`` to
-    choose the subprocess knowingly (no warning). ``sandbox.isolation()`` tells
-    what the returned sandbox really enforces."""
-    if require_docker and not prefer_docker:
-        raise ValueError("require_docker=True contradicts prefer_docker=False")
+    The plain subprocess is NOT an isolation boundary (an AST denylist behind
+    ``-I -S``), so falling back to it is not silent (0.23.1) : a warning, once
+    per process, says so. ``require_docker=True`` refuses anything but Docker;
+    ``require_boundary=True`` accepts Docker or the confined subprocess and
+    refuses the plain one — both raise ``ToolError``. Pass ``prefer_docker=False``
+    to choose the plain subprocess knowingly (no warning). The confined fallback
+    behaves like the container for a tool's permissions: no host file, network
+    only for a tool holding ``network``. ``sandbox.isolation()`` tells what the
+    returned sandbox really enforces."""
+    if (require_docker or require_boundary) and not prefer_docker:
+        raise ValueError("require_docker=True / require_boundary=True contradict prefer_docker=False")
     if prefer_docker and docker_available():
         return DockerSandbox(image=image, timeout=timeout)
     if require_docker:
@@ -1099,6 +1546,16 @@ def make_sandbox(
             "make_sandbox(require_docker=True): no usable Docker daemon (Linux containers) is reachable, and "
             "the fallback SubprocessSandbox is not an isolation boundary, so nothing is run. Start Docker, or "
             "drop require_docker=True to accept the weaker sandbox."
+        )
+    if prefer_docker:
+        confine = _bac_par_defaut(timeout=timeout)
+        if confine.confine is not None:
+            return confine
+    if require_boundary:
+        raise ToolError(
+            "make_sandbox(require_boundary=True): neither a Docker daemon nor kernel confinement is available "
+            f"here ({_confinement_impossible() or 'confinement could not be set up'}), and the plain "
+            "SubprocessSandbox is not an isolation boundary, so nothing is run."
         )
     if prefer_docker:
         warn_once(
@@ -1123,7 +1580,7 @@ def load_generated_tool(
         permissions=metadata.get("permissions") or [],
     )
     validate_generated_tool_code(code, permissions=spec.permissions)
-    return GeneratedPythonTool(spec=spec, file_path=path, sandbox=sandbox or SubprocessSandbox())
+    return GeneratedPythonTool(spec=spec, file_path=path, sandbox=sandbox or _bac_par_defaut(spec.permissions))
 
 
 def extract_tool_metadata(code: str) -> JsonDict:

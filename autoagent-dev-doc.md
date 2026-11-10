@@ -63,6 +63,7 @@
 42. [0.24.0 — se mesurer : un banc d'injection, un banc de pannes, un juge audité, des durées](#42-0240--se-mesurer--un-banc-dinjection-un-banc-de-pannes-un-juge-audité-des-durées) *(0.24.0)*
 43. [Le code comme action en une ligne — `enable_code_action()`](#43-le-code-comme-action-en-une-ligne--enable_code_action) *(non publiée)*
 44. [La voix en continu — Gemini Live sous la boucle](#44-la-voix-en-continu--gemini-live-sous-la-boucle) *(non publiée)*
+45. [Le confinement par le noyau — une frontière sans Docker](#45-le-confinement-par-le-noyau--une-frontière-sans-docker) *(non publiée)*
 
 ---
 
@@ -129,7 +130,8 @@
 - Une clé API d'un provider LLM (OpenAI, Anthropic, DeepSeek, Gemini)
 - **Docker** — *optionnel mais recommandé* : il fournit la vraie isolation OS des tools dynamiques
   (`DockerSandbox`, §11.4). Sans démon Docker, `make_sandbox()` retombe automatiquement sur
-  `SubprocessSandbox` (durcissement AST seul, pas d'isolation réseau). Pas besoin de Docker si tu
+  `SubprocessSandbox` (durcissement AST seul, pas d'isolation réseau) — ou, sur `main` (non publié), sur
+  le sous-processus CONFINÉ par le noyau là où Linux le permet (§45). Pas besoin de Docker si tu
   n'utilises pas les tools dynamiques.
 
 ### 2.2 Installer
@@ -1608,7 +1610,11 @@ reach Docker, which can enable code execution through arbitrary C function calls
 - **`make_sandbox(require_docker=True)`** lève `ToolError` quand aucun démon Docker (conteneurs
   Linux) n'est joignable : fail-closed, rien ne s'exécute. `require_docker=True` avec
   `prefer_docker=False` est contradictoire (`ValueError`) ;
-- `prefer_docker=False` choisit le sous-processus **en connaissance de cause** : aucun avertissement.
+- `prefer_docker=False` choisit le sous-processus **en connaissance de cause** : aucun avertissement ;
+- *(sur `main`, non publié — §45)* entre Docker et le sous-processus simple, `make_sandbox()` essaie le
+  sous-processus **confiné par le noyau** (Linux x86_64) : une frontière, donc pas d'avertissement.
+  **`make_sandbox(require_boundary=True)`** accepte Docker ou ce bac confiné et refuse le sous-processus
+  simple (`ToolError`).
 
 ```python
 from autoagent.sandbox import make_sandbox
@@ -1627,7 +1633,9 @@ DockerSandbox().isolation()
 #  'env_scrubbed': True, 'limits': {'timeout_s': 10.0, 'memory': '256m', 'cpus': '1.0', 'pids': 128}}
 ```
 
-`os_boundary` n'est vrai que pour Docker. `limits` ne liste que les plafonds RÉELS (le délai mur,
+`os_boundary` est vrai pour Docker, et pour un sous-processus confiné par le noyau
+(`SubprocessSandbox(confine=Confinement())`, sur `main`, non publié — §45 ; son `kind` est
+`"subprocess+confine"`). `limits` ne liste que les plafonds RÉELS (le délai mur,
 plus ceux de `SandboxLimits` s'ils sont posés). `network_isolated` pour Docker : le réseau est
 coupé tant que l'outil n'a pas la permission `network`.
 
@@ -2218,7 +2226,8 @@ autoagent/
 │                            # 0.22.0 — reprise des refus, bibliothèque persistante, host_functions,
 │                            # PythonRunner (§11.7, §11.9)
 ├── sandbox.py               # SubprocessSandbox (+ warm 0.22.0, + limits=SandboxLimits 0.23.1), DockerSandbox,
-│                            # make_sandbox(require_docker=), isolation() — 0.23.1 — pont host-function
+│                            # make_sandbox(require_docker=), isolation() — 0.23.1 — pont host-function ;
+│                            # main (non publié) — confine=Confinement : Landlock + seccomp, Linux x86_64 (§45)
 ├── approval.py              # ToolManifest (allowlist par hash) + promotion humaine + CLI
 ├── orchestrator.py          # 0.9.0 — Orchestrator, Step, TurnEvent (flux piloté par l'hôte, §15)
 ├── http.py                  # post_json / post_sse (urllib + retry/backoff + jitter, Retry-After ms/s/date — 0.23.1) ;
@@ -2350,6 +2359,7 @@ from autoagent.trace import truncate_preview        # helper public pour preview
 from autoagent.eval import run_k, ReliabilityReport  # 0.18.0 — fiabilité pass^k (§25.4)
 from autoagent.compare import detectable_difference, paired_interval, paired_p_value, wilson_interval  # §38
 from autoagent.sandbox import SandboxLimits, make_sandbox   # 0.23.1 — plafonds du sous-processus, repli refusable (§11.4)
+from autoagent.sandbox import Confinement                    # main (non publié) — confinement par le noyau (§45)
 from autoagent.http import is_retryable_status               # 0.23.1 — quels statuts HTTP sont relancés (§41.2)
 from autoagent.judge import audit_check, result_from, trivial_negatives     # 0.24.0 — auditer un juge (§42.4)
 from autoagent.redteam import (                              # 0.24.0 — le banc d'injection à canari (§42.1)
@@ -5425,6 +5435,129 @@ interrompu avant n'a pas de consommation, et `token_budget` ne voit pas ce que l
 facturation des jetons de réflexion du mode Live n'est pas documentée ici : on applique la règle du Gemini REST
 (sortie = réponse + réflexion). Pas de mode asynchrone (choix de la bibliothèque), pas d'autre fournisseur Live,
 pas encore de démo numérotée ni d'entrée dans le constructeur visuel.
+
+## 45. Le confinement par le noyau — une frontière sans Docker
+
+*(sur `main`, non publiée)* Le modèle écrit de plus en plus de code (`run_python`, `enable_code_action()`, les
+outils générés), et ce code tourne dans un `SubprocessSandbox` que retient une liste d'interdits sur la syntaxe —
+contournable, la bibliothèque le dit depuis la 0.22.0. Une fois contournée, le code a les droits du processus
+hôte. `DockerSandbox` est la réponse là où Docker existe ; il n'existe pas partout (un serveur sans démon, une prod
+déjà dans un conteneur, une carte embarquée). `confine=` donne au sous-processus une frontière que le NOYAU
+applique, sans dépendance :
+
+```python
+from autoagent.sandbox import Confinement, SandboxLimits, SubprocessSandbox
+
+bac = SubprocessSandbox(confine=Confinement())                       # ni fichier, ni réseau, ni programme lancé
+bac = SubprocessSandbox(
+    confine=Confinement(read=["/srv/donnees"], write=["/srv/sorties"]),   # dossiers accordés par l'HÔTE
+    limits=SandboxLimits(memory_mb=256, cpu_s=10),                        # les ressources restent l'affaire de limits=
+)
+agent.enable_code_action(sandbox=bac)
+bac.isolation()   # {'kind': 'subprocess+confine', 'os_boundary': True, 'network_isolated': True,
+                  #  'filesystem_isolated': True, 'confinement': {'landlock_abi': 3, 'seccomp': 'denylist', …}, …}
+```
+
+**Deux mécanismes, posés par le runner avant le code de l'outil** (un préambule collé devant le runner, comme les
+plafonds de la 0.23.1 ; sans `confine=`, le runner reste octet pour octet celui d'avant) :
+
+- **Landlock** : le processus se retire l'accès aux fichiers, sauf une liste blanche — en lecture seule, la
+  bibliothèque standard, les bibliothèques partagées du système, les fuseaux horaires, le fichier de l'outil lui-même
+  et lui seul ; plus les dossiers `read` / `write` que l'hôte accorde. Irrévocable, hérité par les enfants, valable
+  pour root. Aucun droit d'exécuter un fichier n'est jamais accordé.
+- **seccomp** : un filtre d'appels système pour ce que Landlock ne couvre pas — le réseau, le lancement de
+  programmes, les autres processus (signaux, `ptrace`, limites), les droits et les dates des fichiers, les montages
+  et les espaces de noms. `kill` ne passe que vers soi ; un appel système ajouté par un futur noyau est refusé par
+  défaut (numéro au-delà du dernier connu).
+
+Un refus rend une **erreur** au code (`PermissionError`), pas la mort du processus : l'outil échoue, le modèle voit
+une erreur d'outil.
+
+**Mesuré par un banc écrit avant le code** (`tests/test_confinement.py`, WSL2 Ubuntu 24.04, noyau 6.6, Landlock
+ABI 3, CPython 3.10 / 3.12.3 système / 3.12.15 / 3.13). Les charges sont exécutées directement, SANS le validateur :
+on suppose la liste d'interdits contournée.
+
+| charge | sans `confine=` | avec |
+|---|---|---|
+| lire un fichier privé ; lister son dossier | réussit | `PermissionError` |
+| lire l'environnement d'un autre processus par `/proc/<pid>/environ` (une clé d'API témoin) ; celui de son parent | réussit | `PermissionError` |
+| écrire, vider, supprimer un fichier hors des dossiers accordés ; en changer les droits | réussit | `PermissionError` |
+| se connecter en TCP à un serveur local ; envoyer un datagramme UDP | réussit | `PermissionError` |
+| lancer `/bin/sh` | réussit | `PermissionError` |
+| tuer un autre processus ; lire ses limites | réussit | `PermissionError` |
+
+13 charges : 13 réussissent sans la couche (contrôle positif), 0 avec. Un enfant créé par `fork` reste confiné. Le
+légitime ne change pas : douze extraits (`json`, `re`, fuseaux et heure locale, `decimal`, `hashlib`, fils
+d'exécution, `asyncio`, `sqlite3` en mémoire, `mimetypes`, un signal à soi-même…) rendent le MÊME résultat avec et sans, ainsi
+que le pont `call_host`, le worker chaud et la combinaison avec `limits=`. Mutations : 28 variantes cassées, 28
+détectées — après l'ajout d'un test : retirer `execve` du filtre ne se voyait d'abord nulle part, Landlock refusant
+déjà de lancer un programme (deux barrières ; le filtre a maintenant son propre test, avec des numéros écrits en
+dur). Le filtre est une fonction pure : il est simulé instruction par instruction sur toute plateforme, Windows
+compris. Les numéros d'appels système ont été recoupés avec la table du noyau 6.12.
+
+**Surcoût** (médiane de 50 appels, bras alternés, CPython 3.12.15 et 3.12.3) : un processus par appel 21 → 27 ms
+(+5,5 à +5,8 ms) ; avec le pont 29 → 35 ms ; worker chaud 0,40 → 0,53 ms (+0,14 ms, le confinement n'étant posé
+qu'au démarrage du worker).
+
+**Le réseau** : `Confinement()` le coupe même pour un outil qui porte la permission `network`.
+`Confinement(network=True)` le rouvre pour ces outils-là seulement, et accorde alors en lecture les fichiers de
+résolution des noms et les certificats (testé : connexion TCP locale, `getaddrinfo('localhost')`, chargement des
+autorités de certification ; pas de requête HTTPS réelle vers l'extérieur).
+
+**Refuser plutôt que se replier** (fail-closed) : hors Linux x86_64, ou sans Landlock ABI 3 (noyau 6.2), la
+construction de `SubprocessSandbox(confine=...)` est REFUSÉE (`ToolError`) ; si le confinement ne se pose pas dans
+l'enfant (un dossier accordé qui a disparu), le préambule sort avant le code de l'outil. Le banc a trouvé là un
+défaut plus ancien : un enfant mort avant de lire son entrée faisait remonter du pont une `BrokenPipeError` brute,
+une fois sur deux selon la vitesse des deux processus ; c'est maintenant une `ToolError` qui cite la raison.
+`PythonRunner` et `DynamicToolBuilder` n'avertissent plus « pas une frontière » quand `isolation()` déclare
+`os_boundary` — Docker, ou ce confinement.
+
+**Le confinement automatique : quand l'hôte ne choisit pas de bac.** Là où le noyau le permet, le code écrit par
+le modèle tourne confiné SANS que l'hôte ait rien à passer. La règle tient en une phrase : *le noyau fait
+respecter ce que les permissions disent déjà* — un outil sans permission `filesystem.*` n'a pas de fichiers, un
+outil sans permission `network` n'a pas de réseau.
+
+| où | sans bac choisi par l'hôte |
+|---|---|
+| `PythonRunner()` — donc `enable_run_python()` et `enable_code_action()` | confiné, sauf si l'hôte lui a donné une permission `filesystem.*` |
+| `DynamicToolBuilder(...)` | choisi OUTIL PAR OUTIL : confiné, sauf l'outil qui porte une permission `filesystem.*` |
+| `load_generated_tool(fichier)` | selon les permissions de l'outil |
+| `make_sandbox()` | Docker, sinon le sous-processus confiné, sinon le sous-processus simple (qui avertit) ; `require_boundary=True` refuse ce dernier |
+
+Un outil à qui des fichiers ont été accordés sans dire LESQUELS tourne comme avant, dans le sous-processus simple,
+et l'avertissement « pas une frontière » part : une liste blanche ne s'invente pas. Pour le confiner, nommer les
+dossiers — `SubprocessSandbox(confine=Confinement(read=[...], write=[...]))`. Sur une machine que le noyau ne peut
+pas confiner (Windows, macOS, ARM64, noyau d'avant 6.2), RIEN ne change. Un bac passé par l'hôte n'est jamais
+remplacé : `sandbox=SubprocessSandbox()` rend le comportement d'avant.
+
+**C'est un changement de comportement, sous Linux x86_64** : un extrait SANS permission de fichiers qui en touchait
+quand même, par un module que la liste d'interdits ne connaît pas, échoue maintenant. `sqlite3.connect(chemin)`
+écrit un fichier sans `open()` ni module interdit : le validateur le laisse passer, le noyau le refuse (un test le
+fige, avec son contrôle positif). Sur la suite complète, ce défaut n'a changé le résultat d'aucun test d'outil ni
+d'aucune démo ; seuls trois tests qui vérifiaient l'AVERTISSEMENT du bac par défaut ont dû dire qu'ils parlent d'une
+machine sans confinement. Le banc des extraits légitimes a trouvé AVANT la livraison un vrai faux refus :
+`mimetypes.guess_type()` ouvre `/etc/mime.types` et levait `PermissionError` ; ces tables sont maintenant lisibles.
+
+**Vérifié sur un vrai modèle** (`gemini-3.7-flash`, banc d'efficacité `evals/eval_efficacite.py`, réglage
+`code_une_ligne`, sous Linux, bac par défaut) : familles D et E, une répétition, **8 tâches sur 8** ; sur un second
+run de 3 tâches, 4 programmes écrits par le modèle ont été comptés, **4 exécutés dans le bac confiné, 0 hors
+frontière**, dont un en échec sur une erreur du modèle lui-même (`TypeError`), corrigée au tour suivant. Ce n'est
+pas une comparaison : une répétition par modèle. Même run sur `deepseek-chat` : **8 tâches sur 8**, 6 programmes
+écrits par le modèle, **6 dans le bac confiné, 0 hors frontière, aucun en échec** (sur deux tâches, le modèle a
+répondu sans écrire de programme).
+
+**Ce qui n'est pas garanti, dit.** Le noyau est PARTAGÉ : une faille du noyau traverse cette frontière, comme elle
+traverse Docker. Mémoire, CPU et taille de fichier relèvent de `limits=` ; le nombre de processus n'est pas borné.
+L'existence et la taille d'un fichier restent visibles (`stat`), pas son contenu ni la liste de son dossier. Dans un
+dossier `write`, on ne change ni les droits ni les dates (`shutil.copy` échoue, `shutil.copyfile` passe). Ce qui
+passe par le pont `call_host` relève de la porte (§39). Le filtre est une liste d'interdits, fermée vers l'avenir —
+pas une liste blanche. Non couverts : ARM64 (la table d'appels système dépend de l'architecture ; à tester sur la
+carte), Windows, macOS, les noyaux d'avant 6.2. Le banc passe aussi lancé en root (uid 0, même machine) ; rien
+n'a été mesuré DANS un conteneur, dont le propre filtre peut refuser Landlock (la construction est alors refusée).
+Le
+confinement automatique ne nomme aucun dossier : un outil qui a besoin de fichiers demande un `Confinement(read=,
+write=)` écrit par l'hôte. Pas de dossier temporaire privé comme le `/tmp` du conteneur. Pas encore de démo
+numérotée ni d'entrée dans le constructeur visuel.
 
 ---
 *Doc maintenue par l'équipe Alyce R&D. Pour questions, ouvrir une issue sur le repo interne ou taper l'auteur sur Slack.*

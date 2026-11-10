@@ -24,6 +24,7 @@ from .sandbox import (
     DockerSandbox,
     GeneratedPythonTool,
     SubprocessSandbox,
+    _bac_par_defaut,
     discard_generated_tool,
     load_generated_tool,
     validate_generated_tool_code,
@@ -99,6 +100,16 @@ class ToolBuildRequest:
     permissions: list[str] = field(default_factory=list)
 
 
+def _a_une_frontiere(sandbox: Any) -> bool:
+    """Le bac à sable est-il une frontière que l'OS fait respecter ? C'est `isolation()` qui le dit :
+    un conteneur Docker, ou un sous-processus confiné par le noyau (`SubprocessSandbox(confine=...)`).
+    Un bac qui ne sait pas le dire compte pour « non » : l'avertissement part."""
+    try:
+        return bool(sandbox.isolation().get("os_boundary"))
+    except Exception:
+        return False
+
+
 class PythonRunner:
     """Exécute UN extrait de code Python écrit par le modèle — validé, sandboxé, jamais gardé (0.22.0).
 
@@ -134,14 +145,16 @@ class PythonRunner:
         humaine y REFUSE, un programme ne pouvant pas être mis en pause. Pour qu'une
         fonction compte comme `egress` ou `untrusted`, décore-la avec `autoagent.tool(...)`.
         Hors d'un run d'agent (le runner appelé à la main), rien n'est consulté."""
-        sandbox = sandbox or SubprocessSandbox(timeout=timeout)
+        self.permissions = sorted(set(permissions or []))
+        # Sans bac choisi par l'hôte : confiné par le noyau là où c'est possible, tant que le lanceur n'a pas
+        # de permission de fichiers (`sandbox._bac_par_defaut` dit la règle). Sinon le sous-processus d'avant.
+        sandbox = sandbox or _bac_par_defaut(self.permissions, timeout=timeout)
         if isinstance(sandbox, SubprocessSandbox) and sandbox.warm:
             sandbox = dataclasses.replace(sandbox, warm=False)
         self.sandbox = sandbox
-        self.permissions = sorted(set(permissions or []))
         self.max_code_chars = max_code_chars
         self.host_functions: dict[str, Callable[..., Any]] | None = dict(host_functions) if host_functions else None
-        if not isinstance(self.sandbox, DockerSandbox):
+        if not _a_une_frontiere(self.sandbox):
             warn_once(
                 _log, "dynamic.run_python_not_docker",
                 "run_python executes model-written code in a SubprocessSandbox (AST denylist, "
@@ -264,7 +277,11 @@ class DynamicToolBuilder:
         """
         self.provider = provider
         self.tools_dir = Path(tools_dir)
-        self.sandbox = sandbox or SubprocessSandbox(timeout=timeout)
+        # Sans bac choisi par l'hôte, le choix se fait OUTIL PAR OUTIL (`_bac_pour`) : confiné par le noyau
+        # là où c'est possible, sauf pour un outil qui porte une permission de fichiers.
+        self._bac_impose = sandbox is not None
+        self.sandbox = sandbox or _bac_par_defaut(timeout=timeout)
+        self._bac_sans_frontiere: SubprocessSandbox | None = None
         self.allowed_permissions = None if allowed_permissions is None else set(allowed_permissions)
         self.max_repairs = max(0, int(max_repairs))
         self.self_test_rel_tol = max(0.0, float(self_test_rel_tol))
@@ -279,7 +296,7 @@ class DynamicToolBuilder:
         # THREAD (comme `_CanalDepense`) : deux créations en `parallel_tool_calls`
         # ne s'écrasent pas leur dépense.
         self._local = threading.local()
-        if not isinstance(self.sandbox, DockerSandbox):
+        if not _a_une_frontiere(self.sandbox):
             # Le SubprocessSandbox est un validateur AST + un `-I -S` : une liste
             # d'interdits, PAS une frontière d'isolation (son propre code le dit).
             # Du code écrit par le modèle y reste contournable. On le dit une fois
@@ -290,6 +307,26 @@ class DynamicToolBuilder:
                 "(AST denylist, not an isolation boundary). For untrusted "
                 "capabilities pass sandbox=DockerSandbox(...) or make_sandbox().",
             )
+
+    def _bac_pour(self, permissions: Iterable[str] | None) -> SubprocessSandbox | DockerSandbox:
+        """Le bac d'UN outil. Celui de l'hôte s'il en a choisi un. Sinon le bac par défaut (confiné là où le
+        noyau le permet) — sauf pour un outil qui porte une permission ``filesystem.*`` : des fichiers ont
+        été accordés sans dire lesquels, il tourne donc comme avant, dans le sous-processus simple, et on le
+        dit une fois."""
+        if self._bac_impose or not _a_une_frontiere(self.sandbox):
+            return self.sandbox
+        if not any(str(p).startswith("filesystem.") for p in (permissions or ())):
+            return self.sandbox
+        with self._verrou:
+            if self._bac_sans_frontiere is None:
+                self._bac_sans_frontiere = SubprocessSandbox(timeout=self.sandbox.timeout)
+        warn_once(
+            _log, "dynamic.outil_fichiers_sans_frontiere",
+            "A generated tool holds a filesystem.* permission and no sandbox was chosen: it runs in a plain "
+            "SubprocessSandbox (AST denylist, not an isolation boundary), because no directory was named. "
+            "Pass sandbox=SubprocessSandbox(confine=Confinement(read=[...], write=[...])) to confine it.",
+        )
+        return self._bac_sans_frontiere
 
     @property
     def last_build_usage(self) -> TokenUsage | None:
@@ -415,7 +452,7 @@ class DynamicToolBuilder:
         # rester sur le disque : chargeable tel quel au prochain démarrage (0.22.0),
         # et son bytecode périmé rejouerait du code refusé (le bug `.pyc` vu en CI).
         try:
-            generated_tool = load_generated_tool(file_path, sandbox=self.sandbox)
+            generated_tool = load_generated_tool(file_path, sandbox=self._bac_pour(permissions))
             self._run_self_tests(generated_tool, tests)
         except Exception:
             discard_generated_tool(file_path)
@@ -559,6 +596,7 @@ class DynamicToolBuilder:
             try:
                 outil = load_generated_tool(chemin, sandbox=self.sandbox)       # revalide l'AST
                 self._check_permissions(list(outil.spec.permissions or []))
+                outil.sandbox = self._bac_pour(outil.spec.permissions)
             except (ToolValidationError, OSError, SyntaxError, ValueError) as exc:
                 _log.warning("library tool %r not loaded: %s", nom, exc)
                 continue
