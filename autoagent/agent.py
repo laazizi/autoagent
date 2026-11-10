@@ -23,6 +23,7 @@ from .errors import (
     ToolError,
 )
 from .gate import ActionGate, active_gate, gate_scope
+from .output_guard import OutputGuard, guard_output, resolve_output_guard
 from .guards import (  # noqa: F401 — re-exportés pour les tests
     TurnGuards,
     _call_signature,
@@ -597,6 +598,9 @@ class Agent:
             explicit keyword that differs from its default overrides the
             corresponding field. ``agent.bounds`` is a snapshot of the
             bounds IN FORCE (the attributes stay plain and writable).
+        output_guard: ``"off"`` (défaut), ``"neutralize"`` ou un `OutputGuard(...)` : dans un run TEINTÉ, toute
+            URL de la réponse absente mot pour mot du transcript est retirée (image Markdown vers un hôte inconnu,
+            lien de référence, balise HTML…) et un événement `output_guard_block` le trace. Voir `output_guard.py`.
         shadow_guards: OBSERVE the built-in guards instead of enforcing
             them (0.20.0). ``False`` (default) keeps the historical
             behaviour: a guard that fires refuses the call. Set it and
@@ -666,6 +670,7 @@ class Agent:
         trifecta_guard: str = "deny",
         bounds: Bounds | None = None,
         journal: Journal | None = None,
+        output_guard: str | OutputGuard = "off",
     ) -> None:
         self.provider = provider
         self.journal = journal
@@ -688,6 +693,8 @@ class Agent:
         self.shadow_guards = shadow_guards
         self.max_repeated_tool_calls = max_repeated_tool_calls
         self.trifecta_guard = trifecta_guard
+        # Garde de la RÉPONSE (`output_guard.py`) : en run teinté, les URL non vues mot pour mot sont retirées.
+        self.output_guard = resolve_output_guard(output_guard)
         if bounds is not None:
             # `Bounds` pose les huit bornes d'un coup ; un kwarg donné
             # EXPLICITEMENT (différent de sa valeur par défaut) l'emporte —
@@ -2173,6 +2180,10 @@ class Agent:
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                 )
+                # Garde de la réponse : sur un run déjà teinté, le texte n'est PAS diffusé au fil du flux (une URL
+                # d'exfiltration serait déjà partie) ; il est neutralisé puis rendu d'un bloc (en mode témoin : diffusé).
+                retenir_flux = bool(self.output_guard is not None and not self.shadow_guards
+                                    and (taint[0] or is_tainted(working_messages)))
                 if streaming:
                     # Drive the provider's streaming generator, re-emitting
                     # text deltas and capturing the assembled final response.
@@ -2202,7 +2213,8 @@ class Agent:
                             if cancel_token is not None and cancel_token.is_set():
                                 _lever_annulation(step)
                             if chunk.type == "text" and chunk.text:
-                                yield StreamEvent(type="text", text=chunk.text)
+                                if not retenir_flux:     # garde de réponse active sur un run teinté : le texte attend
+                                    yield StreamEvent(type="text", text=chunk.text)
                             elif chunk.type == "tool_call" and chunk.tool_call is not None:
                                 _lancer_en_avance(chunk.tool_call, step, req_span)
                             elif chunk.type == "final":
@@ -2244,6 +2256,25 @@ class Agent:
                     if response.usage.cached_tokens is not None:
                         spent_cached += response.usage.cached_tokens
                         saw_cached = True
+                if self.output_guard is not None and (taint[0] or is_tainted(working_messages)):
+                    try:
+                        propre, trouvees = guard_output(response.content or "", working_messages, self.output_guard)
+                    except Exception:     # la garde de réponse ne casse pas un run : sur doute, la réponse est vidée
+                        _log.exception("output_guard failed — answer withheld (fail-closed)")
+                        propre, trouvees = "", [None]
+                    if trouvees:
+                        self._emit(
+                            "output_guard_would_block" if self.shadow_guards else "output_guard_block",
+                            {"step": step, "count": len(trouvees),
+                             "items": [t.to_dict() for t in trouvees if t is not None]},
+                            parent_id=req_span,
+                        )
+                        if self.shadow_guards:
+                            temoin[0] += len(trouvees)
+                        else:
+                            response.content = propre
+                    if retenir_flux and response.content:
+                        yield StreamEvent(type="text", text=response.content)
                 vide = not response.tool_calls and not (response.content or "").strip()
                 if vide and response.finish_reason == "malformed" and not relance_faite:
                     # Appel d'outil que le fournisseur n'a pas su former

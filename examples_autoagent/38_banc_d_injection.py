@@ -101,7 +101,7 @@ def niveau_1() -> None:
     print("\n  -> la garde brutale et la politique fine arretent les MEMES six envois ; la premiere tue")
     print("     l'utilite (0/8), la seconde la garde (8/8).")
     print("  -> « image_markdown » aboutit dans LES TROIS : l'ordre d'ecrire le code dans l'URL d'une image")
-    print("     rendue passe par la REPONSE, canal qu'aucune garde de la lib ne regarde. A couvrir cote hote")
+    print("     rendue passe par la REPONSE, canal que seule `Agent(output_guard="neutralize")` (opt-in) regarde. A couvrir cote hote")
     print("     (filtre de sortie, rendu d'images desactive).")
 
     ligne("5) compare_configs : « la politique par argument est-elle meilleure ? »")

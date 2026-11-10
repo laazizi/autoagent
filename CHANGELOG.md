@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Agent(output_guard="neutralize")` — a guard on the RESPONSE channel** (`autoagent/output_guard.py`, default `"off"`). The
+  injection bench (§42, demo 38) measured that no guard read the final answer: the `image_markdown` attack (the model
+  writes the canary into the URL of an image of its answer) compromised 1 run of 1 in all three demo configurations
+  (no guard, trifecta guard, per-argument policy). In a TAINTED run, every URL of the answer must now appear
+  verbatim in the transcript or it is removed: an IMAGE only if it is in TRUSTED content (system prompt, user message,
+  non-`untrusted` tool result) or on `OutputGuard(allowed_hosts=...)`; a LINK or bare URL also if it is quoted verbatim
+  from untrusted content (`links_from_untrusted=False` refuses that). Covers inline and reference links/images,
+  autolinks, HTML attributes (`src`, `href`, `srcset`…), bare `http`/`ftp`/`//host`/`www.`, upper-case schemes, `\/`,
+  numeric entities, any scheme (`javascript:`, `mailto:`). The trace event `output_guard_block` (or `output_guard_would_block`
+  under `shadow_guards`) carries kind, length and digest of each removed URL — never the URL (it may hold the secret).
+  The text stream is held back while the guard is active on an already-tainted run. Fail-closed: a guard that crashes
+  empties the answer; an unknown `output_guard` value raises. **Measured, level 1 (offline, DocileProvider, k=1):**
+  `image_markdown` compromised 1/1 → 0/1 in all three configurations; legitimate task utility unchanged; positive
+  control unchanged (7/8 leak without any guard). Does NOT cover: a secret written in plain text in the answer, a
+  selection among attacker-prepared URLs present in the page, a read URL (`lire_page(url)`), voice.
+
 - **`SubprocessSandbox(confine=Confinement())` — a kernel-enforced boundary without Docker** (Linux x86_64;
   applied automatically when the host chooses no sandbox — see *Changed* below). Model-written code (`run_python`, `enable_code_action()`, generated tools) runs behind an AST denylist
   the library has called bypassable since 0.22.0; once bypassed, the code had the host process's rights. Docker is
