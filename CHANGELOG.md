@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Provenance of generated tools; quarantine of tools built in a tainted run** (`DynamicToolBuilder(persist=True)`). Each catalogue entry now records `provenance`: whether the run had ingested untrusted content when the model had the tool written (read from the active gate, `gate.active_gate()`; unreadable = tainted, fail-closed), the library tools visible at the time, and a sequence number. A tool built in a tainted run is QUARANTINED: kept and inspectable, never reloaded by `load_library()` until a human calls `release(name, reviewed_sha256)` (refused if the digest or the file differs from the validated one). New: `quarantine()`, `quarantined()`, `descendants(name)` (tools built after `name` in a run where it was visible, transitive) and `cascade=True` on `retire()` / `quarantine()`. Why: agents that write tools by imitating a library copy the trapped ones, and deleting the original leaves the copies (EVOMAL, arXiv 2608.25776). Catalogues written before this change have no provenance and load as before.
 - **`SubprocessSandbox(confine=Confinement())` — a kernel-enforced boundary without Docker** (Linux x86_64;
   applied automatically when the host chooses no sandbox — see *Changed* below). Model-written code (`run_python`, `enable_code_action()`, generated tools) runs behind an AST denylist
   the library has called bypassable since 0.22.0; once bypassed, the code had the host process's rights. Docker is
