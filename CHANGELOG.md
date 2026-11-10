@@ -104,11 +104,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     [−8 % ; +5 %]); success 57/60 → 59/60, not significant (p = 0.55). By family: multi-step −74 %, large
     results −17 %, but small tasks MORE expensive — SQL +59 %, extraction +95 %. Enable it for agents whose
     tools return large results, not for an extraction agent.
-  - **Not verified on Gemini in its one-line form**: the hand-wired version measured −49 % tokens on
-    `gemini-3.7-flash` (sequential runs, 60/60), but the confirmation run failed — every attempt got HTTP 402
-    (credit exhausted); `compare_configs` flagged it ("check the infrastructure before concluding") instead of
-    concluding. Not in the visual builder yet.
-  - Security: `SubprocessSandbox` by default — an AST denylist, not a boundary. In production pass
+  - **Confirmed on Gemini too** (10 Nov 2026, `gemini-3.7-flash`, same protocol: 20 tasks x 3 repetitions per
+    arm, arms alternating): **−60 % tokens per attempt, bootstrap interval [−63 % ; −57 %]** (7 279 → 2 909);
+    success 60/60 → 60/60 — a ceiling, the judge cannot separate the two arms on these tasks; median latency
+    5.56 s → 6.31 s (**+13 %**, [+5 % ; +22 %]: slower here, unlike DeepSeek). Large results −71 %, multi-step
+    −77 % (summed from the run's lines); the three small-task families together cost about +40 % (derived by
+    subtraction — their per-family detail was not kept). A first attempt on 4 Oct had failed on HTTP 402
+    (credit exhausted), which `compare_configs` flagged instead of concluding. Not in the visual builder yet.
+  - Security: with no sandbox passed, the program runs kernel-confined where Linux allows it (see the
+    confinement entry above) and in the plain `SubprocessSandbox` elsewhere — an AST denylist, not a boundary. In production pass
     `sandbox=DockerSandbox(...)` and keep the tools under `tool_policy`.
 
 ### Changed

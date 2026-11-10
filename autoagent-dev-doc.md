@@ -5350,10 +5350,24 @@ le 4 octobre 2026 :
 Par famille : plusieurs étapes −74 %, gros résultat −17 %, mais codification +27 %, SQL +59 %, extraction +95 % :
 **à activer pour un agent dont les outils rendent de gros résultats**, pas pour un agent d'extraction.
 
-**Ce qui reste, dit.** Pas confirmé sous cette forme sur Gemini : la version câblée à la main y gagnait 49 % (runs
-successifs, 60/60) ; la confirmation a échoué — HTTP 402 à chaque tentative, crédit épuisé — et `compare_configs` l'a
-signalé (« vérifier l'infrastructure avant de conclure ») au lieu de conclure. Vingt tâches courtes, simulées, k=3 :
-un écart de réussite de moins de ≈30 points n'est pas détectable. `SubprocessSandbox` par défaut — une liste
+**Confirmé aussi sur Gemini** (10 novembre 2026, `gemini-3.7-flash`, même protocole : 20 tâches × 3 répétitions par
+bras, bras alternés) :
+
+| | `telle_quelle` | `code_une_ligne` |
+|---|---|---|
+| réussite | 60/60 | 60/60 (plafond : le juge ne sépare pas les deux bras sur ces tâches) |
+| jetons par tentative | 7 279 | 2 909 — **−60 %**, intervalle bootstrap [−63 % ; −57 %] |
+| durée médiane d'une tentative | 5,56 s | 6,31 s (**+13 %**, [+5 % ; +22 %]) |
+
+Gros résultat −71 %, plusieurs étapes −77 % (sommes des lignes du run) ; les trois familles de petites tâches
+coûtent ensemble environ +40 % (déduit par soustraction : leur détail par famille n'a pas été conservé). Sur ce
+modèle le code comme action est donc PLUS LENT de 13 %, alors qu'il ne changeait pas la durée sur DeepSeek. La
+première tentative, le 4 octobre, avait échoué sur HTTP 402 (crédit épuisé), ce que `compare_configs` avait signalé
+au lieu de conclure.
+
+**Ce qui reste, dit.** Vingt tâches courtes, simulées, k=3 :
+un écart de réussite de moins de ≈30 points n'est pas détectable. Sans bac passé par l'hôte, le programme tourne
+confiné par le noyau là où Linux le permet (§45), et dans le `SubprocessSandbox` simple ailleurs — une liste
 d'interdits, pas une frontière : en production, `sandbox=DockerSandbox(...)` et `tool_policy`. Pas encore dans le
 constructeur visuel.
 

@@ -12544,5 +12544,207 @@
     ]
    }
   }
+ },
+ "gemini/gemini-3.7-flash | comparaison telle_quelle vs code_une_ligne": {
+  "date": "2026-11-10 22:09",
+  "k": 3,
+  "verdict": "indistinguishable",
+  "taux_a": 1.0,
+  "taux_b": 1.0,
+  "p": 1.0,
+  "ecart": [
+   0.0,
+   -0.12555455321686393,
+   0.12555455321686393
+  ],
+  "detectable": 0.3,
+  "jetons_par_tentative": [
+   7279.266666666666,
+   2908.8
+  ],
+  "jetons_variation": -0.6003993076225627,
+  "jetons_intervalle": [
+   -0.6284828374290379,
+   -0.5669418999993159
+  ],
+  "jetons_par_succes": [
+   7279.266666666666,
+   2908.8
+  ],
+  "duree_mediane": [
+   5.560232949999772,
+   6.307681849997607
+  ],
+  "duree_variation": 0.1344276232163737,
+  "duree_intervalle": [
+   0.04609425236515219,
+   0.2182359295288574
+  ],
+  "familles": {
+   "A. extraction": {
+    "telle_quelle": {
+     "succes": 12,
+     "tentatives": 12,
+     "jetons": 13072
+    },
+    "code_une_ligne": {
+     "succes": 12,
+     "tentatives": 12,
+     "jetons": 16694
+    }
+   },
+   "B. codification": {
+    "telle_quelle": {
+     "succes": 12,
+     "tentatives": 12,
+     "jetons": 17999
+    },
+    "code_une_ligne": {
+     "succes": 12,
+     "tentatives": 12,
+     "jetons": 24463
+    }
+   },
+   "C. sql": {
+    "telle_quelle": {
+     "succes": 12,
+     "tentatives": 12,
+     "jetons": 20753
+    },
+    "code_une_ligne": {
+     "succes": 12,
+     "tentatives": 12,
+     "jetons": 31181
+    }
+   },
+   "D. gros résultat": {
+    "telle_quelle": {
+     "succes": 12,
+     "tentatives": 12,
+     "jetons": 223873
+    },
+    "code_une_ligne": {
+     "succes": 12,
+     "tentatives": 12,
+     "jetons": 64509
+    }
+   },
+   "E. plusieurs étapes": {
+    "telle_quelle": {
+     "succes": 12,
+     "tentatives": 12,
+     "jetons": 161059
+    },
+    "code_une_ligne": {
+     "succes": 12,
+     "tentatives": 12,
+     "jetons": 37681
+    }
+   }
+  },
+  "resume": "A « telle_quelle » contre B « code_une_ligne » · 20 tâche(s) x 3 répétition(s) par bras\nSuccès : A 100% → B 100% · écart +0 points, intervalle approché à 95% [-13 ; +13] · test exact p=1.000\n→ INDISTINGUABLES : aucune preuve d'écart. Ce n'est PAS « équivalentes » : cette mesure ne détecterait pas moins de ≈30 points (80 % de chances).\nPar tâche : B > A sur 0, B < A sur 0, égalité sur 20.\nCoût : 7279 → 2909 jetons par tentative (-60%, intervalle bootstrap [-63% ; -57%]) · par succès 7279 → 2909\nDurée : médiane 5.56 s → 6.31 s par tentative (+13%, intervalle bootstrap [+5% ; +22%])\n⚠ Plafond ou plancher : sur chaque tâche, les deux bras réussissent TOUJOURS ou échouent TOUJOURS. Le juge ne sépare pas ces configurations ; il faut des tâches plus difficiles (ou plus faciles).\nEmpreintes (structure déclarée, pas le code des outils) : suite 32f377052b4a · telle_quelle d0d8dd0ee40b · code_une_ligne 19ecbc1c24f5",
+  "taches": {
+   "A1": [
+    3,
+    3,
+    3
+   ],
+   "A2": [
+    3,
+    3,
+    3
+   ],
+   "A3": [
+    3,
+    3,
+    3
+   ],
+   "A4": [
+    3,
+    3,
+    3
+   ],
+   "B1": [
+    3,
+    3,
+    3
+   ],
+   "B2": [
+    3,
+    3,
+    3
+   ],
+   "B3": [
+    3,
+    3,
+    3
+   ],
+   "B4": [
+    3,
+    3,
+    3
+   ],
+   "C1": [
+    3,
+    3,
+    3
+   ],
+   "C2": [
+    3,
+    3,
+    3
+   ],
+   "C3": [
+    3,
+    3,
+    3
+   ],
+   "C4": [
+    3,
+    3,
+    3
+   ],
+   "D1": [
+    3,
+    3,
+    3
+   ],
+   "D2": [
+    3,
+    3,
+    3
+   ],
+   "D3": [
+    3,
+    3,
+    3
+   ],
+   "D4": [
+    3,
+    3,
+    3
+   ],
+   "E1": [
+    3,
+    3,
+    3
+   ],
+   "E2": [
+    3,
+    3,
+    3
+   ],
+   "E3": [
+    3,
+    3,
+    3
+   ],
+   "E4": [
+    3,
+    3,
+    3
+   ]
+  },
+  "secondes_total": 852
  }
 }
