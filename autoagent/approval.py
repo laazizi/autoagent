@@ -247,6 +247,44 @@ def _make_sandbox_handler(
     return handler
 
 
+_ILLISIBLE = object()
+
+
+def _catalogue_de_la_bibliotheque(tools_dir: Path) -> Any:
+    """Le catalogue de `DynamicToolBuilder(persist=True)` s'il y en a un, LU SANS EFFET de
+    bord : `None` (pas de catalogue, dossier non géré), `_ILLISIBLE`, ou le dict des outils."""
+    chemin = tools_dir / "catalogue.json"
+    if not chemin.is_file():
+        return None
+    try:
+        outils = json.loads(chemin.read_text(encoding="utf-8"))["tools"]
+        if not isinstance(outils, dict):
+            raise ValueError("catalogue 'tools' is not an object")
+        return outils
+    except (OSError, ValueError, KeyError, TypeError):
+        return _ILLISIBLE
+
+
+def _statut_au_catalogue(catalogue: Any, file: Path) -> str | None:
+    """`None` si un outil NON approuvé peut être chargé au regard du catalogue, sinon le
+    mode sous lequel il est écarté (`"quarantined"`, `"retired"`). Fail-closed."""
+    if catalogue is None:
+        return None
+    if catalogue is _ILLISIBLE:
+        return "quarantined"
+    entree = catalogue.get(file.stem)
+    if not isinstance(entree, dict) or entree.get("quarantined"):
+        return "quarantined"
+    if entree.get("retired"):
+        return "retired"
+    try:
+        if hashlib.sha256(file.read_bytes()).hexdigest() != entree.get("sha256"):
+            return "quarantined"
+    except OSError:
+        return "quarantined"
+    return None
+
+
 def load_tools(
     agent: Any,
     tools_dir: str | Path,
@@ -265,7 +303,17 @@ def load_tools(
 
     Returns a list of ``(tool_name, mode)`` where mode is
     ``"native"`` / ``"sandbox"`` / ``"invalid"`` (the last for an unapproved
-    tool that fails validation — it is skipped, never registered).
+    tool that fails validation — it is skipped, never registered) /
+    ``"quarantined"`` / ``"retired"``.
+
+    When ``tools_dir`` is a library kept by ``DynamicToolBuilder(persist=True)``
+    (it holds ``catalogue.json``), an UNAPPROVED tool is registered only if the
+    catalogue knows it, has not quarantined or retired it, and its file still has
+    the digest recorded at build time. Otherwise it is skipped as
+    ``"quarantined"`` (or ``"retired"``) — an unreadable catalogue skips every
+    unapproved tool (fail-closed) and is left untouched. A tool whose exact
+    digest is in ``manifest`` was approved by a human: it loads natively, as
+    before. A directory without a catalogue behaves as before.
     """
     host_context = host_context or {}
     tools_dir = Path(tools_dir)
@@ -273,6 +321,7 @@ def load_tools(
     registered: list[tuple[str, str]] = []
     if not tools_dir.is_dir():
         return registered
+    catalogue = _catalogue_de_la_bibliotheque(tools_dir)
 
     for file in sorted(tools_dir.glob("*.py")):
         code = file.read_text(encoding="utf-8")
@@ -293,6 +342,10 @@ def load_tools(
             )
             mode = "native"
         else:
+            refus = _statut_au_catalogue(catalogue, file)
+            if refus is not None:
+                registered.append((spec.name, refus))
+                continue
             try:
                 generated = load_generated_tool(file, sandbox=sandbox)  # validates internally
             except ToolValidationError:

@@ -22,7 +22,7 @@ from .errors import (
     TokenBudgetExceeded,
     ToolError,
 )
-from .gate import ActionGate, active_gate, gate_scope
+from .gate import ActionGate, active_gate, delegation_taint, gate_scope
 from .guards import (  # noqa: F401 — re-exportés pour les tests
     TurnGuards,
     _call_signature,
@@ -714,6 +714,10 @@ class Agent:
         # La porte du PARENT, posée le temps d'un run de sous-agent qui hérite de sa
         # politique (`as_tool(inherit_policy=True)`). `None` = comportement historique.
         self._parent_gate: ActionGate | None = None
+        # Vrai le temps d'un run de sous-agent appelé par un run TEINTÉ (as_tool, delegate_to),
+        # quelle que soit `inherit_policy`. Lu par la provenance des outils générés : sans lui,
+        # déléguer la création d'un outil à un sous-agent propre blanchissait la teinte.
+        self._teinte_heritee = False
         self.dynamic_builder: DynamicToolBuilder | None = None
         self._dynamic_tools_built_this_run = 0
         self._python_runs_this_run = 0
@@ -1343,6 +1347,9 @@ class Agent:
             anterieur = agent_self._parent_gate
             if parent is not None:
                 agent_self._parent_gate = parent
+            # La teinte du run appelant descend TOUJOURS pour la provenance (nuit du 11 nov. 2026).
+            teinte_anterieure = agent_self._teinte_heritee
+            agent_self._teinte_heritee = delegation_taint(active_gate())
             try:
                 # 0.23.1 : le « stop » du parent vaut aussi pour le sous-agent (le jeton de l'agent qui
                 # exécute CET outil, lu dans le thread de l'appel) ; sans lui il finissait tous ses pas.
@@ -1360,6 +1367,7 @@ class Agent:
                 raise
             finally:
                 agent_self._parent_gate = anterieur
+                agent_self._teinte_heritee = teinte_anterieure
             sortie = result.output
             if is_tainted(result.messages):
                 # Le sous-agent a lu du contenu externe : sa réponse peut le
@@ -2714,11 +2722,14 @@ def delegate_to(
 
     def _une(cible: str, demande: str, context: dict[str, Any] | None,
              parent: ActionGate | None = None,
-             jeton: threading.Event | None = None) -> tuple[dict[str, Any], Any]:
+             jeton: threading.Event | None = None,
+             teinte: bool = False) -> tuple[dict[str, Any], Any]:
         agent = specialistes[cible]
         anterieur = agent._parent_gate
         if parent is not None:
             agent._parent_gate = parent
+        teinte_anterieure = agent._teinte_heritee
+        agent._teinte_heritee = teinte                 # voir `as_tool`
         try:
             suite: dict[str, Any] = {"cancel_token": jeton} if jeton is not None else {}   # voir `as_tool`
             resultat = agent.run(demande, context=context, **suite)
@@ -2727,6 +2738,7 @@ def delegate_to(
             return {"specialist": cible, "error": f"{type(exc).__name__}: {exc}"}, _depense_d_un_echec(exc)
         finally:
             agent._parent_gate = anterieur
+            agent._teinte_heritee = teinte_anterieure
         sortie = resultat.output
         if is_tainted(resultat.messages):
             # Le spécialiste a lu du contenu externe : sa sortie peut le citer.
@@ -2755,6 +2767,9 @@ def delegate_to(
         # Le jeton d'annulation de l'agent appelant, lu ICI pour la même raison (0.23.1) : les spécialistes
         # tournent dans les threads du pool, qui ne voient pas le contexte de l'appel.
         jeton = _jeton_actif()
+        # La teinte du run appelant, lue ICI pour la même raison : elle descend dans le run de
+        # chaque spécialiste pour la provenance des outils qu'il ferait construire.
+        teinte = delegation_taint(active_gate())
 
         # Regroupement par spécialiste : un Agent ne sert qu'un appelant à la
         # fois, donc deux demandes pour la même cible ne peuvent PAS partir
@@ -2776,7 +2791,7 @@ def delegate_to(
             # Chaque index n'est écrit que par UN thread : pas de verrou requis.
             for index in groupes[cible]:
                 demande = str((requests[index] or {}).get("request", ""))
-                reponses[index], usages[index] = _une(cible, demande, context, parent, jeton)
+                reponses[index], usages[index] = _une(cible, demande, context, parent, jeton, teinte)
 
         if len(groupes) > 1:
             with ThreadPoolExecutor(

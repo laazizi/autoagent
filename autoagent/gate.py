@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     from .agent import Agent, ToolPolicyContext
     from .guards import TurnGuards
 
-__all__ = ["ActionGate", "active_gate", "evaluate_policy", "gate_scope", "trifecta_blocks"]
+__all__ = ["ActionGate", "active_gate", "delegation_taint", "evaluate_policy", "gate_scope", "trifecta_blocks"]
 
 _log = get_logger("gate")
 
@@ -131,6 +131,15 @@ class ActionGate:
         fonction de l'hôte non fiable appelée dans CE programme) ?"""
         return bool(self.guards.taint[0] or is_tainted(self.guards.messages) or self.tainted_by_host)
 
+    @property
+    def lineage_tainted(self) -> bool:
+        """Ce run est-il celui d'un sous-agent appelé par un run TEINTÉ (`as_tool`,
+        `delegate_to`, transitif) ? Sa demande a été écrite par un modèle qui avait lu du
+        contenu non fiable. Lu par la provenance des outils générés (`dynamic.py`) ; ne
+        change PAS la garde trifecta du sous-agent, qui reste sa propre politique tant que
+        l'hôte ne demande pas `inherit_policy=True`."""
+        return bool(getattr(self.agent, "_teinte_heritee", False))
+
     def decide(
         self,
         name: str,
@@ -215,3 +224,15 @@ class ActionGate:
             "would_block": observe, "parent_call_id": self.call.id, "step": etape,
         })
         return reason
+
+
+def delegation_taint(porte: ActionGate | None) -> bool:
+    """La teinte qu'un run transmet au sous-agent qu'il appelle : la sienne, ou celle dont
+    il a lui-même hérité. Hors d'un run : propre. Lecture qui plante : teinté (fail-closed)."""
+    if porte is None:
+        return False
+    try:
+        return bool(porte.tainted or porte.lineage_tainted)
+    except Exception:
+        _log.exception("could not read the delegating run's taint; assuming tainted (fail-closed)")
+        return True

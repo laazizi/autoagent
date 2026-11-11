@@ -1212,6 +1212,10 @@ class GeneratedPythonTool:
     # Fonctions de l'hôte rendues appelables depuis l'outil (pont, 0.22.0) ; un
     # `host_functions=` passé à l'appel est prioritaire.
     host_functions: "dict[str, Callable[..., Any]] | None" = None
+    # Contrôle d'admission AVANT chaque appel : `admission(nom)` rend `None` (autorisé) ou la
+    # raison d'un refus. La bibliothèque persistante y refuse un outil en quarantaine hors du
+    # run qui l'a construit. Sécurité = fail-CLOSED : un contrôle qui plante refuse.
+    admission: "Callable[[str], str | None] | None" = None
 
     # Lu par le registre : un outil écrit par le modèle ne reçoit PAS le `context`
     # du run (0.22.0). Il partait tel quel dans le bac à sable — l'id utilisateur,
@@ -1228,6 +1232,13 @@ class GeneratedPythonTool:
         host_functions: dict[str, Callable[..., Any]] | None = None,
         **kwargs: Any,
     ) -> Any:
+        if self.admission is not None:
+            try:
+                refus = self.admission(self.spec.name)
+            except Exception as exc:
+                refus = f"admission check failed ({type(exc).__name__}: {exc}); call refused (fail-closed)"
+            if refus is not None:
+                raise ToolError(refus)
         allow_network = "network" in (self.spec.permissions or [])
         try:
             result = self.sandbox.run_python_tool(
