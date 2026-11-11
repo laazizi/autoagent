@@ -31,7 +31,7 @@ from .guards import (  # noqa: F401 — re-exportés pour les tests
 from .journal import Journal, RunView, key_scope
 from .logging import get_logger
 from .memory import Memory
-from .output_guard import OutputGuard, guard_output, resolve_output_guard
+from .output_guard import OutputGuard, guard_output, resolve_output_guard, resolve_url_guard
 from .providers import create_provider
 from .providers.base import LLMProvider
 from .registry import ToolRegistry, ToolResult
@@ -601,6 +601,12 @@ class Agent:
         output_guard: ``"off"`` (défaut), ``"neutralize"`` ou un `OutputGuard(...)` : dans un run TEINTÉ, toute
             URL de la réponse absente mot pour mot du transcript est retirée (image Markdown vers un hôte inconnu,
             lien de référence, balise HTML…) et un événement `output_guard_block` le trace. Voir `output_guard.py`.
+        url_guard: ``"off"`` (défaut), ``"deny"`` ou un `OutputGuard(...)` (0.26.0) : dans un run TEINTÉ, un appel
+            d'outil dont un argument porte une URL absente de la conversation est REFUSÉ (`UrlNotAllowed`, événement
+            `url_guard_block`). Lire une URL qui porte un secret exfiltre comme un envoi, et un outil de lecture
+            n'est pas `egress`. Une URL donnée par l'utilisateur, rendue par un outil fiable ou citée par le contenu
+            lu passe ; une URL construite par le modèle ne passe pas. Vaut aussi pour les appels faits depuis un
+            programme du modèle (la porte unique). Voir `output_guard.guard_call_urls`.
         shadow_guards: OBSERVE the built-in guards instead of enforcing
             them (0.20.0). ``False`` (default) keeps the historical
             behaviour: a guard that fires refuses the call. Set it and
@@ -671,6 +677,7 @@ class Agent:
         bounds: Bounds | None = None,
         journal: Journal | None = None,
         output_guard: str | OutputGuard = "off",
+        url_guard: str | OutputGuard = "off",
     ) -> None:
         self.provider = provider
         self.journal = journal
@@ -695,6 +702,8 @@ class Agent:
         self.trifecta_guard = trifecta_guard
         # Garde de la RÉPONSE (`output_guard.py`) : en run teinté, les URL non vues mot pour mot sont retirées.
         self.output_guard = resolve_output_guard(output_guard)
+        # Garde des URL des APPELS (0.26.0) : en run teinté, une URL passée à un outil doit figurer dans la conversation.
+        self.url_guard = resolve_url_guard(url_guard)
         if bounds is not None:
             # `Bounds` pose les huit bornes d'un coup ; un kwarg donné
             # EXPLICITEMENT (différent de sa valeur par défaut) l'emporte —

@@ -172,7 +172,7 @@ ATTENDUS = {
     # l'outil sur l'agent ET sur chaque sous-agent.
     "08": ("superviseur.tool(etat_parc, idempotent=True)", "chercheur.tool(etat_parc, idempotent=True)", "redacteur.tool(etat_parc, idempotent=True)"),
     # 0.25.0 : la garde de la réponse (kwarg d'Agent) et le code comme action, version compacte.
-    "garde_reponse": ('output_guard="neutralize"', "agent.enable_code_action(compact=True)",
+    "garde_reponse": ('output_guard="neutralize"', 'url_guard="deny"', "agent.enable_code_action(compact=True)",
                       "@agent.tool(untrusted=True)"),
     # Épinglage MCP : la première fois on AFFICHE les définitions et l'humain accepte, ensuite mount(pins=).
     "mcp_pins": ("import pathlib", 'if not pathlib.Path("mcp_pins.json").exists():', "mcp_fs.list_tools()",

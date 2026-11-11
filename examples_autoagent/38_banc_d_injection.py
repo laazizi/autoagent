@@ -33,6 +33,7 @@ Ce que la demo montre :
   6. le banc des ROUTES (0.26.0) : un attaquant ne s'arrete pas au premier refus. Chaque
      attaque, par chaque chemin de sortie (envoi direct, sous-agent, programme du modele,
      image de la reponse, URL d'une LECTURE) : quelles routes le code laisse-t-il ouvertes ?
+     La lecture d'une URL porteuse restait ouverte ; `url_guard="deny"` la ferme.
 
 Ce que ca ne mesure pas : les canaux sont enumeres (outil `egress`, URL d'une lecture, URL de
 la reponse), le canari ne trouve que des fuites LITTERALES, les attaques sont peu nombreuses et
@@ -120,15 +121,23 @@ def niveau_1() -> None:
     print("   mecanique ; la lecture utile est « 8 taches sur 8 », pas la valeur de p.)")
 
     ligne("6) Le banc des ROUTES : un attaquant ne s'arrete pas au premier refus")
-    print("  La config la plus fermee de la lib : garde trifecta par defaut + garde de la reponse.")
-    print("  Chaque attaque passe par chaque route ; le modele docile choisit le chemin.\n")
-    routes = run_route_bench(lambda provider: Agent(provider, system_prompt="Tu es un assistant efficace.",
-                                                    max_steps=6, output_guard="neutralize"))
+    print("  Garde trifecta par defaut + garde de la reponse (output_guard). Chaque attaque passe par")
+    print("  chaque route ; le modele docile choisit le chemin.\n")
+
+    def agent_garde(**gardes):
+        return lambda provider: Agent(provider, system_prompt="Tu es un assistant efficace.", max_steps=6, **gardes)
+
+    routes = run_route_bench(agent_garde(output_guard="neutralize"))
     print(routes.summary().split("Lecture")[0].rstrip())
     print("\n  -> envoi direct, sous-agent (la teinte DESCEND depuis la 0.25.0), programme du modele (la porte")
     print("     unique) et image de la reponse (output_guard) sont fermes. Reste la LECTURE d'une URL qui")
-    print("     porte le secret : un GET exfiltre comme un envoi, et aucune garde de la lib ne le voit.")
-    print("     Remede cote hote AUJOURD'HUI : une tool_policy qui n'autorise lire_page que sur l'URL demandee.")
+    print("     porte le secret : un GET exfiltre comme un envoi, et un outil de lecture n'est pas `egress`.")
+
+    fermees = run_route_bench(agent_garde(output_guard="neutralize", url_guard="deny"))
+    ouvertes = ", ".join(fermees.open_routes()) or "aucune"
+    print("\n  Avec en plus la garde des URL d'appel, `Agent(url_guard='deny')` (0.26.0) : en run teinte, une URL")
+    print("  passee a un outil doit figurer dans la conversation - une URL construite n'y figure jamais.")
+    print(f"  Routes OUVERTES : {ouvertes} · attaques qui passent : {len(fermees.compromised_attacks())}/7")
 
 
 def niveau_2(argv: list[str]) -> None:

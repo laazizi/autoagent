@@ -37,13 +37,15 @@ from typing import TYPE_CHECKING, Any
 
 from .errors import ApprovalRequired
 from .logging import get_logger
+from .output_guard import guard_call_urls
 from .schema import Message, ToolCall, ToolSpec, is_tainted
 
 if TYPE_CHECKING:
     from .agent import Agent, ToolPolicyContext
     from .guards import TurnGuards
 
-__all__ = ["ActionGate", "active_gate", "delegation_taint", "evaluate_policy", "gate_scope", "trifecta_blocks"]
+__all__ = ["ActionGate", "active_gate", "delegation_taint", "evaluate_policy", "gate_scope", "trifecta_blocks",
+           "url_guard_verdict"]
 
 _log = get_logger("gate")
 
@@ -76,6 +78,35 @@ def trifecta_blocks(agent: Agent, tainted: bool, egress: bool) -> bool:
     ingéré du contenu non fiable (sauf `trifecta_guard="off"`). UNE définition, partagée
     par la boucle (`TurnGuards.trifecta`) et par la porte."""
     return agent.trifecta_guard != "off" and tainted and egress
+
+
+def url_guard_verdict(
+    agent: Agent, name: str, arguments: dict[str, Any] | None, messages: list[Message],
+) -> tuple[str | None, list[dict[str, object]]]:
+    """La garde des URL des APPELS (`Agent(url_guard=)`, 0.26.0) : UNE définition, partagée par la boucle
+    (`TurnGuards.urls`) et par la porte. À n'appeler que pour un run TEINTÉ.
+
+    Rend `(raison du refus | None, trouvailles)` ; les trouvailles ne portent jamais l'URL (genre, longueur,
+    empreinte). Fail-CLOSED : une garde qui plante refuse. La demande d'un sous-agent appelé par un run teinté n'est
+    pas une source fiable (`agent._teinte_heritee`)."""
+    politique = getattr(agent, "url_guard", None)
+    if politique is None:
+        return None, []
+    try:
+        trouvees = guard_call_urls(arguments or {}, messages, politique,
+                                   request_trusted=not getattr(agent, "_teinte_heritee", False))
+    except Exception as exc:
+        _log.exception("url_guard failed; refusing %r (fail-closed)", name)
+        return f"UrlGuardError: the URL check failed ({type(exc).__name__}); `{name}` was refused (fail-closed).", []
+    if not trouvees:
+        return None, []
+    return (
+        f"UrlNotAllowed: `{name}` was called with {len(trouvees)} URL(s) that appear nowhere in this "
+        f"conversation, after untrusted external content entered the run. A URL built from data can carry "
+        f"that data out. The call was refused by policy, not by the model. Use a URL given by the user or "
+        f"quoted in the content you read.",
+        [t.to_dict() for t in trouvees],
+    )
 
 
 def evaluate_policy(
@@ -194,6 +225,20 @@ class ActionGate:
                 observe = True                              # mode témoin : tracé, pas appliqué
             else:
                 reason = message
+
+        # La garde des URL (0.26.0) : la MÊME règle que pour un appel direct. Un programme du modèle se juge sur
+        # le transcript de CE run ; l'appel d'un sous-agent qui hérite de la politique, sur celui du parent, plus
+        # ce que le sous-agent a lu lui-même (sa demande, écrite par le parent, n'est pas une source).
+        if reason is None and tainted and getattr(agent, "url_guard", None) is not None:
+            reference = self.guards.messages
+            if source == "subagent" and messages is not None:
+                reference = [*reference, *(m for m in messages if m.role != "user")]
+            refus, _trouvees = url_guard_verdict(agent, name, arguments, reference)
+            if refus is not None:
+                if agent.shadow_guards:
+                    observe = True
+                else:
+                    reason = refus
 
         if reason is None and agent.tool_policy is not None:
             ctx = ToolPolicyContext(

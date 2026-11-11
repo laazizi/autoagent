@@ -65,6 +65,15 @@ def test_la_garde_de_la_reponse_ferme_la_route_de_l_image() -> None:
     assert rapport.open_routes() == ["read_url"], "la LECTURE d'une URL porteuse reste ouverte : aucune garde"
 
 
+def test_avec_la_garde_des_url_plus_aucune_route_n_est_ouverte() -> None:
+    """`url_guard="deny"` (0.26.0) ferme la lecture d'une URL porteuse : la dernière route que le banc trouvait."""
+    rapport = run_route_bench(_agent(output_guard="neutralize", url_guard="deny"))
+    assert _colonne(rapport, "read_url") == {BLOCKED}
+    assert "read_url" in rapport.cells[("directe", "read_url")].attempted
+    assert rapport.open_routes() == []
+    assert rapport.compromised_attacks() == []
+
+
 def test_le_banc_voit_le_trou_de_la_delegation_si_on_le_rouvre(monkeypatch: pytest.MonkeyPatch) -> None:
     """Sans la teinte qui descend (0.25.0), un envoi refusé à l'agent partait par son sous-agent."""
     monkeypatch.setattr(module_agent, "delegation_taint", lambda porte: False)

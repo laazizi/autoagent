@@ -425,6 +425,15 @@ class TestEmpreintes:
                             self._tache(), repeats=2)
         assert r.fingerprints["a"] != r.fingerprints["b"]
 
+    def test_une_garde_de_reponse_ou_d_url_change_l_empreinte(self) -> None:
+        """Deux bras qui ne diffèrent que par `output_guard` ou `url_guard` avaient la MÊME empreinte."""
+        def avec(**kw: Any):
+            return lambda: Agent(FakeLLMProvider(["42"]), system_prompt="v1", max_steps=3, **kw)
+
+        for garde in ({"output_guard": "neutralize"}, {"url_guard": "deny"}):
+            r = compare_configs(avec(), avec(**garde), self._tache(), repeats=2)
+            assert r.fingerprints["A"] != r.fingerprints["B"], garde
+
     def test_la_suite_change_quand_la_consigne_ou_le_juge_changent(self) -> None:
         def run(prompt: str, attendu: str) -> str:
             tache = [EvalTask("q", prompt, lambda r: attendu in r.output)]

@@ -575,6 +575,11 @@ def _decrire_agent(agent: Any) -> dict[str, Any]:
         lire(nom, functools.partial(getattr, agent, nom, None))
     for nom in ("memory", "tool_policy", "post_turn_hook"):
         lire(nom, functools.partial(_nom_de_classe, getattr(agent, nom, None)))
+    # Les gardes de la réponse et des URL d'appel (0.25.0, 0.26.0) : deux bras qui ne diffèrent que par elles
+    # n'avaient PAS la même configuration, mais la même empreinte.
+    for nom in ("output_guard", "url_guard"):
+        garde = getattr(agent, nom, None)
+        lire(nom, functools.partial(lambda g: None if g is None else asdict(g), garde))
     return desc
 
 

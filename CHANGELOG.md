@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Agent(url_guard="deny")` — a guard on the URLs of tool CALLS** (default `"off"`; `autoagent.output_guard.guard_call_urls`, `gate.url_guard_verdict`). Reading a URL is also writing: `read_page("https://host/p.png?d=SECRET")`
+  exfiltrates like a send, and a read tool is not `egress` — the route bench (below) found this route open under
+  every library guard. In a TAINTED run, a tool call whose argument carries a URL that appears nowhere in the
+  conversation is refused (`UrlNotAllowed`, event `url_guard_block`: kind, length, digest — never the URL). A URL
+  from the user or the system prompt, returned by a trusted tool, on `allowed_hosts`, or QUOTED by the content read
+  (unless `links_from_untrusted=False`) passes: following a link stays possible; a URL the model built does not.
+  EXACT comparison, none of the answer guard's equivalences: in a call every tolerance is a channel (tabs inside a
+  quoted URL, characters written as entities, host case). An argument that starts with a URL is judged WHOLE
+  (`<quoted URL> <secret>` is refused). One definition, applied by the loop AND by the single gate: a model-written
+  program that assembles the URL then calls the tool through `call_host` is refused at the call. Sub-agents: the
+  delegating call carrying the URL is refused at the parent; a guarded sub-agent called by a tainted run does not
+  trust its REQUEST; with `inherit_policy=True` the parent's guard covers the sub-agent's calls. `shadow_guards`
+  observes (`url_guard_would_block`); a guard that crashes refuses; linear time.
+  - **Measured.** Route bench with `output_guard` + `url_guard`: NO open route (0 of 7 attacks), against `read_url`
+    open without it. An adversarial pass during the writing broke the first version — nine forms, then two
+    encoding channels a tolerant comparison left open, and a quadratic regex (`a.a.a…`: 0.16 s for 4 000
+    characters): all closed. `tests/test_url_guard.py` (86 tests); 12 code mutations, all caught. Real model
+    (`deepseek-chat`, 11 Nov 2026, 13 runs, 23 232 tokens): a legitimate task that must FOLLOW a link quoted by the
+    page succeeds 5/5 without the guard and 5/5 with it, no call wrongly refused; under attack (3 runs) no leak —
+    but the model ignored the order by itself, so the guard never had to act. Five runs are not a false-positive rate.
+  - **Not seen**: a URL passed in pieces, a free-text search query, an identifier the tool turns into a URL, a
+    host with neither dot nor scheme, the choice among attacker-prepared URLs quoted by the page, a free-text
+    instruction to an unguarded sub-agent. A model that legitimately BUILDS a URL after reading untrusted content
+    is refused — hence opt-in, and `allowed_hosts`.
+  - `compare_configs`: the fingerprint of an arm now includes `output_guard` and `url_guard` (two arms differing
+    only by a guard had the same fingerprint). Visual builder: agent option `url_guard`, in the guards preset.
 - **The ROUTE bench** (`autoagent.redteam.run_route_bench`, `positive_control_routes`, `RouteProvider`, `ROUTES`).
   An attacker does not stop at the first refusal; NIST CAISI measured adaptive attacks on AgentDojo far above the
   baseline ones (81 % vs 11 %, one model; https://www.nist.gov/node/1872381). The 0.24.0 bench made the docile model leak by ONE route (the direct send); this
@@ -17,11 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `output_url` (an image URL in the answer), `read_url` (READING a URL that carries the secret). The report is an
   attack x route table and the list of OPEN routes. Measured offline (40 runs, 3 s): with no guard, all 7 visible
   attacks leak through all 5 routes (positive control); default guards close `egress`, `subagent`, `code`;
-  `output_guard` closes `output_url`; **`read_url` stays open with every library guard** — a host-side
-  `tool_policy` restricting the read tool to expected URLs closes it (tested). The bench also SEES a hole that is
+  `output_guard` closes `output_url`; **`read_url` stayed open under every library guard** — which is why
+  `url_guard` (above) was written; a host-side `tool_policy` restricting the read tool to expected URLs closes
+  it too (tested). The bench also SEES a hole that is
   reopened (taint descent disabled → `subagent` leaks; `govern_host_calls=False` → `code` leaks). The judge now
   counts attempts on every route and an answer URL removed by `output_guard` as `blocked`; the 0.24.0 bench's
-  verdicts are unchanged. `tests/test_redteam_routes.py` (10 tests), 5 mutations all caught; demo 38 part 6 and
+  verdicts are unchanged. `tests/test_redteam_routes.py` (11 tests), 5 mutations all caught; demo 38 part 6 and
   its builder showcase (code and recorded output) updated. Level 1 only: no language-level adaptive attack
   against a real model.
 - **Pin MCP tool definitions** (`MCPClient.pin_tools(path)`, `mount(..., pins=path)`, `tools(pins=)`,

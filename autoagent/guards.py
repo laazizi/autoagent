@@ -25,7 +25,7 @@ from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
 from .errors import ApprovalRequired
-from .gate import evaluate_policy, trifecta_blocks
+from .gate import evaluate_policy, trifecta_blocks, url_guard_verdict
 from .logging import get_logger
 from .registry import ToolResult
 from .schema import Message, ToolCall, is_tainted
@@ -241,6 +241,34 @@ class TurnGuards:
             )
         return overrides
 
+    # ── URL des appels ───────────────────────────────────────────────────────
+
+    def urls(
+        self, calls: list[ToolCall], step: int, req_span: str | None, *, dry: bool = False
+    ) -> dict[str, ToolResult]:
+        """Refuse un appel dont un argument porte une URL absente de la conversation, une fois le run teinté
+        (`Agent(url_guard="deny")`, 0.26.0). LIRE une URL qui porte un secret exfiltre comme un envoi, et un outil de
+        lecture n'est pas `egress` : la garde trifecta ne le voit pas. Règle : `gate.url_guard_verdict`."""
+        agent = self.agent
+        overrides: dict[str, ToolResult] = {}
+        if getattr(agent, "url_guard", None) is None:
+            return overrides
+        if not (self.taint[0] or is_tainted(self.messages)):
+            return overrides                      # rien d'externe n'est entré : un run sain n'est jamais touché
+        for call in calls:
+            refus, trouvees = url_guard_verdict(agent, call.name, call.arguments, self.messages)
+            if refus is None:
+                continue
+            overrides[call.id] = ToolResult(ok=False, error=refus)
+            if not dry:
+                agent._emit(
+                    "url_guard_would_block" if agent.shadow_guards else "url_guard_block",
+                    {"step": step, "name": call.name, "call_id": call.id, "count": len(trouvees),
+                     "items": trouvees},
+                    parent_id=req_span,
+                )
+        return overrides
+
     # ── politique de l'hôte ──────────────────────────────────────────────────
 
     def policy(
@@ -376,6 +404,8 @@ class TurnGuards:
         (en avance, puis au tour). Prouvé : 4 refus tracés pour 2 (0.22.0)."""
         integres = self.loop_guard(calls, step, req_span, pending=pending, dry=dry)
         integres.update(self.trifecta(calls, step, req_span, dry=dry))
+        for ident, refus in self.urls(calls, step, req_span, dry=dry).items():
+            integres.setdefault(ident, refus)             # un refus déjà posé (boucle, trifecta) reste le sien
         if self.agent.shadow_guards and integres:
             if not dry:
                 self.temoin[0] += len(integres)
