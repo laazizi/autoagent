@@ -644,10 +644,16 @@ def comparer(provider: Any, monde: Monde, base: Path, taches: list[Tache], k: in
     for t in taches:
         for bras in (config_a, config_b):
             r = rapport.reports[bras][t.id]
-            f = familles.setdefault(t.famille, {}).setdefault(bras, {"succes": 0, "tentatives": 0, "jetons": 0})
+            f = familles.setdefault(t.famille, {}).setdefault(
+                bras, {"succes": 0, "tentatives": 0, "jetons": 0, "entree": 0, "cache": 0})
             f["succes"] += r.successes
             f["tentatives"] += len(r.attempts)
             f["jetons"] += sum(a.total_tokens or 0 for a in r.attempts)
+            # Entrée et part cachée (nuit du 11 nov. 2026) : sans elles, un gain en jetons ne dit
+            # rien du gain en COÛT. `None` dès qu'une tentative ne les a pas rapportées.
+            for cle, champ in (("entree", "input_tokens"), ("cache", "cached_tokens")):
+                valeurs = [getattr(a, champ) for a in r.attempts]
+                f[cle] = None if f[cle] is None or None in valeurs else f[cle] + sum(valeurs)
     c, lat = rapport.cost, rapport.latency
     return {
         "verdict": rapport.verdict, "taux_a": rapport.rate_a, "taux_b": rapport.rate_b, "p": rapport.p_value,
@@ -656,6 +662,7 @@ def comparer(provider: Any, monde: Monde, base: Path, taches: list[Tache], k: in
         "jetons_variation": None if c is None else c.relative_change,
         "jetons_intervalle": None if c is None else c.interval,
         "jetons_par_succes": None if c is None else [c.tokens_per_success_a, c.tokens_per_success_b],
+        "part_cache": None if c is None else [c.cached_share_a, c.cached_share_b],
         "duree_mediane": None if lat is None else [lat.median_seconds_a, lat.median_seconds_b],
         "duree_variation": None if lat is None else lat.relative_change,
         "duree_intervalle": None if lat is None else lat.interval,

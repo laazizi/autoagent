@@ -361,6 +361,11 @@ class CostComparison:
     tokens_per_success_b: float | None
     cost_per_success_a: float | None = None
     cost_per_success_b: float | None = None
+    # Part des jetons d'ENTRÉE servie par le cache de préfixe du fournisseur, par bras. `None` si
+    # une tentative n'a rapporté ni son entrée ni son cache (jamais un zéro inventé). Des jetons en
+    # moins ne valent pas le même pourcentage de COÛT quand cette part bouge entre les bras.
+    cached_share_a: float | None = None
+    cached_share_b: float | None = None
 
 
 @dataclass(frozen=True)
@@ -466,6 +471,9 @@ class ComparisonReport:
             if c.tokens_per_success_a is not None and c.tokens_per_success_b is not None:
                 ligne += (f" · par succès {c.tokens_per_success_a:.0f} → "
                           f"{c.tokens_per_success_b:.0f}")
+            if c.cached_share_a is not None and c.cached_share_b is not None:
+                ligne += (f" · part de l'entrée servie par le cache {c.cached_share_a:.0%} → "
+                          f"{c.cached_share_b:.0%}").replace("%", " %")
             lignes.append(ligne)
         # Sous 10 ms des deux côtés (un modèle scripté, un cache), la durée ne dit rien : on ne l'affiche pas
         # (elle reste dans `latency` et dans `to_dict()`).
@@ -631,7 +639,20 @@ def _comparer_couts(
         tokens_per_success_b=rep_b.tokens_per_success,
         cost_per_success_a=None if cost_fn is None else rep_a.cost_per_success(cost_fn),
         cost_per_success_b=None if cost_fn is None else rep_b.cost_per_success(cost_fn),
+        cached_share_a=_part_du_cache(toutes_a),
+        cached_share_b=_part_du_cache(toutes_b),
     )
+
+
+def _part_du_cache(tentatives: list[Attempt]) -> float | None:
+    """Jetons d'entrée servis par le cache / jetons d'entrée, sur toutes les tentatives d'un bras."""
+    entree = cache = 0
+    for a in tentatives:
+        if a.input_tokens is None or a.cached_tokens is None:
+            return None
+        entree += a.input_tokens
+        cache += a.cached_tokens
+    return cache / entree if entree > 0 else None
 
 
 # ── Durée : bootstrap de la médiane, par tâche (0.24.0) ──────────────────────

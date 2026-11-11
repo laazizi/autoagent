@@ -11,12 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`enable_code_action(compact=True)`** — a shorter `run_python` description and a shorter hint (about half the
   characters), to cut the fixed per-step input cost on small tasks. Measured on `evals/eval_efficacite.py`,
-  `deepseek-chat`, 20 tasks, k=3, `compare_configs`: -29 % tokens versus the default `enable_code_action()`
-  (interval [-33 % ; -24 %], success 100 % in both arms, same median duration). Against no code action, on the
-  small families the surcharge falls to +59 % (extraction), +15 % (coding), +16 % (SQL) but is not removed.
-  Opt-in; the default is unchanged until measured on a second model (Gemini: [non mesure]). A first, weaker
+  `deepseek-chat`, k=3, `compare_configs`, versus the default `enable_code_action()`: on the SMALL tasks this option
+  targets (families A–C), **-15 % tokens** (interval [-20 % ; -10 %]); all families except big results, -11 %
+  [-16 % ; -6 %]. The all-families figure, -29 % [-33 % ; -24 %], comes mostly from the big-result family (77 % of
+  the gap) and is not the headline. Against no code action, small tasks still cost more: +28 % [+23 % ; +33 %]
+  outside big results, extraction +59 %. Raw tokens only: the prompt-cache share was not kept in these runs, so
+  no COST gain is claimed (it is reported from now on, see `cached_share_*` below). Success 100 % in both arms
+  (the judge does not separate them); one model. Opt-in; the default is unchanged until measured on a second
+  model (Gemini: [non mesure]). A first, weaker
   wording of the hint ("process them with run_python") made the model read big results itself (D1 18 329 tokens
   versus 2 611): the three ideas LARGE / not yourself / call_host must stay in the hint.
+
+- **`compare_configs`: the prompt-cache share of each arm** (`CostComparison.cached_share_a` / `cached_share_b`,
+  in `summary()` and `to_dict()`): cached input tokens / input tokens over all attempts, `None` as soon as one
+  attempt did not report them (never an invented zero). Fewer tokens are not the same percentage of COST when this
+  share moves between arms — DeepSeek's varied from 38 % to 79 % across configurations of the same bench. The
+  efficiency bench keeps it too (`part_cache`, and `entree` / `cache` per family).
 
 - **`SubprocessSandbox(confine=Confinement())` — a kernel-enforced boundary without Docker** (Linux x86_64;
   applied automatically when the host chooses no sandbox — see *Changed* below). Model-written code (`run_python`, `enable_code_action()`, generated tools) runs behind an AST denylist
