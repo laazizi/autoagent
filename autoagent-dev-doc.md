@@ -5373,8 +5373,8 @@ au lieu de conclure.
 **Ce qui reste, dit.** Vingt tâches courtes, simulées, k=3 :
 un écart de réussite de moins de ≈30 points n'est pas détectable. Sans bac passé par l'hôte, le programme tourne
 confiné par le noyau là où Linux le permet (§45), et dans le `SubprocessSandbox` simple ailleurs — une liste
-d'interdits, pas une frontière : en production, `sandbox=DockerSandbox(...)` et `tool_policy`. Pas encore dans le
-constructeur visuel.
+d'interdits, pas une frontière : en production, `sandbox=DockerSandbox(...)` et `tool_policy`. Dans le constructeur
+visuel : option « code comme action » de l'agent (normal ou compact).
 
 **`enable_code_action(compact=True)`** *(0.25.0, opt-in)* : une description de `run_python` et une consigne réduites
 de moitié, pour baisser le coût fixe d'entrée à chaque étape. Mesuré (`deepseek-chat`, k=3, `compare_configs`, contre

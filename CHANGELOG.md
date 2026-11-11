@@ -160,7 +160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     5.56 s → 6.31 s (**+13 %**, [+5 % ; +22 %]: slower here, unlike DeepSeek). Large results −71 %, multi-step
     −77 % (summed from the run's lines); the three small-task families together cost about +40 % (derived by
     subtraction — their per-family detail was not kept). A first attempt on 4 Oct had failed on HTTP 402
-    (credit exhausted), which `compare_configs` flagged instead of concluding. Not in the visual builder yet.
+    (credit exhausted), which `compare_configs` flagged instead of concluding. In the visual builder (agent option, see below).
   - Security: with no sandbox passed, the program runs kernel-confined where Linux allows it (see the
     confinement entry above) and in the plain `SubprocessSandbox` elsewhere — an AST denylist, not a boundary. In production pass
     `sandbox=DockerSandbox(...)` and keep the tools under `tool_policy`.
