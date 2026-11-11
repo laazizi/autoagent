@@ -27,6 +27,7 @@ from .agent import (
     delegate_to,
 )
 from .bounds import Bounds
+from .output_guard import OutputGuard
 from .cascade import CascadeResult, TierAttempt, cascade
 from .compare import ComparisonReport, EvalTask, Variant, compare_configs
 from .dynamic import DynamicToolBuilder, PythonRunner, ToolBuildRequest
@@ -128,6 +129,7 @@ __all__ = [
     "OutcomeUnknown",
     "idempotency_key",
     "Bounds",
+    "OutputGuard",
     "TraceMetrics",
     "summarize_trace",
     "RunState",

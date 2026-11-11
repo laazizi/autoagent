@@ -57,6 +57,7 @@ gates, durable runs, fact memory, MCP client, OpenTelemetry export.
 | `autoagent/orchestrator.py` | host-driven deterministic flows |
 | `autoagent/validation.py` | internal JSON-Schema validator (0.21.0) — replaces `jsonschema`; the subset the library generates + MCP/model schemas; differential-tested against `jsonschema` when the `dev` extra is present |
 | `autoagent/synthesis.py` | `synthesize_tool` — program synthesis by example (0.21.0): host truth split shown/held-out, the sandbox judges, held-out cases never reach the model |
+| `autoagent/output_guard.py` | `OutputGuard` / `guard_output` — response-channel guard: in a TAINTED run, URLs of the final answer not seen verbatim in the transcript are neutralized (`Agent(output_guard="neutralize")`, default off) |
 | `autoagent/guards.py` | `TurnGuards` — loop guard, trifecta, host policy, moved out of the loop (0.21.0); incremental signature counter |
 | `autoagent/bounds.py` | `Bounds` — the eight bounds as one frozen dataclass; `agent.bounds` snapshot (0.21.0) |
 | `autoagent/_fichiers.py` | `atomic_write_text` / `quarantine` — state files (facts, vectors, manifest) never left truncated nor overwritten when unreadable (0.22.0) |

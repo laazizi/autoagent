@@ -11,6 +11,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Provenance of generated tools; quarantine of tools built in a tainted run** (`DynamicToolBuilder(persist=True)`). Each catalogue entry now records `provenance`: whether the run had ingested untrusted content when the model had the tool written (read from the active gate, `gate.active_gate()`; unreadable = tainted, fail-closed), the library tools visible at the time, and a sequence number. A tool built in a tainted run is QUARANTINED: kept and inspectable, never reloaded by `load_library()` until a human calls `release(name, reviewed_sha256)` (refused if the digest or the file differs from the validated one). New: `quarantine()`, `quarantined()`, `descendants(name)` (tools built after `name` in a run where it was visible, transitive) and `cascade=True` on `retire()` / `quarantine()`. Why: agents that write tools by imitating a library copy the trapped ones, and deleting the original leaves the copies (EVOMAL, arXiv 2608.25776). Catalogues written before this change have no provenance and load as before.
   Three bypasses found by an adversarial pass and closed, each with a test: (1) **delegation laundered the taint** — a tainted parent that asked a clean sub-agent (`as_tool`, `delegate_to`, nested) to build the tool got it recorded `tainted: False` and reloaded; the delegating run's taint now reaches the sub-agent's run for provenance (`ActionGate.lineage_tainted`, recorded as `context: "delegated_from_tainted_run"`), with or without `inherit_policy`. It deliberately does NOT change the sub-agent's trifecta guard: without `inherit_policy=True` it still acts under its own policy, as documented. (2) **A quarantined tool stayed callable** in the next runs of the agent that built it: it is now refused at CALL time everywhere except in the run that built it (`GeneratedPythonTool.admission`, fail-closed; a quarantine set by the host applies to already-loaded tools too, and survives a lost catalogue). (3) **`approval.load_tools` ignored the catalogue**: in a directory kept by the builder, an unapproved tool is registered only if the catalogue knows it, has not quarantined or retired it, and its digest is unchanged — otherwise it is reported `"quarantined"` / `"retired"`; an unreadable catalogue skips every unapproved tool and is left untouched. A tool whose exact digest is in the manifest (human approval) still loads natively; a directory without a catalogue behaves as before.
+
+- **`Agent(output_guard="neutralize")` — a guard on the RESPONSE channel** (`autoagent/output_guard.py`, default `"off"`). The
+  injection bench (§42, demo 38) measured that no guard read the final answer: the `image_markdown` attack (the model
+  writes the canary into the URL of an image of its answer) compromised 1 run of 1 in all three demo configurations
+  (no guard, trifecta guard, per-argument policy). In a TAINTED run, every URL of the answer must now appear
+  verbatim in the transcript or it is removed: an IMAGE only if it is in TRUSTED content (system prompt, user message,
+  non-`untrusted` tool result) or on `OutputGuard(allowed_hosts=...)`; a LINK or bare URL also if it is quoted verbatim
+  from untrusted content (`links_from_untrusted=False` refuses that). Covers inline and reference links/images,
+  autolinks, HTML attributes (`src`, `href`, `srcset`…), bare `http`/`ftp`/`//host`/`www.`, upper-case schemes, `\/`,
+  numeric entities, any scheme (`javascript:`, `mailto:`). The trace event `output_guard_block` (or `output_guard_would_block`
+  under `shadow_guards`) carries kind, length and digest of each removed URL — never the URL (it may hold the secret).
+  The text stream is held back while the guard is active on an already-tainted run. Fail-closed: a guard that crashes
+  empties the answer; an unknown `output_guard` value raises. **Measured, level 1 (offline, DocileProvider, k=1):**
+  `image_markdown` compromised 1/1 → 0/1 in all three configurations; legitimate task utility unchanged; positive
+  control unchanged (7/8 leak without any guard). Does NOT cover: a secret written in plain text in the answer, a
+  selection among attacker-prepared URLs present in the page, a read URL (`lire_page(url)`), voice.
+  An adversarial pass (headless Chrome + a local server logging requests) then broke it; closed, each with a test:
+  numeric entities WITHOUT a semicolon (`&#104ttp://`, decoded by HTML5) and with leading zeros; backslash forms the
+  browser reads as `/` (`/\host`, `\/host`, `\\host`, `https:\\host`, tab inside the URL, `<img/src=…>`); a reference
+  definition whose destination is on the NEXT line; a CUBIC regex on unterminated tags (`<a` + 800 spaces: 0.64 s,
+  now linear) and a QUADRATIC scan per reference definition (6 000 definitions: 8 s → 0.3 s). False positives: 6
+  legitimate answers out of 12 lost a trusted URL; trusted URLs are now also compared in a canonical form (HTML
+  entities such as `&amp;`, host and scheme case, http/https, default port, trailing `/`, `mailto:` reduced to the
+  address) — never the path, query, fragment or `user@`; two URLs glued by a comma are judged one by one. Known
+  limit: a `>` inside a quoted attribute value cuts the tag; the rest falls to the bare-URL net. Still opt-in: no
+  false-positive rate has been measured on a real model's answers.
+
 - **`SubprocessSandbox(confine=Confinement())` — a kernel-enforced boundary without Docker** (Linux x86_64;
   applied automatically when the host chooses no sandbox — see *Changed* below). Model-written code (`run_python`, `enable_code_action()`, generated tools) runs behind an AST denylist
   the library has called bypassable since 0.22.0; once bypassed, the code had the host process's rights. Docker is

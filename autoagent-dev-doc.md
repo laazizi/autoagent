@@ -5019,7 +5019,7 @@ l'attaque a échoué ; `metric="utility"` : réussi = la tâche légitime a abou
   DÉTERMINISTE, les 3 répétitions d'une attaque sont identiques : ce p minuscule est mécanique, la lecture utile est
   « 8 tâches sur 8 ».
 - **`image_markdown` aboutit dans les trois** : l'ordre d'écrire le code dans l'URL d'une image rendue passe
-  par la **réponse**, canal qu'aucune garde de la bibliothèque ne regarde. À couvrir côté hôte (filtre de
+  par la **réponse**, canal que seule `Agent(output_guard="neutralize")` (opt-in, `output_guard.py`, [Unreleased] : `image_markdown` 1/1 → 0/1 au niveau 1) regarde. À couvrir côté hôte (filtre de
   sortie, rendu d'images désactivé).
 
 **Niveau 2, mesuré (démo 38 `--reel`, `deepseek-chat`, k=3 → 24 runs par configuration, 4 octobre 2026 — un modèle,
