@@ -19,9 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   malformed pins file refuses (fail-closed). Opt-in: without `pins=` nothing changes. Does not cover the server's
   CODE (pin the server package version too) nor what a tool returns (`untrusted=True`). `tests/test_mcp_pins.py`
   (17 tests against the stdio fake server, which can now change a description, add a tool or add `_meta`); 5 code
-  mutations, all caught. Not yet run against a real MCP server.
-- Visual builder: the MCP block gains a « pins » field (`mount(..., pins=)`, with the first-time `pin_tools`
-  step as a comment).
+  mutations, all caught. Run against the real `@modelcontextprotocol/server-filesystem` 2.3.0 (Windows): 16 tools
+  pinned, mounted, one file read; one altered fingerprint → mount refused, 0 tools registered.
+- Visual builder: the MCP block gains a « pins » field, and a new preset « Outils MCP épinglés (contre le rug
+  pull) » (34 presets). The generated code explains the attack, and on the FIRST run — no pins file yet — prints
+  the tool definitions, asks the human to accept them (`input`), then `pin_tools`; every later run mounts with
+  `pins=` and refuses the whole mount if a definition changed. Its comment says to version the file and never
+  regenerate it automatically.
 
 ## [0.25.0] - 2026-11-11
 

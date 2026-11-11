@@ -842,7 +842,7 @@ const INFO = {
   delegation:{api:"delegate_to({nom: agent, …}, name=)", info:"UN outil, plusieurs demandes : celles qui visent des spécialistes différents partent EN PARALLÈLE (−39 % de temps mesuré). L'appel ne rend la main que quand TOUS ont fini — c'est ce qui garde token_budget exact (paralléliser ≠ passer en asynchrone). Un même spécialiste est sérialisé ; l'ordre des réponses suit les demandes ; la teinte d'un spécialiste remonte ; la dépense de tous entre dans le plafond du parent. « inherit_policy » : leurs appels d'outils passent aussi par la politique du parent. Depuis la 0.25.0, la TEINTE descend toujours : appelé après un contenu non fiable, le spécialiste naît teinté — ses outils egress sont refusés (trifecta_guard « off » sur LUI pour l'autoriser), les outils qu'il fait construire vont en quarantaine."},
   cascade:{api:"cascade([lambda: agent_lite, lambda: agent_pro], tache, check=juge)", info:"Le petit modèle d'abord, le gros seulement si TON juge (du CODE, pas l'avis du modèle) refuse. Les paliers ratés se paient et sont dans la facture. Une pause d'approbation remonte : la cascade ne contourne jamais tool_policy. Mesuré : sur des micro-tâches la cascade peut coûter PLUS en jetons — elle gagne en euros si le jeton lite coûte moins qu'un seuil que la démo 33 calcule."},
   synthese:{api:"synthesize_tool(builder, goal, examples, holdout=, max_attempts=, register_on=)", info:"Le modèle écrit un outil, le bac à sable exécute TES exemples (args → attendu) et décide. Les exemples sont COUPÉS : la part cachée n'est jamais transmise au modèle, même quand elle rate (il apprend combien, jamais lesquels) — sinon il code les exemples un par un. Un outil refusé est effacé du disque ; un outil accepté reste en bac à sable jusqu'à ta promotion par empreinte."},
-  mcp:{api:"MCPClient(commande).mount(agent, prefix=, include=)", info:"Branche un serveur MCP (Model Context Protocol) : il tourne en sous-processus local (stdio) et CHACUN de ses outils devient un outil autoagent ordinaire, validé par le registre avant chaque appel. Filtre avec « include » : monter 3 outils précis vaut mieux que 40 (contexte + surface d'attaque). Zéro dépendance."},
+  mcp:{api:"MCPClient(commande).mount(agent, prefix=, include=)", info:"Branche un serveur MCP (Model Context Protocol) : il tourne en sous-processus local (stdio) et CHACUN de ses outils devient un outil autoagent ordinaire, validé par le registre avant chaque appel. Filtre avec « include » : monter 3 outils précis vaut mieux que 40 (contexte + surface d'attaque). Zéro dépendance. « Fichier d'épingles » : la première fois, tu relis les définitions des outils et tu les acceptes ; ensuite, si le serveur en change une (rug pull) ou en ajoute une, RIEN n'est monté."},
   otel:{api:"OTelTraceExporter() → TraceEmitter(on_event=…)", info:"Exporte la trace vers OpenTelemetry : l'arbre agent.run → llm → tool.<nom> devient de vrais spans visibles dans Jaeger, Grafana Tempo, Langfuse ou Phoenix. Se branche sur la Trace (créée automatiquement au besoin). Nécessite opentelemetry-api — dépendance OPTIONNELLE, le cœur reste zéro dépendance."},
   checkpoint:{api:"run(checkpoint=…) · RunState · agent.resume(state)", info:"Le run n'est plus prisonnier de son processus : un snapshot JSON est sauvé à CHAQUE étape complétée. Après un crash ou un redémarrage, l'agent REPREND où il en était (resume) au lieu de tout refaire. max_steps et token_budget gardent leur sens à travers les reprises."},
   evolution:{api:"enable_software_evolution(agent, EvolutionRuntime(workspace_root, pipeline_path=, validation_command=, allowed_write_extensions=), capabilities=)", info:"L'agent fait évoluer un LOGICIEL existant, sous garde : lecture/écriture bornées à un dossier et à des extensions, slots de pipeline remplaçables à chaud (pipeline.json), commande de validation fixée par l'hôte, rollback de chaque changement. Quatorze outils sont enregistrés selon les capacités choisies. La commande de validation ne peut pas être remplacée par le modèle sauf drapeau explicite — une exécution arbitraire n'a sa place qu'en bac à sable."},
@@ -1227,6 +1227,7 @@ function generate(){
   if(agentB && ckpt){ std.add("json"); std.add("pathlib"); }
   if(agentB && imagePath && !integ){ std.add("base64"); std.add("mimetypes"); std.add("pathlib"); }
   if(agentB && timeoutS && !integ) std.add("threading");
+  if(mcps.some(m => String(m.f.pins||"").trim())) std.add("pathlib");
   if(std.size){ for(const m of [...std].sort()) L.push(`import ${m}`); L.push(``); }
   L.push(`from autoagent import ${[...names].join(", ")}`);
   if(sb){
@@ -1648,9 +1649,21 @@ function generate(){
       const pins = String(m.f.pins||"").trim();
       if(pins){
         margs.push(`pins=${pyStr(pins)}`);
-        L.push(`# Épinglage : la PREMIÈRE fois, relis ${mv}.list_tools() puis accepte-les :`);
-        L.push(`#     ${mv}.pin_tools(${pyStr(pins)}${inc.length ? `, include={${inc.map(pyStr).join(", ")}}` : ``})`);
-        L.push(`# Ensuite, une définition changée ou un outil nouveau refuse TOUT le montage (MCPError).`);
+        const incPy = inc.length ? `{${inc.map(pyStr).join(", ")}}` : ``;
+        L.push(`# Épinglage des définitions d'outils (contre le « rug pull ») : un serveur MCP peut changer la`);
+        L.push(`# description d'un outil APRÈS que tu l'as relue — le modèle lirait alors une consigne que personne`);
+        L.push(`# n'a vue. La PREMIÈRE fois, le fichier d'épingles n'existe pas : on AFFICHE les définitions, TU`);
+        L.push(`# décides, et on les épingle (sha256 de chaque définition). Versionne ce fichier avec ton code ;`);
+        L.push(`# ne le régénère jamais automatiquement (sinon il n'épingle plus rien).`);
+        L.push(`if not pathlib.Path(${pyStr(pins)}).exists():`);
+        L.push(`    for outil in ${mv}.list_tools():`);
+        if(inc.length) L.push(`        if outil["name"] in ${incPy}:`);
+        L.push(`${inc.length ? "            " : "        "}print("-", outil["name"], ":", (outil.get("description") or "")[:120])`);
+        L.push(`    if input("Accepter ces définitions d'outils ? [o/N] ").strip().lower() != "o":`);
+        L.push(`        raise SystemExit("Définitions refusées : aucun outil MCP n'est monté.")`);
+        L.push(`    ${mv}.pin_tools(${pyStr(pins)}${inc.length ? `, include=${incPy}` : ``})`);
+        L.push(`# Ensuite, à CHAQUE lancement : une définition changée ou un outil nouveau refuse TOUT le`);
+        L.push(`# montage (MCPError) — rien n'est branché, pas même les outils inchangés.`);
       }
       L.push(`${mv}.mount(${margs.join(", ")})`);
       L.push(``);
@@ -2531,6 +2544,12 @@ const PRESETS = [
   {id:"mcp", grp:"Outils qui s'écrivent", label:"Outils MCP (filesystem)", make:()=>[
     mk("agent",{var:"agent",system:"Tu explores des fichiers avec tes outils MCP. Tu ne rapportes que ce que tes outils renvoient.",steps:"6"}),
     mk("mcp",{}),
+    mk("trace",{file:"trace.jsonl"}),
+    mk("run",{prompt:"Liste les fichiers du dossier, puis résume le contenu du premier fichier texte que tu trouves."}),
+  ]},
+  {id:"mcp_pins", grp:"Sécurité & bornes", label:"Outils MCP épinglés (contre le rug pull)", make:()=>[
+    mk("agent",{var:"agent",system:"Tu explores des fichiers avec tes outils MCP. Tu ne rapportes que ce que tes outils renvoient.",steps:"6"}),
+    mk("mcp",{pins:"mcp_pins.json"}),
     mk("trace",{file:"trace.jsonl"}),
     mk("run",{prompt:"Liste les fichiers du dossier, puis résume le contenu du premier fichier texte que tu trouves."}),
   ]},

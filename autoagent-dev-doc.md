@@ -194,7 +194,7 @@ python examples_autoagent/17_memoire_factuelle.py
 
 Et le **constructeur visuel** (`constructeur_autoagent.html`, hors-ligne) :
 assemble des blocs → code Python généré ; menu « Charger un exemple » =
-33 presets (tous générés et compilés en CI) + les démos complètes en lecture.
+34 presets (tous générés et compilés en CI) + les démos complètes en lecture.
 
 ---
 
@@ -2852,8 +2852,9 @@ with MCPClient(commande, inherit_env=False) as mcp:
 - **Ce que ça ne couvre pas** : le CODE du serveur (il peut changer de comportement sans changer de définition :
   épingle aussi la version du paquet serveur) ; le contenu que l'outil RENVOIE (pour ça : `untrusted=True`).
 - Vérifié : `tests/test_mcp_pins.py` (17 tests, contre le faux serveur stdio des tests, qui sait changer une
-  description, ajouter un outil ou ajouter un `_meta`) ; 5 mutations du code, toutes attrapées. Pas encore
-  vérifié contre un vrai serveur MCP.
+  description, ajouter un outil ou ajouter un `_meta`) ; 5 mutations du code, toutes attrapées. **Vérifié contre
+  le vrai serveur** `@modelcontextprotocol/server-filesystem` 2.3.0 (11 nov. 2026, Windows) : 16 outils épinglés,
+  montés, une lecture réussie ; une empreinte altérée → montage refusé, 0 outil monté.
 
 ## 18. `OTelTraceExporter` — traces vers OpenTelemetry
 
