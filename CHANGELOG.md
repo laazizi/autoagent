@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-11-11
+
 ### Added
 
 - **`Agent(url_guard="deny")` — a guard on the URLs of tool CALLS** (default `"off"`; `autoagent.output_guard.guard_call_urls`, `gate.url_guard_verdict`). Reading a URL is also writing: `read_page("https://host/p.png?d=SECRET")`
@@ -2806,7 +2808,8 @@ underscored or imported from a submodule path is internal and may change.
 - CI invariants: `ruff check`, `ruff format --check`, `mypy autoagent/`,
   and `pytest` are all green.
 
-[Unreleased]: https://github.com/laazizi/autoagent/compare/v0.25.0...HEAD
+[Unreleased]: https://github.com/laazizi/autoagent/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/laazizi/autoagent/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/laazizi/autoagent/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/laazizi/autoagent/compare/v0.23.1...v0.24.0
 [0.23.1]: https://github.com/laazizi/autoagent/compare/v0.23.0...v0.23.1

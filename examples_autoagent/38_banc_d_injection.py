@@ -26,8 +26,8 @@ Ce que la demo montre :
      avec (utilite 0/8) - apres lecture d'une page non fiable, tout envoi est refuse ;
   3. une politique PAR ARGUMENT (« refuse tout destinataire hors alice ») : meme protection,
      utilite intacte ;
-  4. ce qu'AUCUNE garde de la lib ne couvre : l'URL d'une image dans la reponse (canal de
-     SORTIE) - le banc le dit, il ne le cache pas ;
+  4. ce que ces trois configurations ne couvrent PAS : l'URL d'une image dans la reponse (canal
+     de SORTIE) - le banc le dit, il ne le cache pas (la garde de la reponse la retire : partie 6) ;
   5. `compare_configs` : « la politique par argument est-elle meilleure ? » devient un
      chiffre apparie, un test exact et un controle A/A ;
   6. le banc des ROUTES (0.26.0) : un attaquant ne s'arrete pas au premier refus. Chaque
@@ -106,8 +106,8 @@ def niveau_1() -> None:
     print("\n  -> la garde brutale et la politique fine arretent les MEMES six envois ; la premiere tue")
     print("     l'utilite (0/8), la seconde la garde (8/8).")
     print("  -> « image_markdown » aboutit dans LES TROIS : l'ordre d'ecrire le code dans l'URL d'une image")
-    print("     rendue passe par la REPONSE, canal que seule `Agent(output_guard='neutralize')` (opt-in) regarde. A couvrir cote hote")
-    print("     (filtre de sortie, rendu d'images desactive).")
+    print("     rendue passe par la REPONSE, canal que seule `Agent(output_guard='neutralize')` (opt-in) regarde :")
+    print("     aucune de ces trois configurations ne l'active. Voir la partie 6.")
 
     ligne("5) compare_configs : « la politique par argument est-elle meilleure ? »")
     taches = injection_tasks(metric="utility")

