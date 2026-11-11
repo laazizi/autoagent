@@ -11,6 +11,7 @@ import re
 import tempfile
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -58,17 +59,29 @@ def _lignes_fonctions(host_functions: dict[str, Callable[..., Any]]) -> list[str
 
 def _provenance_du_run() -> dict[str, Any]:
     """Le contexte du run à la construction, lu sur la porte active (`gate.py`). Hors d'un run
-    d'agent (appel à la main) : pas de teinte connue, donc propre. Lecture qui plante :
-    on suppose teinté (fail-closed)."""
+    d'agent (appel à la main) : pas de teinte connue, donc propre. Un sous-agent appelé par un
+    run teinté est teinté (`lineage_tainted`) : sans cela, déléguer la création à un sous-agent
+    propre blanchissait la teinte. Lecture qui plante : on suppose teinté (fail-closed)."""
     from .gate import active_gate
     porte = active_gate()
     if porte is None:
         return {"tainted": False, "context": "no_run"}
     try:
-        return {"tainted": bool(porte.tainted), "context": "run"}
+        if porte.tainted:
+            return {"tainted": True, "context": "run"}
+        if porte.lineage_tainted:
+            return {"tainted": True, "context": "delegated_from_tainted_run"}
+        return {"tainted": False, "context": "run"}
     except Exception:
         _log.exception("could not read the run taint; assuming tainted (fail-closed)")
         return {"tainted": True, "context": "run_unreadable"}
+
+
+def _run_en_cours() -> Any:
+    """L'objet qui identifie le run en cours (ses gardes de tour, un par run), ou `None`."""
+    from .gate import active_gate
+    porte = active_gate()
+    return getattr(porte, "guards", None) if porte is not None else None
 
 
 def _descendants(outils: dict[str, dict[str, Any]], name: str) -> list[str]:
@@ -328,6 +341,12 @@ class DynamicToolBuilder:
         # Provenance : les outils de la bibliothèque que le modèle VOIT dans ce processus
         # (rechargés par `load_library` + construits ici). Un outil en quarantaine n'y est jamais.
         self._visibles: set[str] = set()
+        # Quarantaine connue de CE processus, en plus du catalogue : un catalogue perdu ou
+        # corrompu ne doit pas libérer un outil déjà chargé. Et, pour chaque outil mis en
+        # quarantaine à sa construction, le run qui l'a construit (référence faible) : c'est
+        # le seul où il reste appelable.
+        self._en_quarantaine: set[str] = set()
+        self._run_de_construction: dict[str, weakref.ref[Any]] = {}
         # Dépense du dernier `build()` (0.22.0). L'appel au modèle constructeur
         # coûtait des jetons INVISIBLES à `token_budget` : le modèle pouvait
         # construire outil sur outil sous un plafond aveugle. `create_python_tool`
@@ -446,6 +465,7 @@ class DynamicToolBuilder:
         if self.persist:
             self._noter_construction(generated_tool, _provenance_du_run())
             generated_tool.observer = self._observer
+            generated_tool.admission = self._admission
         return generated_tool
 
     def _construire(self, request: ToolBuildRequest, contenu: str) -> GeneratedPythonTool:
@@ -583,8 +603,16 @@ class DynamicToolBuilder:
                 entree["quarantine_reason"] = "built in a run that had ingested untrusted content"
                 _log.warning("generated tool %r built in a TAINTED run: quarantined (not reloaded until released)", nom)
                 self._visibles.discard(nom)
+                self._en_quarantaine.add(nom)
+                run = _run_en_cours()
+                if run is not None:
+                    self._run_de_construction[nom] = weakref.ref(run)
+                else:
+                    self._run_de_construction.pop(nom, None)
             else:
                 self._visibles.add(nom)
+                self._en_quarantaine.discard(nom)
+                self._run_de_construction.pop(nom, None)
             outils[nom] = entree
             self._ecrire_catalogue(outils)
 
@@ -631,6 +659,10 @@ class DynamicToolBuilder:
                 outils[nom][champ] = True
                 outils[nom][champ_raison] = raison if nom == name else f"{raison} (built after {name!r}, which it could see)"
                 self._visibles.discard(nom)
+                if champ == "quarantined":
+                    # Posée par l'hôte : plus aucun run, pas même celui qui l'a construit.
+                    self._en_quarantaine.add(nom)
+                    self._run_de_construction.pop(nom, None)
             self._ecrire_catalogue(outils)
             return cibles
 
@@ -669,7 +701,30 @@ class DynamicToolBuilder:
             entree["released"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             entree.pop("quarantine_reason", None)
             self._ecrire_catalogue(outils)
+            self._en_quarantaine.discard(name)
+            self._run_de_construction.pop(name, None)
             return True
+
+    def _admission(self, nom: str) -> str | None:
+        """Contrôle avant CHAQUE appel d'un outil de la bibliothèque (nuit du 11 nov. 2026).
+
+        Un outil en quarantaine restait dans le registre de l'agent qui l'avait construit, et
+        appelable à ses runs suivants. Il ne sert plus qu'au run qui l'a construit (le modèle
+        l'a fait écrire pour sa tâche en cours) ; partout ailleurs — run suivant, autre agent,
+        appel de l'hôte hors run, quarantaine posée par l'hôte — il est refusé jusqu'à `release`.
+        """
+        with self._verrou:
+            entree = self._lire_catalogue().get(nom)
+            en_quarantaine = nom in self._en_quarantaine or bool(entree and entree.get("quarantined"))
+            if not en_quarantaine:
+                return None
+            ref = self._run_de_construction.get(nom)
+        run = _run_en_cours()
+        if ref is not None and run is not None and ref() is run:
+            return None
+        return (f"tool {nom!r} is in quarantine (built in a run that had ingested untrusted content, "
+                f"or quarantined by the host); it is not callable until a human releases it "
+                f"(DynamicToolBuilder.release)")
 
     def load_library(self) -> list[GeneratedPythonTool]:
         """Recharge les outils déjà acceptés lors de runs précédents (``persist=True``).
@@ -714,6 +769,7 @@ class DynamicToolBuilder:
                 _log.warning("library tool %r declares another name (%r); skipped", nom, outil.spec.name)
                 continue
             outil.observer = self._observer
+            outil.admission = self._admission
             outil.host_functions = self.host_functions
             self._visibles.add(nom)
             charges.append(outil)
