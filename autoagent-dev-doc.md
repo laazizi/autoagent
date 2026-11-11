@@ -2243,7 +2243,8 @@ autoagent/
 │                            # 0.12→0.13 — FactMemory (+ sleep-time, embed_fn) ;
 │                            # 0.18.0 — recall hybride BM25+RRF, forget_matching,
 │                            # bi-temporalité + provenance (§25, §26)
-├── mcp.py                   # 0.11.0 — MCPClient (serveur MCP stdio → tools locaux, §17)
+├── mcp.py                   # 0.11.0 — MCPClient (serveur MCP stdio → tools locaux, §17) ;
+│                            # main (non publié) — pin_tools / mount(pins=) : définitions épinglées (§17.1)
 ├── otel.py                  # 0.11.0 — OTelTraceExporter ; 0.18.0 — semconv="gen_ai" (§18, §25.3)
 ├── replay.py                # 0.16.0 — RecordSession / ReplaySession (§23)
 ├── policy.py                # 0.18.0 — ToolPolicySpec : la politique d'outils en JSON (§26.2) ;
@@ -2370,6 +2371,7 @@ from autoagent.redteam import (                              # 0.24.0 — le ban
 )
 from autoagent.faults import FaultServer, run_fault_bench, FAULT_CASES      # 0.24.0 — le banc de pannes (§42.2)
 from autoagent.ws import WebSocketClient, WebSocketClosed, WebSocketError   # 0.25.0 — WebSocket stdlib (§44)
+from autoagent.mcp import tool_fingerprint                                   # main (non publié) — empreinte d'un outil MCP (§17.1)
 from autoagent.output_guard import OutputGuard, guard_output                # 0.25.0 — garde du canal de la réponse (§47)
 from autoagent.gate import delegation_taint                                 # 0.25.0 — la teinte qui descend (§46)
 ```
@@ -2805,8 +2807,11 @@ with MCPClient(["npx", "-y", "@modelcontextprotocol/server-filesystem", "."]) as
 | `start()` / `close()` / context manager | lance le process + handshake `initialize` ; `close()` idempotent |
 | `list_tools()` | définitions brutes du serveur (pagination `nextCursor` suivie) |
 | `call_tool(name, arguments, timeout=)` | 1 appel ; `structuredContent` renvoyé tel quel, sinon `{"text": ...}` |
-| `tools(include=, exclude=, prefix=)` | handlers portant `__autoagent_tool_spec__` (schéma = `inputSchema` du serveur) |
-| `mount(agent, include=, exclude=, prefix=)` | `add_tool` de chaque handler ; accepte aussi un `ToolRegistry` nu |
+| `tools(include=, exclude=, prefix=, untrusted=, pins=)` | handlers portant `__autoagent_tool_spec__` (schéma = `inputSchema` du serveur) |
+| `mount(agent, include=, exclude=, prefix=, untrusted=, pins=)` | `add_tool` de chaque handler ; accepte aussi un `ToolRegistry` nu |
+| `fingerprints(include=, exclude=)` *(non publié)* | `{nom serveur: sha256}` des définitions sélectionnées |
+| `pin_tools(path, include=, exclude=)` *(non publié)* | écrit ces empreintes dans un fichier JSON à versionner avec le code |
+| `tool_fingerprint(tool_def)` *(non publié)* | l'empreinte d'UNE définition : JSON canonique sans `_meta`, sha256 |
 | `server_info` / `server_capabilities` / `alive` | état après handshake |
 
 **Sémantique** :
@@ -2821,6 +2826,34 @@ with MCPClient(["npx", "-y", "@modelcontextprotocol/server-filesystem", "."]) as
 * Windows : donner le vrai exécutable (`npx.cmd`, pas `npx`) ; pipes forcés UTF-8.
 * `include`/`exclude` filtrent sur les noms CÔTÉ SERVEUR (avant `prefix`) —
   monter 3 outils précis vaut mieux que 40 (contexte + surface d'attaque).
+
+### 17.1 Épingler les définitions d'outils *(sur `main`, non publié)*
+
+Un serveur MCP peut changer la description ou le schéma d'un outil APRÈS qu'on l'a relu et accepté
+(« rug pull ») : le modèle lit alors une consigne que personne n'a vue. OWASP Top 10 for Agentic Applications
+2026, ASI04 (chaîne d'approvisionnement agentique) : épingler outils et configurations par empreinte de contenu.
+
+```python
+with MCPClient(commande, inherit_env=False) as mcp:
+    print(mcp.list_tools())                    # 1. LIRE les définitions
+    mcp.pin_tools("mcp_pins.json")             # 2. les accepter : un fichier à versionner
+
+with MCPClient(commande, inherit_env=False) as mcp:
+    mcp.mount(agent, pins="mcp_pins.json")     # 3. refuse si une définition a changé
+```
+
+- Chaque outil SÉLECTIONNÉ (après `include` / `exclude`) doit être épinglé avec l'empreinte de sa définition
+  actuelle. Une définition changée, ou un outil apparu depuis, lève `MCPError` et **rien n'est monté**, pas même
+  les outils inchangés (fail-closed). Un outil épinglé que le serveur n'offre plus est seulement journalisé.
+- L'empreinte couvre tout ce que le serveur dit de l'outil (nom, description, schémas, annotations), sauf
+  `_meta` ; JSON canonique, l'ordre des clés n'y change rien.
+- Fichier absent, illisible ou mal formé : refus (`MCPError`). `pins=` accepte aussi un dict en mémoire.
+- Ce que le modèle lit est figé au montage : une description changée PLUS TARD par le serveur ne lui parvient pas.
+- **Ce que ça ne couvre pas** : le CODE du serveur (il peut changer de comportement sans changer de définition :
+  épingle aussi la version du paquet serveur) ; le contenu que l'outil RENVOIE (pour ça : `untrusted=True`).
+- Vérifié : `tests/test_mcp_pins.py` (17 tests, contre le faux serveur stdio des tests, qui sait changer une
+  description, ajouter un outil ou ajouter un `_meta`) ; 5 mutations du code, toutes attrapées. Pas encore
+  vérifié contre un vrai serveur MCP.
 
 ## 18. `OTelTraceExporter` — traces vers OpenTelemetry
 

@@ -38,20 +38,58 @@ Design notes:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
 import subprocess
 import threading
 from collections import deque
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from pathlib import Path
+from typing import Any, Callable, Iterable, Mapping, Sequence, Union
 
+from ._fichiers import atomic_write_text
 from .errors import MCPError, ToolError
 from .logging import get_logger, warn_once
 from .sandbox import safe_environment
 from .schema import JsonDict, ToolSpec
 
-__all__ = ["MCPClient", "MCP_PROTOCOL_VERSION"]
+__all__ = ["MCPClient", "MCP_PROTOCOL_VERSION", "tool_fingerprint"]
+
+# Les épingles : un chemin vers le fichier écrit par `pin_tools`, ou un dict {nom serveur: sha256}.
+Pins = Union[str, os.PathLike, Mapping[str, str]]
+
+
+def tool_fingerprint(tool_def: Mapping[str, Any]) -> str:
+    """L'empreinte sha256 d'une définition d'outil MCP, telle que le serveur l'envoie (0.26.0).
+
+    Couvre TOUT ce que le serveur dit de l'outil — nom, description, schémas, annotations — sauf
+    ``_meta`` (métadonnées volatiles du protocole). JSON canonique : clés triées, sans espaces,
+    UTF-8. Deux définitions qui ne diffèrent que par l'ordre des clés ont la même empreinte.
+    Ce n'est PAS une empreinte du CODE du serveur : épingle aussi la version du paquet serveur.
+    """
+    sans_meta = {k: v for k, v in tool_def.items() if k != "_meta"}
+    canonique = json.dumps(sans_meta, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonique.encode("utf-8")).hexdigest()
+
+
+def _charger_pins(pins: Pins) -> dict[str, str]:
+    """Les épingles, validées. Fail-CLOSED : absent, illisible ou mal formé = refus (MCPError)."""
+    if isinstance(pins, Mapping):
+        source, donnees = "pins mapping", {"tools": dict(pins)}
+    else:
+        chemin = Path(pins)
+        source = f"pins file {chemin}"
+        try:
+            donnees = json.loads(chemin.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise MCPError(f"{source} unreadable ({type(exc).__name__}): nothing mounted. "
+                           f"Write it with MCPClient.pin_tools() after reviewing the tools.") from exc
+    outils = donnees.get("tools") if isinstance(donnees, dict) else None
+    if not isinstance(outils, dict) or not all(
+            isinstance(n, str) and isinstance(h, str) and len(h) == 64 for n, h in outils.items()):
+        raise MCPError(f"{source} malformed (expected {{'tools': {{name: sha256}}}}): nothing mounted")
+    return outils
 
 _log = get_logger(__name__)
 
@@ -268,6 +306,7 @@ class MCPClient:
         exclude: Iterable[str] | None = None,
         prefix: str = "",
         untrusted: bool = False,
+        pins: Pins | None = None,
     ) -> list[Callable[..., Any]]:
         """Build one autoagent-compatible handler per server tool.
 
@@ -276,10 +315,59 @@ class MCPClient:
         it can be passed straight to ``agent.add_tool`` / a registry's
         ``add_function``. ``include``/``exclude`` filter on the SERVER
         tool names (before prefixing).
+
+        ``pins`` (0.26.0): the file written by `pin_tools` (or a dict
+        ``{server name: sha256}``). Every SELECTED tool must be pinned with
+        the fingerprint of its current definition — a changed description
+        or schema ("rug pull") or a tool that appeared since is REFUSED
+        with ``MCPError`` and NO handler is built (fail-closed). A pinned
+        tool the server no longer offers is only logged.
         """
+        definitions = self._selection(include, exclude)
+        if pins is not None:
+            self._verifier_pins(definitions, _charger_pins(pins))
+        return [self._make_handler(d, prefix, untrusted) for d in definitions]
+
+    def fingerprints(
+        self,
+        *,
+        include: Iterable[str] | None = None,
+        exclude: Iterable[str] | None = None,
+    ) -> dict[str, str]:
+        """``{server tool name: sha256 of its definition}`` for the selected tools (0.26.0)."""
+        return {str(d["name"]): tool_fingerprint(d) for d in self._selection(include, exclude)}
+
+    def pin_tools(
+        self,
+        path: str | os.PathLike,
+        *,
+        include: Iterable[str] | None = None,
+        exclude: Iterable[str] | None = None,
+    ) -> dict[str, str]:
+        """Write the fingerprints of the selected tools to ``path`` (0.26.0).
+
+        The deliberate step of pinning: run it once you have READ the
+        tool definitions (``list_tools()``) and accept them, then mount
+        with ``pins=path``. The file is JSON, meant to be versioned next to
+        the code: ``{"version": 1, "server": {...}, "tools": {name: sha256}}``.
+        Returns the fingerprints written.
+        """
+        empreintes = self.fingerprints(include=include, exclude=exclude)
+        contenu = {
+            "version": 1,
+            "server": {k: self.server_info.get(k) for k in ("name", "version") if k in self.server_info},
+            "protocol_version": self.protocol_version,
+            "tools": dict(sorted(empreintes.items())),
+        }
+        atomic_write_text(Path(path), json.dumps(contenu, ensure_ascii=False, indent=1) + "\n")
+        return empreintes
+
+    def _selection(
+        self, include: Iterable[str] | None, exclude: Iterable[str] | None
+    ) -> list[JsonDict]:
         include_set = set(include) if include is not None else None
         exclude_set = set(exclude) if exclude is not None else set()
-        handlers: list[Callable[..., Any]] = []
+        retenues: list[JsonDict] = []
         for tool_def in self.list_tools():
             server_name = tool_def.get("name")
             if not server_name:
@@ -288,8 +376,25 @@ class MCPClient:
                 continue
             if server_name in exclude_set:
                 continue
-            handlers.append(self._make_handler(tool_def, prefix, untrusted))
-        return handlers
+            retenues.append(tool_def)
+        return retenues
+
+    def _verifier_pins(self, definitions: list[JsonDict], pins: dict[str, str]) -> None:
+        changes = [str(d["name"]) for d in definitions
+                   if str(d["name"]) in pins and tool_fingerprint(d) != pins[str(d["name"])]]
+        nouveaux = [str(d["name"]) for d in definitions if str(d["name"]) not in pins]
+        if changes or nouveaux:
+            details = []
+            if changes:
+                details.append(f"definition changed since pinned: {sorted(changes)}")
+            if nouveaux:
+                details.append(f"not pinned: {sorted(nouveaux)}")
+            raise MCPError(f"MCP server {self.server_info.get('name', self.command)!r}: "
+                           f"{'; '.join(details)}. Nothing mounted. Review the definitions "
+                           f"(list_tools()) and re-pin with pin_tools() if you accept them.")
+        disparus = sorted(set(pins) - {str(d["name"]) for d in definitions})
+        if disparus:
+            _log.warning("MCP pinned tools no longer offered by the server (or filtered out): %s", disparus)
 
     def mount(
         self,
@@ -299,8 +404,14 @@ class MCPClient:
         exclude: Iterable[str] | None = None,
         prefix: str = "",
         untrusted: bool = False,
+        pins: Pins | None = None,
     ) -> list[str]:
         """Register every (filtered) server tool on ``agent``.
+
+        ``pins`` (0.26.0): refuse to mount — nothing at all — when a tool
+        definition changed since `pin_tools` or an unpinned tool appeared.
+        See `tools`. What the model reads is frozen at mount time: a
+        description the server changes LATER does not reach it.
 
         Returns the registered tool names. ``agent`` is anything with an
         ``add_tool(handler)`` — an ``Agent`` — or an ``add_function``
@@ -315,7 +426,7 @@ class MCPClient:
         add = getattr(agent, "add_tool", None) or agent.add_function
         names: list[str] = []
         for handler in self.tools(
-            include=include, exclude=exclude, prefix=prefix, untrusted=untrusted
+            include=include, exclude=exclude, prefix=prefix, untrusted=untrusted, pins=pins
         ):
             add(handler)
             names.append(handler.__autoagent_tool_spec__.name)  # type: ignore[attr-defined]

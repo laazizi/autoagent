@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Pin MCP tool definitions** (`MCPClient.pin_tools(path)`, `mount(..., pins=path)`, `tools(pins=)`,
+  `fingerprints()`, `autoagent.mcp.tool_fingerprint`). An MCP server can change a tool's description or schema
+  AFTER you reviewed it ("rug pull"): the model then reads an instruction nobody saw — OWASP Top 10 for Agentic
+  Applications 2026, ASI04, recommends pinning tools by content hash. `pin_tools` writes the sha256 of each
+  selected definition (canonical JSON, `_meta` excluded) to a JSON file meant to be versioned; `mount(pins=)`
+  refuses — with `MCPError`, and registering NOTHING, not even unchanged tools — when a definition changed or an
+  unpinned tool appeared. A pinned tool the server no longer offers is only logged. A missing, unreadable or
+  malformed pins file refuses (fail-closed). Opt-in: without `pins=` nothing changes. Does not cover the server's
+  CODE (pin the server package version too) nor what a tool returns (`untrusted=True`). `tests/test_mcp_pins.py`
+  (17 tests against the stdio fake server, which can now change a description, add a tool or add `_meta`); 5 code
+  mutations, all caught. Not yet run against a real MCP server.
+- Visual builder: the MCP block gains a « pins » field (`mount(..., pins=)`, with the first-time `pin_tools`
+  step as a comment).
+
 ## [0.25.0] - 2026-11-11
 
 ### Added

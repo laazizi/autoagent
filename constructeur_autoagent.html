@@ -642,6 +642,7 @@ const DEFS = {
       {k:"prefix",  l:"préfixe des outils", kind:"text", def:"fs_", w:"half"},
       {k:"include", l:"outils à monter (vide = tous)", kind:"text", def:"read_text_file, list_directory", w:"half", hint:"noms côté serveur, virgules"},
       {k:"cwd", l:"dossier de travail du serveur (vide = courant)", kind:"text", def:""},
+      {k:"pins", l:"fichier d'épingles (vide = pas d'épinglage)", kind:"text", def:"", hint:"refuse TOUT le montage si une définition d'outil a changé depuis que tu l'as relue (rug pull)"},
     ],
   },
   orchestrator: {
@@ -1644,6 +1645,13 @@ function generate(){
       if((m.f.prefix||"").trim()) margs.push(`prefix=${pyStr(m.f.prefix.trim())}`);
       const inc = String(m.f.include||"").split(",").map(s=>s.trim()).filter(Boolean);
       if(inc.length) margs.push(`include={${inc.map(pyStr).join(", ")}}`);
+      const pins = String(m.f.pins||"").trim();
+      if(pins){
+        margs.push(`pins=${pyStr(pins)}`);
+        L.push(`# Épinglage : la PREMIÈRE fois, relis ${mv}.list_tools() puis accepte-les :`);
+        L.push(`#     ${mv}.pin_tools(${pyStr(pins)}${inc.length ? `, include={${inc.map(pyStr).join(", ")}}` : ``})`);
+        L.push(`# Ensuite, une définition changée ou un outil nouveau refuse TOUT le montage (MCPError).`);
+      }
       L.push(`${mv}.mount(${margs.join(", ")})`);
       L.push(``);
     }
