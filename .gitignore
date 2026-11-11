@@ -1,6 +1,9 @@
 # Contexte personnel — ne jamais publier
 .context/
 
+# Copies de travail des agents (workflows Claude Code) : jamais dans un commit
+.claude/worktrees/
+
 # Python
 __pycache__/
 *.pyc
