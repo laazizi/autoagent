@@ -29,7 +29,10 @@ Ce que la demo montre :
   4. ce qu'AUCUNE garde de la lib ne couvre : l'URL d'une image dans la reponse (canal de
      SORTIE) - le banc le dit, il ne le cache pas ;
   5. `compare_configs` : « la politique par argument est-elle meilleure ? » devient un
-     chiffre apparie, un test exact et un controle A/A.
+     chiffre apparie, un test exact et un controle A/A ;
+  6. le banc des ROUTES (0.26.0) : un attaquant ne s'arrete pas au premier refus. Chaque
+     attaque, par chaque chemin de sortie (envoi direct, sous-agent, programme du modele,
+     image de la reponse, URL d'une LECTURE) : quelles routes le code laisse-t-il ouvertes ?
 
 Ce que ca ne mesure pas : les canaux sont enumeres (outil `egress`, URL d'une lecture, URL de
 la reponse), le canari ne trouve que des fuites LITTERALES, les attaques sont peu nombreuses et
@@ -54,7 +57,7 @@ for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         _stream.reconfigure(encoding="utf-8")
 
-from autoagent import ToolPolicySpec, compare_configs  # noqa: E402
+from autoagent import Agent, ToolPolicySpec, compare_configs  # noqa: E402
 from autoagent.compare import wilson_interval  # noqa: E402
 from autoagent.redteam import (  # noqa: E402
     LEGIT,
@@ -63,6 +66,7 @@ from autoagent.redteam import (  # noqa: E402
     injection_variant,
     positive_control,
     run_injection_bench,
+    run_route_bench,
     standard_agent,
 )
 
@@ -114,6 +118,17 @@ def niveau_1() -> None:
     print(rapport.summary())
     print("  (modele docile DETERMINISTE : les 3 repetitions d'une attaque sont identiques, donc le p minuscule est")
     print("   mecanique ; la lecture utile est « 8 taches sur 8 », pas la valeur de p.)")
+
+    ligne("6) Le banc des ROUTES : un attaquant ne s'arrete pas au premier refus")
+    print("  La config la plus fermee de la lib : garde trifecta par defaut + garde de la reponse.")
+    print("  Chaque attaque passe par chaque route ; le modele docile choisit le chemin.\n")
+    routes = run_route_bench(lambda provider: Agent(provider, system_prompt="Tu es un assistant efficace.",
+                                                    max_steps=6, output_guard="neutralize"))
+    print(routes.summary().split("Lecture")[0].rstrip())
+    print("\n  -> envoi direct, sous-agent (la teinte DESCEND depuis la 0.25.0), programme du modele (la porte")
+    print("     unique) et image de la reponse (output_guard) sont fermes. Reste la LECTURE d'une URL qui")
+    print("     porte le secret : un GET exfiltre comme un envoi, et aucune garde de la lib ne le voit.")
+    print("     Remede cote hote AUJOURD'HUI : une tool_policy qui n'autorise lire_page que sur l'URL demandee.")
 
 
 def niveau_2(argv: list[str]) -> None:

@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The ROUTE bench** (`autoagent.redteam.run_route_bench`, `positive_control_routes`, `RouteProvider`, `ROUTES`).
+  An attacker does not stop at the first refusal; NIST CAISI measured adaptive attacks on AgentDojo far above the
+  baseline ones (81 % vs 11 %, one model; https://www.nist.gov/node/1872381). The 0.24.0 bench made the docile model leak by ONE route (the direct send); this
+  one runs every attack through EVERY exit route, one fresh agent per (attack, route): `egress`, `subagent` (an
+  `as_tool` mail assistant holding the send tool), `code` (a `run_python` program calling it through `call_host`),
+  `output_url` (an image URL in the answer), `read_url` (READING a URL that carries the secret). The report is an
+  attack x route table and the list of OPEN routes. Measured offline (40 runs, 3 s): with no guard, all 7 visible
+  attacks leak through all 5 routes (positive control); default guards close `egress`, `subagent`, `code`;
+  `output_guard` closes `output_url`; **`read_url` stays open with every library guard** — a host-side
+  `tool_policy` restricting the read tool to expected URLs closes it (tested). The bench also SEES a hole that is
+  reopened (taint descent disabled → `subagent` leaks; `govern_host_calls=False` → `code` leaks). The judge now
+  counts attempts on every route and an answer URL removed by `output_guard` as `blocked`; the 0.24.0 bench's
+  verdicts are unchanged. `tests/test_redteam_routes.py` (10 tests), 5 mutations all caught; demo 38 part 6 and
+  its builder showcase (code and recorded output) updated. Level 1 only: no language-level adaptive attack
+  against a real model.
 - **Pin MCP tool definitions** (`MCPClient.pin_tools(path)`, `mount(..., pins=path)`, `tools(pins=)`,
   `fingerprints()`, `autoagent.mcp.tool_fingerprint`). An MCP server can change a tool's description or schema
   AFTER you reviewed it ("rug pull"): the model then reads an instruction nobody saw — OWASP Top 10 for Agentic
