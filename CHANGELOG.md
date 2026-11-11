@@ -24,6 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `image_markdown` compromised 1/1 → 0/1 in all three configurations; legitimate task utility unchanged; positive
   control unchanged (7/8 leak without any guard). Does NOT cover: a secret written in plain text in the answer, a
   selection among attacker-prepared URLs present in the page, a read URL (`lire_page(url)`), voice.
+  An adversarial pass (headless Chrome + a local server logging requests) then broke it; closed, each with a test:
+  numeric entities WITHOUT a semicolon (`&#104ttp://`, decoded by HTML5) and with leading zeros; backslash forms the
+  browser reads as `/` (`/\host`, `\/host`, `\\host`, `https:\\host`, tab inside the URL, `<img/src=…>`); a reference
+  definition whose destination is on the NEXT line; a CUBIC regex on unterminated tags (`<a` + 800 spaces: 0.64 s,
+  now linear) and a QUADRATIC scan per reference definition (6 000 definitions: 8 s → 0.3 s). False positives: 6
+  legitimate answers out of 12 lost a trusted URL; trusted URLs are now also compared in a canonical form (HTML
+  entities such as `&amp;`, host and scheme case, http/https, default port, trailing `/`, `mailto:` reduced to the
+  address) — never the path, query, fragment or `user@`; two URLs glued by a comma are judged one by one. Known
+  limit: a `>` inside a quoted attribute value cuts the tag; the rest falls to the bare-URL net. Still opt-in: no
+  false-positive rate has been measured on a real model's answers.
 
 - **`SubprocessSandbox(confine=Confinement())` — a kernel-enforced boundary without Docker** (Linux x86_64;
   applied automatically when the host chooses no sandbox — see *Changed* below). Model-written code (`run_python`, `enable_code_action()`, generated tools) runs behind an AST denylist
