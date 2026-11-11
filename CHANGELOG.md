@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (documentation and demos)
+
+- **A per-argument policy only covers the agent that holds it.** Demo 38 presents "per-argument policy, trifecta
+  guard off" as the configuration that keeps the legitimate task alive. Run through the route bench with both URL
+  guards, it leaves the **`subagent` route open**: a sub-agent holding the send tool WITHOUT that policy sends, and
+  the trifecta guard, turned off, no longer catches it. Found by the bench, not by review. Two remedies, each
+  pinned by a test (`tests/test_delegation_teinte.py`): delegate with `as_tool(..., inherit_policy=True)`, or give
+  the sub-agent the same policy. Demo 38 (part 6) now shows it; dev-doc §42.1; one more route-bench test.
+
 ## [0.26.0] - 2026-11-11
 
 ### Added

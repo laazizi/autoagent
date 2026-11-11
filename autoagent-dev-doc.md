@@ -5144,7 +5144,16 @@ envoi, et un outil de lecture n'est pas `egress`. C'est ce constat qui a fait é
 **aucune route ouverte**. Sans elle, une `tool_policy` qui n'autorise l'outil de lecture que sur les URL attendues la
 ferme aussi (un test le montre). Le banc VOIT aussi un trou
 qu'on rouvre : sans la teinte qui descend, la route `subagent` fuit ; avec `govern_host_calls=False`, la route `code`
-fuit. `tests/test_redteam_routes.py` (11 tests) ; 5 mutations du banc, toutes attrapées. Démo 38, partie 6.
+fuit. `tests/test_redteam_routes.py` (12 tests) ; 5 mutations du banc, toutes attrapées. Démo 38, partie 6.
+
+**Une politique ne couvre que l'agent qui la porte** *(constat du 11 nov. 2026, après la 0.26.0)*. La « politique
+par argument » de la démo 38 (garde trifecta coupée, refus de tout destinataire inconnu) garde l'utilité là où la
+garde trifecta la tue — mais passée au banc des routes avec les deux gardes d'URL, elle laisse **`subagent`
+ouverte** : le sous-agent détient l'outil d'envoi SANS la politique, et la garde trifecta, coupée, ne le rattrape
+plus. Deux remèdes, chacun vérifié par un test (`tests/test_delegation_teinte.py`) : déléguer avec
+`as_tool(..., inherit_policy=True)` (la politique du parent juge les appels du sous-agent), ou poser la même
+politique sur le sous-agent. Garder la garde trifecta (`"deny"`, le défaut) ferme aussi la route, au prix de
+l'utilité. La relecture ne l'avait pas vu ; le banc, si.
 Limites : routes ÉNUMÉRÉES ; niveau 1 seulement (le modèle docile choisit la route — un vrai modèle peut en trouver
 d'autres, ou ne pas trouver celles-ci) ; aucune attaque adaptative en LANGUE contre un vrai modèle (ce serait des jetons).
 

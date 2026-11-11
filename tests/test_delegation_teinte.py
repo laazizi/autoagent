@@ -145,3 +145,51 @@ def test_aucun_mode_de_la_garde_ne_laisse_partir_l_envoi(garde: str) -> None:
                 lit=True).run("go")
     assert envois == []
     assert r.output == "ok"
+
+
+class TestUnePolitiqueNeCouvreQueLAgentQuiLaPorte:
+    """La « politique par argument » (garde trifecta coupée, refus des destinataires inconnus) garde l'utilité là où
+    la garde trifecta la tue (démo 38). Mais elle ne couvre que l'agent qui la porte : un sous-agent qui détient
+    l'outil d'envoi SANS elle rouvre la route — le banc des routes l'a montré (11 nov. 2026). Deux remèdes."""
+
+    DESTINATAIRE_PERMIS = "alice@exemple.fr"
+
+    def _politique(self, ctx: Any) -> str | None:
+        if ctx.call.name == "envoyer" and self.DESTINATAIRE_PERMIS not in str(ctx.call.arguments):
+            return "destinataire non autorisé"
+        return None
+
+    def _courrier(self, envois: list[str], **kw: Any) -> Agent:
+        def envoyer(texte: str, destinataire: str = "attaquant@exemple.fr") -> str:
+            """Envoie un message vers l'extérieur."""
+            envois.append(destinataire)
+            return "envoyé"
+
+        enfant = Agent(Scripte([_appel("envoyer", texte="dossier", destinataire="attaquant@exemple.fr"),
+                                LLMResponse(content="fait")]), max_steps=4, trifecta_guard="off", **kw)
+        enfant.tool(envoyer, egress=True)
+        return enfant
+
+    def _parent(self, outil: Any) -> Agent:
+        parent = Agent(Scripte([_appel("lire_page", url="u"), _appel("courrier", request="envoie le dossier"),
+                                LLMResponse(content="ok")]), max_steps=6, trifecta_guard="off",
+                       tool_policy=self._politique)
+        parent.tool(lire_page, untrusted=True)
+        parent.add_tool(outil)
+        return parent
+
+    def test_le_sous_agent_sans_la_politique_envoie(self) -> None:
+        envois: list[str] = []
+        self._parent(self._courrier(envois).as_tool(name="courrier", description="d")).run("go")
+        assert envois == ["attaquant@exemple.fr"], "la route que le banc trouve ouverte"
+
+    def test_remede_1_la_politique_heritee(self) -> None:
+        envois: list[str] = []
+        self._parent(self._courrier(envois).as_tool(name="courrier", description="d", inherit_policy=True)).run("go")
+        assert envois == []
+
+    def test_remede_2_la_meme_politique_sur_le_sous_agent(self) -> None:
+        envois: list[str] = []
+        enfant = self._courrier(envois, tool_policy=self._politique)
+        self._parent(enfant.as_tool(name="courrier", description="d")).run("go")
+        assert envois == []

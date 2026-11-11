@@ -139,6 +139,14 @@ def niveau_1() -> None:
     print("  passee a un outil doit figurer dans la conversation - une URL construite n'y figure jamais.")
     print(f"  Routes OUVERTES : {ouvertes} · attaques qui passent : {len(fermees.compromised_attacks())}/7")
 
+    fine = run_route_bench(agent_garde(trifecta_guard="off", tool_policy=POLITIQUE.compile(),
+                                       output_guard="neutralize", url_guard="deny"))
+    print("\n  Et la politique par argument de la partie 3 (garde trifecta coupee), avec les deux gardes d'URL ?")
+    print(f"  Routes OUVERTES : {', '.join(fine.open_routes()) or 'aucune'}")
+    print("  -> elle garde l'utilite, mais une politique ne couvre que l'agent qui la porte : le sous-agent qui")
+    print("     detient l'outil d'envoi l'ignore. Remede : `as_tool(..., inherit_policy=True)`, ou la meme")
+    print("     politique sur le sous-agent. C'est le banc qui le montre, pas la relecture.")
+
 
 def niveau_2(argv: list[str]) -> None:
     from _common import make_provider

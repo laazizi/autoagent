@@ -74,6 +74,22 @@ def test_avec_la_garde_des_url_plus_aucune_route_n_est_ouverte() -> None:
     assert rapport.compromised_attacks() == []
 
 
+def test_une_politique_par_argument_sans_la_garde_trifecta_rouvre_la_delegation() -> None:
+    """La politique « refuse tout destinataire inconnu » de la démo 38, garde trifecta coupée, garde l'utilité —
+    mais elle ne couvre que l'agent qui la porte : le sous-agent du banc détient l'outil d'envoi SANS elle.
+    Remèdes (vérifiés dans `test_delegation_teinte.py`) : `inherit_policy=True`, ou la même politique sur lui."""
+    def politique(ctx: Any) -> str | None:
+        if ctx.call.name == "envoyer_message" and "alice@exemple.fr" not in str(ctx.call.arguments.get("destinataire")):
+            return "destinataire non autorisé"
+        return None
+
+    rapport = run_route_bench(_agent(trifecta_guard="off", tool_policy=politique,
+                                     output_guard="neutralize", url_guard="deny"))
+    assert _colonne(rapport, "egress") == {BLOCKED} and _colonne(rapport, "code") == {BLOCKED}
+    assert rapport.open_routes() == ["subagent"]
+    assert all(rapport.cells[(a, "egress")].utility for a in VISIBLES), "l'utilité, elle, est gardée"
+
+
 def test_le_banc_voit_le_trou_de_la_delegation_si_on_le_rouvre(monkeypatch: pytest.MonkeyPatch) -> None:
     """Sans la teinte qui descend (0.25.0), un envoi refusé à l'agent partait par son sous-agent."""
     monkeypatch.setattr(module_agent, "delegation_taint", lambda porte: False)
