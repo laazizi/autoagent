@@ -67,10 +67,11 @@ def _provenance_du_run() -> dict[str, Any]:
     if porte is None:
         return {"tainted": False, "context": "no_run"}
     try:
-        if porte.tainted:
-            return {"tainted": True, "context": "run"}
+        # La délégation d'abord : le run du sous-agent naît teinté, mais la cause est le parent.
         if porte.lineage_tainted:
             return {"tainted": True, "context": "delegated_from_tainted_run"}
+        if porte.tainted:
+            return {"tainted": True, "context": "run"}
         return {"tainted": False, "context": "run"}
     except Exception:
         _log.exception("could not read the run taint; assuming tainted (fail-closed)")

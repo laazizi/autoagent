@@ -364,7 +364,8 @@ class GeminiLiveProvider(LLMProvider):
                 raise ProviderError("gemini_live : session fermée par l'hôte (close())", retryable=True)
             tranche = 0.5 if fin is None else max(0.0, min(0.5, fin - time.monotonic()))
             try:
-                return file.get(timeout=tranche)
+                evenement: tuple[str, Any] | None = file.get(timeout=tranche)
+                return evenement
             except queue.Empty:
                 if fin is not None and time.monotonic() >= fin:
                     return None

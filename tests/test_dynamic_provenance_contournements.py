@@ -109,26 +109,6 @@ class TestLaDelegationNeBlanchitPas:
         parent.run("go")
         assert b.quarantined() == ["petitool"]
 
-    def test_la_teinte_heritee_ne_change_pas_la_garde_trifecta(self, tmp_path: Path) -> None:
-        """Choix délibéré : l'héritage ne touche que la provenance. Sans `inherit_policy`, le
-        sous-agent agit toujours sous sa propre politique (comportement documenté)."""
-        envois: list[str] = []
-
-        def envoyer(texte: str) -> str:
-            """Envoie un message."""
-            envois.append(texte)
-            return "envoyé"
-
-        enfant = Agent(Scripte([_appel("envoyer", texte="x"), LLMResponse(content="fait")]), max_steps=4)
-        enfant.tool(envoyer, egress=True)
-        parent = Agent(Scripte([_appel("lire_page", url="u"), _appel("deleguer", request="envoie"),
-                                LLMResponse(content="ok")]), max_steps=6)
-        parent.tool(lire_page, untrusted=True)
-        parent.add_tool(enfant.as_tool(name="deleguer", description="d"))
-        parent.run("go")
-        assert envois == ["x"]
-
-
 class TestLaQuarantaineSAppliqueALAppel:
     """Un outil en quarantaine ne sert plus qu'au run qui l'a construit."""
 

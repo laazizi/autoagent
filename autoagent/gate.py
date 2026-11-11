@@ -135,9 +135,9 @@ class ActionGate:
     def lineage_tainted(self) -> bool:
         """Ce run est-il celui d'un sous-agent appelé par un run TEINTÉ (`as_tool`,
         `delegate_to`, transitif) ? Sa demande a été écrite par un modèle qui avait lu du
-        contenu non fiable. Lu par la provenance des outils générés (`dynamic.py`) ; ne
-        change PAS la garde trifecta du sous-agent, qui reste sa propre politique tant que
-        l'hôte ne demande pas `inherit_policy=True`."""
+        contenu non fiable. Le run du sous-agent naît alors teinté (0.25.0 : garde trifecta,
+        `tool_policy`) ; ce drapeau dit en plus POURQUOI, pour la provenance des outils générés
+        (`dynamic.py`, contexte `delegated_from_tainted_run`)."""
         return bool(getattr(self.agent, "_teinte_heritee", False))
 
     def decide(

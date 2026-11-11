@@ -7,10 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-11-11
+
 ### Added
 
 - **Provenance of generated tools; quarantine of tools built in a tainted run** (`DynamicToolBuilder(persist=True)`). Each catalogue entry now records `provenance`: whether the run had ingested untrusted content when the model had the tool written (read from the active gate, `gate.active_gate()`; unreadable = tainted, fail-closed), the library tools visible at the time, and a sequence number. A tool built in a tainted run is QUARANTINED: kept and inspectable, never reloaded by `load_library()` until a human calls `release(name, reviewed_sha256)` (refused if the digest or the file differs from the validated one). New: `quarantine()`, `quarantined()`, `descendants(name)` (tools built after `name` in a run where it was visible, transitive) and `cascade=True` on `retire()` / `quarantine()`. Why: agents that write tools by imitating a library copy the trapped ones, and deleting the original leaves the copies (EVOMAL, arXiv 2608.25776). Catalogues written before this change have no provenance and load as before.
-  Three bypasses found by an adversarial pass and closed, each with a test: (1) **delegation laundered the taint** — a tainted parent that asked a clean sub-agent (`as_tool`, `delegate_to`, nested) to build the tool got it recorded `tainted: False` and reloaded; the delegating run's taint now reaches the sub-agent's run for provenance (`ActionGate.lineage_tainted`, recorded as `context: "delegated_from_tainted_run"`), with or without `inherit_policy`. It deliberately does NOT change the sub-agent's trifecta guard: without `inherit_policy=True` it still acts under its own policy, as documented. (2) **A quarantined tool stayed callable** in the next runs of the agent that built it: it is now refused at CALL time everywhere except in the run that built it (`GeneratedPythonTool.admission`, fail-closed; a quarantine set by the host applies to already-loaded tools too, and survives a lost catalogue). (3) **`approval.load_tools` ignored the catalogue**: in a directory kept by the builder, an unapproved tool is registered only if the catalogue knows it, has not quarantined or retired it, and its digest is unchanged — otherwise it is reported `"quarantined"` / `"retired"`; an unreadable catalogue skips every unapproved tool and is left untouched. A tool whose exact digest is in the manifest (human approval) still loads natively; a directory without a catalogue behaves as before.
+  Three bypasses found by an adversarial pass and closed, each with a test: (1) **delegation laundered the taint** — a tainted parent that asked a clean sub-agent (`as_tool`, `delegate_to`, nested) to build the tool got it recorded `tainted: False` and reloaded; the delegating run's taint now reaches the sub-agent's run for provenance (`ActionGate.lineage_tainted`, recorded as `context: "delegated_from_tainted_run"`), with or without `inherit_policy` — and, by the same rule, the sub-agent's run now starts tainted (see *Changed*). (2) **A quarantined tool stayed callable** in the next runs of the agent that built it: it is now refused at CALL time everywhere except in the run that built it (`GeneratedPythonTool.admission`, fail-closed; a quarantine set by the host applies to already-loaded tools too, and survives a lost catalogue). (3) **`approval.load_tools` ignored the catalogue**: in a directory kept by the builder, an unapproved tool is registered only if the catalogue knows it, has not quarantined or retired it, and its digest is unchanged — otherwise it is reported `"quarantined"` / `"retired"`; an unreadable catalogue skips every unapproved tool and is left untouched. A tool whose exact digest is in the manifest (human approval) still loads natively; a directory without a catalogue behaves as before.
 
 - **`Agent(output_guard="neutralize")` — a guard on the RESPONSE channel** (`autoagent/output_guard.py`, default `"off"`). The
   injection bench (§42, demo 38) measured that no guard read the final answer: the `image_markdown` attack (the model
@@ -165,6 +167,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Taint now DESCENDS into sub-agents (`as_tool`, `delegate_to`): delegating no longer gets around the trifecta
+  guard.** Before, an agent that had read untrusted content was refused an `egress` call, but the same call asked
+  of a sub-agent went out: the sub-agent started "clean", it saw the request, not the page — only
+  `inherit_policy=True`, to remember at every delegation, closed that path. Now the sub-agent's run STARTS TAINTED
+  when the calling run is tainted, with or without `inherit_policy`, transitively, and for `delegate_to` in
+  parallel: its `egress` tools are refused (`"approve"` pauses the sub-agent, which a delegation cannot wait for:
+  the call does not go out, the parent gets a tool error and goes on), its `tool_policy` sees `ctx.tainted=True`,
+  tools it has built go to quarantine. The inheritance lasts the delegation only. **What it can break:** a
+  sub-agent with an `egress=True` tool called after untrusted content was read — say so on THAT agent with
+  `trifecta_guard="off"`. Nothing else: the guard targets `egress` tools only. Checked by reading on one consumer
+  (no `egress` tool, its taint-conditioned policy covers no tool its sub-agents hold). `tests/test_delegation_teinte.py`
+  (10 tests, 7 go red without the change).
+
 - **On Linux x86_64 (Landlock ABI 3), model-written code now runs kernel-confined BY DEFAULT when the host
   passes no sandbox.** One rule: *the kernel enforces what the permissions already say* — a tool without a
   `filesystem.*` permission has no file, a tool without `network` has no network. Concerned: `PythonRunner()`
@@ -193,12 +208,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Demo 38 (`38_banc_d_injection.py`) no longer parsed** — a sentence about `output_guard` put double quotes
+  inside a double-quoted string (`SyntaxError` on every Python). No test compiles the demos; ruff found it before
+  the release. Every `.py` of the repo now parses with the 3.10 grammar, and demo 38 runs offline again.
+- Type annotations from the unreleased work (`ws._echec` is `NoReturn`, `gemini_live`, the output guard's
+  failure path) and two import orders: mypy and ruff are back to their 0.24.0 baseline (10 and 46 findings).
+
 - **The host-function bridge raised a raw `BrokenPipeError`** when the sandboxed child died before reading its
   input (a limits or confinement preamble that refuses to start) — or not, depending on which process was faster.
   Found by the confinement bench on Ubuntu's system Python. It is now a `ToolError` that quotes the child's stderr.
 - `PythonRunner` and `DynamicToolBuilder` warned "not an isolation boundary" for every sandbox that was not a
   `DockerSandbox` instance; they now ask `isolation()` (`os_boundary`), so a confined subprocess no longer triggers
   the warning and a plain one still does.
+
+### Changed — the visual builder
+
+- `constructeur_autoagent.html` targets 0.25.0: agent options `output_guard` (off / neutralize) and code as
+  action (`enable_code_action()`, plain or `compact=True`); the sub-agent and delegation help says the taint
+  now descends; a new preset « Garde de la réponse + code comme action » (33 presets, all generated and
+  compiled by the tests). Kernel confinement and the provenance quarantine need no block: they apply by
+  default or through `DynamicToolBuilder(persist=True)`, already in the palette.
 
 ### Fixed (documentation and demos)
 
@@ -2715,7 +2744,10 @@ underscored or imported from a submodule path is internal and may change.
 - CI invariants: `ruff check`, `ruff format --check`, `mypy autoagent/`,
   and `pytest` are all green.
 
-[Unreleased]: https://github.com/laazizi/autoagent/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/laazizi/autoagent/compare/v0.25.0...HEAD
+[0.25.0]: https://github.com/laazizi/autoagent/compare/v0.24.0...v0.25.0
+[0.24.0]: https://github.com/laazizi/autoagent/compare/v0.23.1...v0.24.0
+[0.23.1]: https://github.com/laazizi/autoagent/compare/v0.23.0...v0.23.1
 [0.23.0]: https://github.com/laazizi/autoagent/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/laazizi/autoagent/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/laazizi/autoagent/releases/tag/v0.21.0

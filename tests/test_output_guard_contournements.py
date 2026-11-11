@@ -17,7 +17,7 @@ import time
 
 import pytest
 
-from autoagent.output_guard import OutputGuard, guard_output
+from autoagent.output_guard import guard_output
 from autoagent.schema import UNTRUSTED_OPEN, Message
 
 SECRET = "CANARY-0123456789ab"

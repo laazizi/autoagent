@@ -171,6 +171,9 @@ ATTENDUS = {
     # Bug vu à l'écran : un outil PARTAGÉ perdait ses drapeaux. Ils doivent suivre
     # l'outil sur l'agent ET sur chaque sous-agent.
     "08": ("superviseur.tool(etat_parc, idempotent=True)", "chercheur.tool(etat_parc, idempotent=True)", "redacteur.tool(etat_parc, idempotent=True)"),
+    # 0.25.0 : la garde de la réponse (kwarg d'Agent) et le code comme action, version compacte.
+    "garde_reponse": ('output_guard="neutralize"', "agent.enable_code_action(compact=True)",
+                      "@agent.tool(untrusted=True)"),
 }
 
 

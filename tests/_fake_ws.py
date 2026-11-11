@@ -163,7 +163,7 @@ class FakeWSServer:
             self.script(conn)
         except ConnectionError:
             pass                                            # le client est parti : normal en fin de test
-        except BaseException as exc:                        # noqa: BLE001 — une assertion de scénario doit remonter
+        except BaseException as exc:
             self.errors.append(exc)
         finally:
             try:

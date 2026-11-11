@@ -35,6 +35,7 @@ import struct
 import threading
 import time
 from collections.abc import Mapping
+from typing import NoReturn
 from urllib.parse import urlsplit
 
 __all__ = ["WebSocketClient", "WebSocketClosed", "WebSocketError"]
@@ -362,7 +363,7 @@ class WebSocketClient:
         except WebSocketClosed:
             pass
 
-    def _echec(self, code: int, message: str) -> None:
+    def _echec(self, code: int, message: str) -> NoReturn:
         """Faute de protocole : fermeture avec `code` (au mieux), socket coupée, erreur typée."""
         if not self._close_sent:
             self._close_sent = True

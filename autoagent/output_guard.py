@@ -43,7 +43,7 @@ import hashlib
 import html
 import re
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from .schema import TAINT_SENTINEL, UNTRUSTED_OPEN, Message

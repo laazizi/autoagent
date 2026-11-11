@@ -23,7 +23,6 @@ from .errors import (
     ToolError,
 )
 from .gate import ActionGate, active_gate, delegation_taint, gate_scope
-from .output_guard import OutputGuard, guard_output, resolve_output_guard
 from .guards import (  # noqa: F401 — re-exportés pour les tests
     TurnGuards,
     _call_signature,
@@ -32,6 +31,7 @@ from .guards import (  # noqa: F401 — re-exportés pour les tests
 from .journal import Journal, RunView, key_scope
 from .logging import get_logger
 from .memory import Memory
+from .output_guard import OutputGuard, guard_output, resolve_output_guard
 from .providers import create_provider
 from .providers.base import LLMProvider
 from .registry import ToolRegistry, ToolResult
@@ -722,8 +722,9 @@ class Agent:
         # politique (`as_tool(inherit_policy=True)`). `None` = comportement historique.
         self._parent_gate: ActionGate | None = None
         # Vrai le temps d'un run de sous-agent appelé par un run TEINTÉ (as_tool, delegate_to),
-        # quelle que soit `inherit_policy`. Lu par la provenance des outils générés : sans lui,
-        # déléguer la création d'un outil à un sous-agent propre blanchissait la teinte.
+        # quelle que soit `inherit_policy`. Le run du sous-agent naît alors teinté (garde trifecta,
+        # `ToolPolicyContext.tainted`, provenance des outils générés) : sans lui, déléguer
+        # blanchissait la teinte.
         self._teinte_heritee = False
         self.dynamic_builder: DynamicToolBuilder | None = None
         self._dynamic_tools_built_this_run = 0
@@ -1338,6 +1339,14 @@ class Agent:
             An approval request from the parent's policy DENIES the call: a
             delegate cannot be paused mid-run. Transitive across nested
             delegations.
+          * TAINT DESCENDS, always (0.25.0): when the calling run has ingested
+            untrusted content, the sub-agent's run starts tainted — its own
+            trifecta guard refuses its ``egress`` tools and its
+            ``tool_policy`` sees ``ctx.tainted``. The request was written by a
+            model that read the untrusted content; without this, delegating
+            turned a refused send into an accepted one. A host that wants a
+            delegate to send anyway says so on THAT agent:
+            ``trifecta_guard="off"`` on the sub-agent, deliberately.
 
         Thread-safety: an ``Agent`` instance serves ONE caller at a time.
         If the parent uses ``parallel_tool_calls=True``, give each
@@ -1784,7 +1793,11 @@ class Agent:
         # RunState à la reprise, sinon du transcript initial (marqueur/sentinelle
         # d'un historique persisté). Passe à True dès qu'une sortie untrusted
         # entre — et le reste. Robuste à la compaction (≠ scan seul).
-        taint = [resume_from.tainted if resume_from else is_tainted(working_messages)]
+        # Un sous-agent appelé par un run TEINTÉ (`as_tool`, `delegate_to`) naît teinté (0.25.0) :
+        # sa demande a été écrite par un modèle qui avait lu du contenu non fiable. Sans cela,
+        # déléguer contournait la garde trifecta : l'envoi refusé au parent partait du sous-agent.
+        taint = [bool(resume_from.tainted if resume_from else is_tainted(working_messages))
+                 or self._teinte_heritee]
 
         # Dépense des SOUS-AGENTS (`Agent.as_tool`). Cellule mutable, comme la
         # teinte : la collecte se fait dans `_run_turn_tools`, une fonction
@@ -2269,6 +2282,7 @@ class Agent:
                         spent_cached += response.usage.cached_tokens
                         saw_cached = True
                 if self.output_guard is not None and (taint[0] or is_tainted(working_messages)):
+                    trouvees: list[Any]                 # `[None]` = la garde a planté (voir plus bas)
                     try:
                         propre, trouvees = guard_output(response.content or "", working_messages, self.output_guard)
                     except Exception:     # la garde de réponse ne casse pas un run : sur doute, la réponse est vidée
@@ -2766,6 +2780,10 @@ def delegate_to(
     ``inherit_policy=True`` (opt-in, D1) : chaque appel d'outil d'un spécialiste passe
     AUSSI par la politique, la garde trifecta et la teinte du PARENT (voir
     `Agent.as_tool`). Défaut inchangé : un spécialiste agit sous sa propre politique.
+
+    La TEINTE, elle, descend toujours (0.25.0) : appelé par un run qui a lu du contenu non
+    fiable, le spécialiste naît teinté — sa garde trifecta refuse ses outils ``egress``, sa
+    ``tool_policy`` voit ``ctx.tainted``. Voir `Agent.as_tool`.
     """
     if not specialistes:
         raise ValueError("delegate_to attend au moins un spécialiste")

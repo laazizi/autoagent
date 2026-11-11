@@ -13,7 +13,7 @@ calls are stateless and can be issued concurrently.
 
 from __future__ import annotations
 
-__version__ = "0.24.0"
+__version__ = "0.25.0"
 
 from .agent import (
     Agent,
@@ -27,7 +27,6 @@ from .agent import (
     delegate_to,
 )
 from .bounds import Bounds
-from .output_guard import OutputGuard
 from .cascade import CascadeResult, TierAttempt, cascade
 from .compare import ComparisonReport, EvalTask, Variant, compare_configs
 from .dynamic import DynamicToolBuilder, PythonRunner, ToolBuildRequest
@@ -60,6 +59,7 @@ from .orchestrator import (
     TurnEvent,
 )
 from .otel import OTelTraceExporter
+from .output_guard import OutputGuard
 from .pipeline import PipelineManager
 from .policy import ToolPolicySpec
 from .providers import (
