@@ -25,7 +25,10 @@ from .sandbox import (
     DockerSandbox,
     GeneratedPythonTool,
     SubprocessSandbox,
+    _a_une_frontiere,
+    _bac_avec_frontiere,
     _bac_par_defaut,
+    _exiger_la_frontiere,
     discard_generated_tool,
     load_generated_tool,
     validate_generated_tool_code,
@@ -150,16 +153,6 @@ class ToolBuildRequest:
     permissions: list[str] = field(default_factory=list)
 
 
-def _a_une_frontiere(sandbox: Any) -> bool:
-    """Le bac à sable est-il une frontière que l'OS fait respecter ? C'est `isolation()` qui le dit :
-    un conteneur Docker, ou un sous-processus confiné par le noyau (`SubprocessSandbox(confine=...)`).
-    Un bac qui ne sait pas le dire compte pour « non » : l'avertissement part."""
-    try:
-        return bool(sandbox.isolation().get("os_boundary"))
-    except Exception:
-        return False
-
-
 class PythonRunner:
     """Exécute UN extrait de code Python écrit par le modèle — validé, sandboxé, jamais gardé (0.22.0).
 
@@ -196,6 +189,8 @@ class PythonRunner:
         fonction compte comme `egress` ou `untrusted`, décore-la avec `autoagent.tool(...)`.
         Hors d'un run d'agent (le runner appelé à la main), rien n'est consulté."""
         self.permissions = sorted(set(permissions or []))
+        # Un bac choisi par l'HÔTE n'est jamais remplacé en silence (`Agent(require_boundary=True)` le refuse).
+        self._bac_impose = sandbox is not None
         # Sans bac choisi par l'hôte : confiné par le noyau là où c'est possible, tant que le lanceur n'a pas
         # de permission de fichiers (`sandbox._bac_par_defaut` dit la règle). Sinon le sous-processus d'avant.
         sandbox = sandbox or _bac_par_defaut(self.permissions, timeout=timeout)
@@ -231,6 +226,7 @@ class PythonRunner:
         if args is not None and not isinstance(args, dict):
             raise ToolValidationError(f"args must be an object, got {type(args).__name__}")
         validate_generated_tool_code(code, permissions=self.permissions)
+        _exiger_la_frontiere(self.sandbox)
         with tempfile.TemporaryDirectory(prefix="autoagent_run_python_", ignore_cleanup_errors=True) as dossier:
             fichier = Path(dossier) / "run_python.py"
             fichier.write_text(code, encoding="utf-8")
@@ -330,8 +326,10 @@ class DynamicToolBuilder:
         # Sans bac choisi par l'hôte, le choix se fait OUTIL PAR OUTIL (`_bac_pour`) : confiné par le noyau
         # là où c'est possible, sauf pour un outil qui porte une permission de fichiers.
         self._bac_impose = sandbox is not None
-        self.sandbox = sandbox or _bac_par_defaut(timeout=timeout)
+        self.sandbox: SubprocessSandbox | DockerSandbox = sandbox or _bac_par_defaut(timeout=timeout)
         self._bac_sans_frontiere: SubprocessSandbox | None = None
+        # Posé par `Agent(require_boundary=True)` (0.28.0) : plus jamais le sous-processus simple.
+        self._frontiere_requise = False
         self.allowed_permissions = None if allowed_permissions is None else set(allowed_permissions)
         self.max_repairs = max(0, int(max_repairs))
         self.self_test_rel_tol = max(0.0, float(self_test_rel_tol))
@@ -367,15 +365,33 @@ class DynamicToolBuilder:
                 "capabilities pass sandbox=DockerSandbox(...) or make_sandbox().",
             )
 
+    def _imposer_la_frontiere(self) -> None:
+        """Appelé par `Agent.enable_dynamic_tools` quand l'agent exige une frontière (0.28.0). Un bac par défaut
+        sans frontière devient le meilleur bac à frontière de la machine ; un bac choisi par l'hôte sans frontière
+        est refusé (``ToolError``) — jamais remplacé en silence. Rien ne change si le remplacement échoue."""
+        if not _a_une_frontiere(self.sandbox):
+            if self._bac_impose:
+                raise ToolError(
+                    "require_boundary=True: the sandbox given to DynamicToolBuilder is not an OS-enforced "
+                    "isolation boundary. Pass a DockerSandbox or a confined SubprocessSandbox, or none to let "
+                    "the agent pick the best boundary available."
+                )
+            self.sandbox = _bac_avec_frontiere(timeout=self.sandbox.timeout)
+        self._frontiere_requise = True
+
     def _bac_pour(self, permissions: Iterable[str] | None) -> SubprocessSandbox | DockerSandbox:
         """Le bac d'UN outil. Celui de l'hôte s'il en a choisi un. Sinon le bac par défaut (confiné là où le
         noyau le permet) — sauf pour un outil qui porte une permission ``filesystem.*`` : des fichiers ont
         été accordés sans dire lesquels, il tourne donc comme avant, dans le sous-processus simple, et on le
-        dit une fois."""
+        dit une fois. Sous `require_boundary=True` (0.28.0), cet outil-là va dans Docker, ou il est refusé."""
         if self._bac_impose or not _a_une_frontiere(self.sandbox):
             return self.sandbox
         if not any(str(p).startswith("filesystem.") for p in (permissions or ())):
             return self.sandbox
+        if self._frontiere_requise:
+            if isinstance(self.sandbox, DockerSandbox):
+                return self.sandbox
+            return _bac_avec_frontiere(permissions, timeout=self.sandbox.timeout)
         with self._verrou:
             if self._bac_sans_frontiere is None:
                 self._bac_sans_frontiere = SubprocessSandbox(timeout=self.sandbox.timeout)
@@ -763,7 +779,7 @@ class DynamicToolBuilder:
                 outil = load_generated_tool(chemin, sandbox=self.sandbox)       # revalide l'AST
                 self._check_permissions(list(outil.spec.permissions or []))
                 outil.sandbox = self._bac_pour(outil.spec.permissions)
-            except (ToolValidationError, OSError, SyntaxError, ValueError) as exc:
+            except (ToolError, OSError, SyntaxError, ValueError) as exc:     # ToolError : pas de frontière (0.28.0)
                 _log.warning("library tool %r not loaded: %s", nom, exc)
                 continue
             if outil.spec.name != nom:

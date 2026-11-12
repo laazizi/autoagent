@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`Agent(require_boundary=True)` — model-written code runs only behind a real boundary.** Requiring a boundary
+  used to be said sandbox by sandbox (`make_sandbox(require_boundary=True)`), in three places. Without a sandbox
+  chosen, the library took kernel confinement where it exists, else the PLAIN subprocess (a denylist, not a
+  boundary) — even when a Docker daemon was answering (seen on 12 Nov 2026 on a Windows machine). Now one setting
+  on the agent, default `False` (nothing changes for an existing agent):
+  - at configuration (`enable_code_action`, `enable_run_python`, `enable_dynamic_tools`), a DEFAULT sandbox without
+    a boundary becomes the best boundary of the machine — kernel confinement, else `DockerSandbox` if a Linux-
+    containers daemon answers, else `ToolError` with the cause; a sandbox CHOSEN by the host without a boundary is
+    refused, never silently replaced;
+  - at execution too (fail-closed): a sandbox swapped afterwards, a generated tool loaded by hand, a sandbox that
+    cannot say what it guarantees — nothing runs without a boundary;
+  - a generated tool holding `filesystem.*` with no directory named keeps the builder's container, goes to Docker,
+    or is refused — never the plain subprocess;
+  - the requirement DESCENDS into sub-agents (`as_tool`, `delegate_to`) for the delegation, like taint;
+  - software evolution (`enable_software_evolution`) is refused on such an agent (it runs the host's validation
+    command on edited code outside any sandbox).
+  Cost of one code call, measured (same trivial program, 20 calls per sandbox, alternating, 12 Nov 2026): Windows,
+  plain subprocess 200 ms vs Docker 448 ms (medians); Linux (WSL2), plain 20.6 ms vs kernel-confined 20.4 ms.
+- **`autoagent.webfetch.http_fetch_tool(allowed_hosts)` — read the web ON THE HOST, from a list of sites, without
+  opening the sandbox network.** GET only, https (http on option), default port only; an allowed host or a
+  subdomain; refused before any connection: credentials, backslashes, blanks in the URL, an IP written in the URL,
+  and any RESOLVED address that is not public (private, loopback, link-local, cloud metadata, carrier NAT,
+  multicast, reserved — including a private IPv4 inside an IPv6: `::ffff:`, NAT64, 6to4, Teredo). The connection
+  goes to the verified address (no second resolution); the next verified address is tried if one is unreachable;
+  certificate checked on the name; every redirect re-checked; bounded in bytes and total time; text content only.
+  Flags: `untrusted=True`, idempotent, NOT `egress` (the trifecta guard would otherwise refuse every second read of
+  a run); the URL leak is held by the host list and, for the exact URL, by `url_guard="deny"` (tested). The model's
+  code calls it through `call_host`, so through the single gate. Checked on the real network: PyPI's JSON API over
+  HTTPS, a redirect followed, a 404 returned as a response, `localhost` refused.
+  Measured on a real model (`deepseek-chat`, 12 Nov 2026, Windows, 5 runs per arm alternating, 294,111 tokens; a
+  first run, stopped by an error in the measuring script, is not counted): "what is the latest autoagent-core
+  version on PyPI, and its date?", with `http_fetch` (pypi.org only) and code-as-action, judged in code against
+  PyPI's API. Success 10/10 — 5/5 with `require_boundary=True` (Docker), 5/5 without (plain subprocess); median
+  3.1 s vs 2.8 s. But the model wrote a program only ONCE in ten: the other nine read the 87,643-character JSON
+  whole (~32,500 tokens per run). The one time it did — inside Docker, the read going through `call_host` to the
+  host — the run cost 1,782 tokens (about 95 % less). The full path works; the model does not pick it by itself
+  on this task. Five runs are not a rate.
+  Tests: `tests/test_frontiere_obligatoire.py` (23, one real: Docker on Windows, kernel confinement on Linux),
+  `tests/test_webfetch.py` (132, one end-to-end on a real local HTTP server). 43 code mutations, 41 caught; the 2
+  survivors do not change behaviour (each read size already falls to zero at the limit; Teredo is already
+  non-public for Python, the rule stays in case that changes). Demo 41; builder options `require_boundary` and
+  « http_fetch : sites permis », preset `lecture_web` (35 presets). Dev-doc §49.
+
+### Fixed (documentation)
+
+- Three comments of `sandbox.py` still said kernel confinement was « main, unreleased » (one also « opt-in »); it
+  shipped in 0.25.0 and is set by default on Linux x86_64 when the host chooses no sandbox.
+
 ## [0.27.0] - 2026-11-12
 
 ### Added

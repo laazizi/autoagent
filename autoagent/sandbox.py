@@ -283,7 +283,8 @@ def _echec_du_runner(completed: "subprocess.CompletedProcess[str]", limits: Sand
 
 
 # ---------------------------------------------------------------------------
-# Confinement par le noyau (main, non publié) — OPT-IN, Linux x86_64.
+# Confinement par le noyau (0.25.0) — Linux x86_64 ; posé d'office quand l'hôte ne choisit pas de bac
+# (`_bac_par_defaut`), exigé avec `Agent(require_boundary=True)` (`_bac_avec_frontiere`).
 # La liste d'interdits AST se contourne, et un outil qui la contourne avait les
 # droits du processus hôte : ses fichiers, le réseau, ses clés (lisibles par
 # `/proc/<pid>/environ` alors que l'environnement de l'enfant est épuré), ses
@@ -1239,6 +1240,7 @@ class GeneratedPythonTool:
                 refus = f"admission check failed ({type(exc).__name__}: {exc}); call refused (fail-closed)"
             if refus is not None:
                 raise ToolError(refus)
+        _exiger_la_frontiere(self.sandbox)
         allow_network = "network" in (self.spec.permissions or [])
         try:
             result = self.sandbox.run_python_tool(
@@ -1508,7 +1510,7 @@ def discard_generated_tool(tool: GeneratedPythonTool | Path) -> None:
 
 
 def _bac_par_defaut(permissions: Any = (), *, timeout: float = 10.0) -> "SubprocessSandbox":
-    """Le bac d'un outil quand l'HÔTE n'en a pas choisi (main, non publié).
+    """Le bac d'un outil quand l'HÔTE n'en a pas choisi (0.25.0).
 
     Règle : le noyau fait respecter ce que les permissions disent déjà. Un outil sans permission
     ``filesystem.*`` n'a pas de fichiers ; sans permission ``network``, pas de réseau — là où le
@@ -1530,13 +1532,71 @@ def _bac_par_defaut(permissions: Any = (), *, timeout: float = 10.0) -> "Subproc
     return SubprocessSandbox(timeout=timeout)
 
 
+def _a_une_frontiere(sandbox: Any) -> bool:
+    """Le bac à sable est-il une frontière que l'OS fait respecter ? C'est `isolation()` qui le dit :
+    un conteneur Docker, ou un sous-processus confiné par le noyau (`SubprocessSandbox(confine=...)`).
+    Un bac qui ne sait pas le dire compte pour « non »."""
+    try:
+        return bool(sandbox.isolation().get("os_boundary"))
+    except Exception:
+        return False
+
+
+def _frontiere_exigee() -> bool:
+    """Le run en cours exige-t-il une frontière (`Agent(require_boundary=True)`, 0.28.0) ? Lu sur l'agent de la
+    porte active : le sien, ou celui d'un parent qui l'exige et lui a délégué la tâche (`_frontiere_heritee`).
+    Hors de tout run (l'hôte qui appelle un outil à la main) : non, comme la porte."""
+    porte = active_gate()
+    agent = getattr(porte, "agent", None) if porte is not None else None
+    return bool(getattr(agent, "require_boundary", False) or getattr(agent, "_frontiere_heritee", False))
+
+
+def _exiger_la_frontiere(sandbox: Any) -> None:
+    """Fail-closed, À L'EXÉCUTION : dans un run qui exige une frontière, du code écrit par le modèle ne part
+    jamais dans un bac qui n'en est pas une — même si le bac a été remplacé après la configuration, si l'outil
+    a été chargé à la main, ou si le run est celui d'un sous-agent délégué par un agent qui l'exige."""
+    if _frontiere_exigee() and not _a_une_frontiere(sandbox):
+        try:
+            nature = str(sandbox.isolation().get("kind", type(sandbox).__name__))
+        except Exception:
+            nature = type(sandbox).__name__
+        raise ToolError(
+            f"require_boundary=True: this sandbox ({nature}) is not an OS-enforced isolation boundary, so the "
+            "model-written code was not run. Use kernel confinement (Linux x86_64) or DockerSandbox; a sub-agent "
+            "called by an agent that requires a boundary needs require_boundary=True too."
+        )
+
+
+def _bac_avec_frontiere(permissions: Any = (), *, timeout: float = 10.0) -> "SubprocessSandbox | DockerSandbox":
+    """Le meilleur bac à VRAIE frontière de cette machine (0.28.0), pour `Agent(require_boundary=True)` : le
+    confinement par le noyau (rapide, sans démon) ; sinon Docker, si un démon à conteneurs Linux répond ; sinon
+    ``ToolError`` — jamais le sous-processus simple. Un outil qui porte une permission ``filesystem.*`` sans
+    dossiers nommés ne peut pas être confiné (une liste blanche ne s'invente pas) : Docker, ou refus."""
+    fichiers = any(str(p).startswith("filesystem.") for p in (permissions or ()))
+    cause = _confinement_impossible()
+    if not fichiers and cause is None:
+        try:
+            return SubprocessSandbox(timeout=timeout, confine=Confinement(network=True))
+        except (ToolError, ValueError, OSError) as exc:
+            cause = f"kernel confinement could not be set up: {exc}"
+    if docker_available():
+        return DockerSandbox(timeout=timeout)
+    raison = ("the tool holds a filesystem.* permission and no directory was named, so kernel confinement "
+              "cannot apply" if fichiers else (cause or "no kernel confinement"))
+    raise ToolError(
+        f"require_boundary=True: no isolation boundary is available here ({raison}), and no Docker daemon "
+        "(Linux containers) is reachable, so model-written code will not run. Run on Linux x86_64 (kernel "
+        "confinement), or start Docker; or drop require_boundary=True to accept the plain subprocess."
+    )
+
+
 def make_sandbox(
     *, prefer_docker: bool = True, timeout: float = 10.0, image: str = "python:3.11-slim",
     require_docker: bool = False, require_boundary: bool = False,
 ) -> "SubprocessSandbox | DockerSandbox":
     """Return the strongest sandbox available: a DockerSandbox when a Docker
     daemon is reachable, else a kernel-confined SubprocessSandbox where the
-    kernel allows it (Linux x86_64, Landlock ABI 3 — main, unreleased), else
+    kernel allows it (Linux x86_64, Landlock ABI 3 — 0.25.0), else
     the plain SubprocessSandbox.
 
     The plain subprocess is NOT an isolation boundary (an AST denylist behind

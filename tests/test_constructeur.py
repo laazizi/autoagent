@@ -174,6 +174,10 @@ ATTENDUS = {
     # 0.25.0 : la garde de la réponse (kwarg d'Agent) et le code comme action, version compacte.
     "garde_reponse": ('output_guard="neutralize"', 'url_guard="deny"', "agent.enable_code_action(compact=True)",
                       "@agent.tool(untrusted=True)"),
+    # Frontière obligatoire et lecture web par l'hôte (main, non publié) : l'import, l'outil sur sa liste de sites,
+    # le kwarg d'Agent, et le code comme action qui l'appelle.
+    "lecture_web": ("from autoagent.webfetch import http_fetch_tool", 'agent.add_tool(http_fetch_tool(["pypi.org"]))',
+                    "require_boundary=True", 'url_guard="deny"', "agent.enable_code_action(compact=True)"),
     # Épinglage MCP : la première fois on AFFICHE les définitions et l'humain accepte, ensuite mount(pins=).
     "mcp_pins": ("import pathlib", 'if not pathlib.Path("mcp_pins.json").exists():', "mcp_fs.list_tools()",
                  'input("Accepter ces définitions', 'mcp_fs.pin_tools("mcp_pins.json", include=',

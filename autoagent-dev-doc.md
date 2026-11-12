@@ -67,6 +67,7 @@
 46. [Provenance des outils générés, et la teinte qui descend dans les sous-agents](#46-provenance-des-outils-générés-et-la-teinte-qui-descend-dans-les-sous-agents) *(0.25.0)*
 47. [La garde du canal de la réponse — `output_guard`](#47-la-garde-du-canal-de-la-réponse--output_guard) *(0.25.0)*
 48. [Les données au repos gardent leur provenance](#48-les-données-au-repos-gardent-leur-provenance) *(0.27.0)*
+49. [La frontière obligatoire et la lecture web par l'hôte](#49-la-frontière-obligatoire-et-la-lecture-web-par-lhôte) *(sur `main`, non publié)*
 
 ---
 
@@ -195,7 +196,7 @@ python examples_autoagent/17_memoire_factuelle.py
 
 Et le **constructeur visuel** (`constructeur_autoagent.html`, hors-ligne) :
 assemble des blocs → code Python généré ; menu « Charger un exemple » =
-34 presets (tous générés et compilés en CI) + les démos complètes en lecture.
+35 presets (tous générés et compilés en CI) + les démos complètes en lecture.
 
 ---
 
@@ -2210,7 +2211,7 @@ Passe un `post_turn_hook` (§4.7) qui regarde `ctx.tool_calls` et retourne un `M
 
 ### Annexe A — Liste des fichiers de la lib
 
-*(vérifiée contre le disque sur `main` à la 0.27.0 — `autoagent/` : 35 modules + `__init__.py` ; `providers/` : 6 modules + `__init__.py`)*
+*(vérifiée contre le disque sur `main` à la 0.27.0 — `autoagent/` : 36 modules + `__init__.py` ; `providers/` : 6 modules + `__init__.py`)*
 
 ```
 autoagent/
@@ -2271,6 +2272,8 @@ autoagent/
 ├── ws.py                    # 0.25.0 — client WebSocket synchrone RFC 6455, stdlib seule (§44)
 ├── output_guard.py          # 0.25.0 — OutputGuard / guard_output : la garde du canal de la réponse (§47) ;
 │                            # 0.26.0 — guard_call_urls : la garde des URL d'appel, url_guard (§47.1)
+├── webfetch.py              # main (non publié) — http_fetch_tool : lire le web PAR L'HÔTE, à une liste de
+│                            # sites, adresses internes refusées (§49.2)
 └── providers/
     ├── __init__.py          # create_provider (fabrique par nom)
     ├── base.py              # LLMProvider (ABC) + deep-merge de config.extra_body ;
@@ -2380,6 +2383,7 @@ from autoagent.output_guard import guard_call_urls                          # 0.
 from autoagent.redteam import run_persistence_bench                         # 0.27.0 — banc de persistance (§48.3)
 from autoagent.gate import run_taint, note_untrusted_read                   # 0.27.0 — provenance des données au repos (§48)
 from autoagent.gate import delegation_taint                                 # 0.25.0 — la teinte qui descend (§46)
+from autoagent.webfetch import http_fetch_tool                             # main (non publié) — lecture web par l'hôte (§49.2)
 ```
 
 ### Annexe C — Cheat-sheet
@@ -5950,6 +5954,107 @@ hors du workspace. `SummarizingMemory` et `BufferMemory`, qui ne persistent rien
 teinte les suit dans la conversation). La mémoire d'un fait marqué puis reformulé par le modèle dans un fait neuf lors
 d'un run sain (la marque ne se propage pas d'un fait à l'autre). `EvolutionRuntime` construit son workspace en mode
 `"label"`.
+
+## 49. La frontière obligatoire et la lecture web par l'hôte
+
+*(sur `main`, non publié)* Première étape du « mode atelier » : laisser le modèle créer librement DANS un bac, sans
+rien relâcher à la frontière. Elle pose deux choses : une frontière qu'on peut EXIGER d'un seul réglage, et un
+accès au web qui ne passe pas par le réseau du bac.
+
+### 49.1 `Agent(require_boundary=True)`
+
+Avant, exiger une vraie frontière se disait bac par bac (`make_sandbox(require_boundary=True)`), à trois endroits
+(`enable_dynamic_tools`, `enable_run_python`, `enable_code_action`). Sans bac choisi, la bibliothèque prenait le
+confinement par le noyau là où il existe, sinon le sous-processus SIMPLE — une liste d'interdits, pas une frontière —
+même quand un démon Docker répondait (constaté le 12 nov. 2026 sur une machine Windows : Docker détecté, bac par
+défaut = sous-processus simple).
+
+```python
+agent = Agent(provider, require_boundary=True)       # défaut : False, rien ne change pour un agent existant
+agent.enable_code_action()                           # le noyau sous Linux, sinon Docker, sinon ToolError
+```
+
+- **À la configuration** (`enable_code_action`, `enable_run_python`, `enable_dynamic_tools`) : un bac PAR DÉFAUT
+  sans frontière devient le meilleur bac à frontière de la machine — le confinement par le noyau (Linux x86_64),
+  sinon `DockerSandbox` si un démon à conteneurs Linux répond, sinon `ToolError` avec la cause. Un bac CHOISI par
+  l'hôte sans frontière est refusé, jamais remplacé en silence.
+- **À l'exécution, en plus** (fail-closed) : un bac remplacé après coup, un outil généré chargé à la main, un bac
+  qui ne sait pas dire ce qu'il garantit (`isolation()` qui plante) — rien ne tourne sans frontière. Hors de tout
+  run (l'hôte qui appelle un outil à la main), rien n'est consulté, comme pour la porte.
+- **Un outil généré à permission `filesystem.*`** sans dossiers nommés ne peut pas être confiné (une liste blanche
+  ne s'invente pas) : il garde le conteneur du constructeur, ou va dans Docker, ou il est refusé — plus jamais le
+  sous-processus simple.
+- **L'exigence descend dans les sous-agents** (`as_tool`, `delegate_to`), comme la teinte (§46), le temps de la
+  délégation : un spécialiste qui n'exige rien ne fait pas tourner son code sans frontière quand c'est un agent
+  exigeant qui l'appelle. Il est refusé à l'exécution ; lui mettre `require_boundary=True` lui donne le bon bac.
+- **L'évolution logicielle** (`enable_software_evolution`) est refusée sur un tel agent : elle édite une vraie
+  application et lance la commande de validation de l'hôte hors de tout bac — c'est sa raison d'être.
+- Un outil PROMU en natif par `approval` (approuvé par un humain à l'empreinte près) n'est pas concerné : voulu.
+
+**Coût mesuré d'un appel de code** (le même programme trivial, 20 appels par bac alternés, 12 nov. 2026) : sous
+Windows, sous-processus simple 200 ms, Docker 448 ms (médianes) — environ 250 ms de plus par programme ; sous Linux
+(WSL2), simple 20,6 ms, confiné par le noyau 20,4 ms — pas d'écart mesurable sur cette série.
+
+### 49.2 Lire le web par l'hôte — `http_fetch_tool`
+
+Le réseau d'un bac est en tout ou rien (`Confinement(network=True)`, la permission `network`) : un outil qui avait
+besoin d'un seul site poussait à ouvrir tout le réseau, et chaque hôte écrivait sa propre lecture
+(`urllib.request.urlopen` dans la démo 18), sans garde contre les adresses internes.
+
+```python
+from autoagent.webfetch import http_fetch_tool
+
+agent.add_tool(http_fetch_tool(["pypi.org", "data.gouv.fr"]))          # et leurs sous-domaines
+agent.add_tool(http_fetch_tool(["exemple.fr"], max_bytes=500_000, timeout=20, max_redirects=5, allow_http=False))
+```
+
+L'outil lit pour le modèle, CÔTÉ HÔTE ; le bac reste coupé. Le code du modèle l'appelle par `call_host` (code
+comme action, outils générés avec `host_functions`), donc par la porte unique (§39). Il rend
+`{"url", "status", "content_type", "text", "truncated"}` ; une 404 est une réponse, un refus est une erreur d'outil.
+
+Refusé EN CODE, avant toute connexion :
+
+- un schéma autre que `https` (`http` sur option), un port autre que celui du schéma ;
+- un hôte hors de la liste (égalité ou sous-domaine : `pypi.org.evil.example` ne passe pas), une adresse IP écrite
+  dans l'URL ; une URL qu'un autre analyseur lirait autrement (barre inverse, identifiants `moi@`, blancs) ;
+- une adresse RÉSOLUE qui n'est pas publique : privée, bouclage, link-local, métadonnées des nuages
+  (169.254.169.254), NAT des opérateurs, multicast, réservée — y compris une IPv4 privée logée dans une IPv6
+  (`::ffff:`, NAT64, 6to4) et Teredo. Une seule adresse non publique parmi les réponses suffit. `localhost` est
+  refusé même s'il est dans la liste : la règle porte sur l'adresse.
+
+La connexion se fait sur l'adresse VÉRIFIÉE — pas de seconde résolution (« DNS rebinding ») ; si elle ne répond
+pas, l'adresse vérifiée suivante (un site en IPv6 et IPv4, une machine sans IPv6). Le certificat est vérifié sur le
+nom. Une redirection repasse les mêmes règles. `GET` seul, sans cookie, sans identifiant, sans en-tête choisi par le
+modèle, sans proxy. Bornes : `max_bytes` (le texte est tronqué et le rendu le dit), `timeout` au total, contenu
+textuel seulement, pas de compression non demandée.
+
+**Drapeaux** : `untrusted=True` (le run est teinté) et `idempotent`. **Pas `egress`** : la garde trifecta refuserait
+sinon la deuxième lecture de chaque run (la première le teinte). La fuite PAR L'URL est tenue par la liste — n'y
+mettre que des sites qui ne rendent pas une requête que l'hôte ne contrôle pas — et, pour l'URL exacte, par
+`Agent(url_guard="deny")` (§47.1) : testé, une URL qui porte un secret est refusée avant toute connexion, celle que
+la page cite passe.
+
+Ne fait pas : exécuter du JavaScript, envoyer un formulaire, passer par un proxy d'entreprise, lire un service
+INTERNE (adresse privée, refusée toujours : écrire un outil dédié).
+
+**Vérifié sur le vrai réseau** (12 nov. 2026) : l'API JSON de PyPI lue en HTTPS (certificat vérifié), `python.org`
+redirigé vers `www.python.org` et suivi, une 404 rendue comme réponse, `localhost` refusé (`::1`, `127.0.0.1`).
+
+**Mesuré sur un vrai modèle** (`deepseek-chat`, 12 nov. 2026, Windows, 5 essais par bras alternés, 294 111 jetons ;
+un premier essai, interrompu par une erreur du script de mesure, n'est pas compté). Tâche : « quelle est la dernière
+version d'autoagent-core sur PyPI, et sa date ? », avec `http_fetch` (pypi.org seulement) et le code comme action ;
+juge en code contre l'API de PyPI lue par le script. **Réussite 10/10** : 5/5 avec `require_boundary=True` (bac :
+Docker), 5/5 sans (sous-processus simple). Durée médiane 3,1 s contre 2,8 s. Mais le modèle a écrit un programme
+**une seule fois sur dix** : les neuf autres fois il a lu le JSON de 87 643 caractères en entier (~32 500 jetons par
+run). La fois où il l'a fait — dans Docker, la lecture passant par `call_host` vers l'hôte — le run a coûté
+**1 782 jetons**, soit environ 95 % de moins. Le chemin complet marche ; le modèle ne le choisit pas de lui-même sur
+cette tâche. C'est un point pour l'étape suivante, pas un défaut de cette étape. Une série de cinq n'est pas un taux.
+
+**Preuves.** `tests/test_frontiere_obligatoire.py` (23 tests, dont un réel : sous Windows le programme tourne dans
+Docker, sous Linux confiné par le noyau) ; `tests/test_webfetch.py` (132 tests, dont un bout en bout sur un vrai
+serveur HTTP local). 43 mutations du code : 41 attrapées ; les 2 survivantes ne changent pas le comportement (la
+taille de chaque lecture tombe d'elle-même à zéro à la limite ; Teredo est déjà non public pour Python, la règle
+reste en cas de changement). Démo 41 ; preset du constructeur « Lire le web sans ouvrir le bac ».
 
 ---
 *Doc maintenue par l'équipe Alyce R&D. Pour questions, ouvrir une issue sur le repo interne ou taper l'auteur sur Slack.*

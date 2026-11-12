@@ -459,6 +459,13 @@ def enable_software_evolution(
     *,
     capabilities: set[str] | None = None,
 ) -> EvolutionRuntime:
+    if getattr(agent, "require_boundary", False):
+        # L'évolution logicielle édite une VRAIE application et lance la commande de validation de l'hôte sur
+        # ce code, hors de tout bac : c'est sa raison d'être, et c'est l'inverse de ce que l'agent exige (0.28.0).
+        raise ToolError(
+            "require_boundary=True: software evolution edits a real application and runs the host's validation "
+            "command on it outside any sandbox. Use it on an agent without require_boundary."
+        )
     runtime.register_tools(agent, capabilities=capabilities)
     # `Agent.system_prompt` peut être un CALLABLE (prompt dynamique, recalculé à
     # chaque tour). Le concaténer comme une chaîne plantait :

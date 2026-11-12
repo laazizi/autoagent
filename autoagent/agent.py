@@ -35,6 +35,7 @@ from .output_guard import OutputGuard, guard_output, resolve_output_guard, resol
 from .providers import create_provider
 from .providers.base import LLMProvider
 from .registry import ToolRegistry, ToolResult
+from .sandbox import _a_une_frontiere, _bac_avec_frontiere, _frontiere_exigee
 from .sandbox import discard_generated_tool as _discard_generated
 from .schema import (
     UNTRUSTED_CLOSE,
@@ -678,7 +679,14 @@ class Agent:
         journal: Journal | None = None,
         output_guard: str | OutputGuard = "off",
         url_guard: str | OutputGuard = "off",
+        require_boundary: bool = False,
     ) -> None:
+        if not isinstance(require_boundary, bool):
+            raise TypeError(f"require_boundary must be True or False, got {require_boundary!r}")
+        # 0.28.0 : le code écrit par le modèle (run_python, code comme action, outils générés) ne tourne que
+        # derrière une VRAIE frontière — confinement par le noyau, sinon Docker, sinon refus. Défaut `False` :
+        # rien ne change pour un agent existant.
+        self.require_boundary = require_boundary
         self.provider = provider
         self.journal = journal
         self.registry = registry or ToolRegistry()
@@ -735,6 +743,9 @@ class Agent:
         # `ToolPolicyContext.tainted`, provenance des outils générés) : sans lui, déléguer
         # blanchissait la teinte.
         self._teinte_heritee = False
+        # Vrai le temps d'un run de sous-agent appelé par un agent qui EXIGE une frontière (0.28.0) : la même
+        # exigence vaut pour le code que le sous-agent ferait tourner (`sandbox._frontiere_exigee`).
+        self._frontiere_heritee = False
         self.dynamic_builder: DynamicToolBuilder | None = None
         self._dynamic_tools_built_this_run = 0
         self._python_runs_this_run = 0
@@ -891,6 +902,8 @@ class Agent:
         ``builder.host_functions`` — voir `DynamicToolBuilder`. Liste blanche, et
         chaque fonction tourne chez l'hôte sur des arguments choisis par le modèle.
         """
+        if self.require_boundary:
+            builder._imposer_la_frontiere()              # avant tout : rien n'est à moitié configuré
         if host_functions is not None:
             builder.host_functions = dict(host_functions) or None
         self.dynamic_builder = builder
@@ -968,6 +981,7 @@ class Agent:
         du code que tu ne maîtrises pas.
         """
         runner = runner or PythonRunner()
+        self._frontiere_du_lanceur(runner)
         self.python_runner = runner
         self.max_python_runs_per_run = max(1, int(max_runs_per_run))
 
@@ -1032,6 +1046,7 @@ class Agent:
                 surcoût moindre sur les petites tâches qui n'en ont pas besoin.
         """
         runner = PythonRunner(sandbox, timeout=timeout)
+        self._frontiere_du_lanceur(runner)
         noms = None if tools is None else frozenset(tools)
         self.python_runner = runner
         self.max_python_runs_per_run = max(1, int(max_runs_per_run))
@@ -1049,6 +1064,20 @@ class Agent:
             return runner(code, args)
 
         self.registry.replace(spec=_code_action_spec(compact=compact), handler=run_python)
+
+    def _frontiere_du_lanceur(self, runner: PythonRunner) -> None:
+        """`require_boundary=True` (0.28.0), à la configuration : le bac par défaut d'un `PythonRunner` devient le
+        meilleur bac à frontière de la machine (noyau, sinon Docker, sinon ``ToolError``) ; un bac choisi par
+        l'hôte sans frontière est refusé — jamais remplacé en silence. Le contrôle se refait à l'exécution."""
+        if not self.require_boundary or _a_une_frontiere(runner.sandbox):
+            return
+        if runner._bac_impose:
+            raise ToolError(
+                "require_boundary=True: the sandbox given for run_python is not an OS-enforced isolation boundary. "
+                "Pass a DockerSandbox or a confined SubprocessSandbox, or none to let the agent pick the best "
+                "boundary available."
+            )
+        runner.sandbox = _bac_avec_frontiere(runner.permissions, timeout=runner.sandbox.timeout)
 
     def _outils_pour_le_code(self, noms: frozenset[str] | None) -> dict[str, Callable[..., Any]]:
         """Les outils de l'agent vus comme fonctions de l'hôte par le code du modèle (`enable_code_action`)."""
@@ -1381,6 +1410,9 @@ class Agent:
             # La teinte du run appelant descend TOUJOURS pour la provenance (nuit du 11 nov. 2026).
             teinte_anterieure = agent_self._teinte_heritee
             agent_self._teinte_heritee = delegation_taint(active_gate())
+            # L'exigence de frontière descend aussi (0.28.0), lue dans le thread de l'appel.
+            frontiere_anterieure = agent_self._frontiere_heritee
+            agent_self._frontiere_heritee = _frontiere_exigee()
             try:
                 # 0.23.1 : le « stop » du parent vaut aussi pour le sous-agent (le jeton de l'agent qui
                 # exécute CET outil, lu dans le thread de l'appel) ; sans lui il finissait tous ses pas.
@@ -1399,6 +1431,7 @@ class Agent:
             finally:
                 agent_self._parent_gate = anterieur
                 agent_self._teinte_heritee = teinte_anterieure
+                agent_self._frontiere_heritee = frontiere_anterieure
             sortie = result.output
             if is_tainted(result.messages):
                 # Le sous-agent a lu du contenu externe : sa réponse peut le
@@ -2855,13 +2888,16 @@ def delegate_to(
     def _une(cible: str, demande: str, context: dict[str, Any] | None,
              parent: ActionGate | None = None,
              jeton: threading.Event | None = None,
-             teinte: bool = False) -> tuple[dict[str, Any], Any]:
+             teinte: bool = False,
+             frontiere: bool = False) -> tuple[dict[str, Any], Any]:
         agent = specialistes[cible]
         anterieur = agent._parent_gate
         if parent is not None:
             agent._parent_gate = parent
         teinte_anterieure = agent._teinte_heritee
         agent._teinte_heritee = teinte                 # voir `as_tool`
+        frontiere_anterieure = agent._frontiere_heritee
+        agent._frontiere_heritee = frontiere           # voir `as_tool` (0.28.0)
         try:
             suite: dict[str, Any] = {"cancel_token": jeton} if jeton is not None else {}   # voir `as_tool`
             resultat = agent.run(demande, context=context, **suite)
@@ -2871,6 +2907,7 @@ def delegate_to(
         finally:
             agent._parent_gate = anterieur
             agent._teinte_heritee = teinte_anterieure
+            agent._frontiere_heritee = frontiere_anterieure
         sortie = resultat.output
         if is_tainted(resultat.messages):
             # Le spécialiste a lu du contenu externe : sa sortie peut le citer.
@@ -2902,6 +2939,7 @@ def delegate_to(
         # La teinte du run appelant, lue ICI pour la même raison : elle descend dans le run de
         # chaque spécialiste pour la provenance des outils qu'il ferait construire.
         teinte = delegation_taint(active_gate())
+        frontiere = _frontiere_exigee()                # idem (0.28.0)
 
         # Regroupement par spécialiste : un Agent ne sert qu'un appelant à la
         # fois, donc deux demandes pour la même cible ne peuvent PAS partir
@@ -2923,7 +2961,7 @@ def delegate_to(
             # Chaque index n'est écrit que par UN thread : pas de verrou requis.
             for index in groupes[cible]:
                 demande = str((requests[index] or {}).get("request", ""))
-                reponses[index], usages[index] = _une(cible, demande, context, parent, jeton, teinte)
+                reponses[index], usages[index] = _une(cible, demande, context, parent, jeton, teinte, frontiere)
 
         if len(groupes) > 1:
             with ThreadPoolExecutor(
