@@ -44,8 +44,8 @@ if TYPE_CHECKING:
     from .agent import Agent, ToolPolicyContext
     from .guards import TurnGuards
 
-__all__ = ["ActionGate", "active_gate", "delegation_taint", "evaluate_policy", "gate_scope", "trifecta_blocks",
-           "url_guard_verdict"]
+__all__ = ["ActionGate", "active_gate", "delegation_taint", "evaluate_policy", "gate_scope", "note_untrusted_read",
+           "run_taint", "trifecta_blocks", "url_guard_verdict"]
 
 _log = get_logger("gate")
 
@@ -281,3 +281,23 @@ def delegation_taint(porte: ActionGate | None) -> bool:
     except Exception:
         _log.exception("could not read the delegating run's taint; assuming tainted (fail-closed)")
         return True
+
+
+def run_taint() -> bool | None:
+    """La teinte du run EN COURS, pour ce qui écrit des données qui lui SURVIVRONT — un fait de mémoire, un
+    fichier du workspace (0.27.0). `None` hors de tout run : le code de l'hôte agit lui-même, c'est son
+    affirmation. Sinon vrai dès que ce run, ou celui qui lui a délégué, a ingéré du contenu non fiable.
+    Lecture qui plante : teinté (fail-closed, dans `delegation_taint`)."""
+    porte = active_gate()
+    return None if porte is None else delegation_taint(porte)
+
+
+def note_untrusted_read() -> bool:
+    """L'outil EN COURS vient de relire une donnée NON VÉRIFIÉE (un fichier écrit par un run teinté) : son
+    résultat sera encadré et le run teinté — le mécanisme d'une fonction `untrusted` appelée depuis un programme
+    (`tainted_by_host`), donc la même boucle, le même journal. Rend False hors de tout run."""
+    porte = active_gate()
+    if porte is None:
+        return False
+    porte.tainted_by_host = True
+    return True

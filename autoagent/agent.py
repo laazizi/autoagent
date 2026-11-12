@@ -1761,6 +1761,13 @@ class Agent:
                 working_messages = list(self.memory.compact(working_messages))
             except Exception:
                 _log.exception("memory.compact raised; using messages unchanged")
+            # Des faits appris pendant un run teinté viennent d'être relus (0.27.0) : la trace le dit — le
+            # nombre et le mode, jamais le texte des faits. C'est la mesure à regarder avant de passer la
+            # mémoire en `tainted_facts="taint"`.
+            non_verifies = getattr(self.memory, "last_unverified", 0)
+            if isinstance(non_verifies, int) and non_verifies > 0:
+                self._emit("memory_unverified_facts",
+                           {"count": non_verifies, "mode": getattr(self.memory, "tainted_facts", "label")})
         self._dynamic_tools_built_this_run = 0
         self._python_runs_this_run = 0
         # Divulgation progressive : les outils déjà révélés sont RE-DÉRIVÉS du

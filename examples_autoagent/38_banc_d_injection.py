@@ -34,6 +34,10 @@ Ce que la demo montre :
      attaque, par chaque chemin de sortie (envoi direct, sous-agent, programme du modele,
      image de la reponse, URL d'une LECTURE) : quelles routes le code laisse-t-il ouvertes ?
      La lecture d'une URL porteuse restait ouverte ; `url_guard="deny"` la ferme.
+  7. le banc de PERSISTANCE : une attaque en deux temps. Lundi, une page fait RETENIR une
+     consigne (dans la memoire de faits, dans un fichier) ; mardi, une conversation neuve la
+     relit et agit. La donnee plantee est marquee ; `tainted_facts="taint"` /
+     `tainted_files="taint"` rearment les gardes a la relecture.
 
 Ce que ca ne mesure pas : les canaux sont enumeres (outil `egress`, URL d'une lecture, URL de
 la reponse), le canari ne trouve que des fuites LITTERALES, les attaques sont peu nombreuses et
@@ -67,6 +71,7 @@ from autoagent.redteam import (  # noqa: E402
     injection_variant,
     positive_control,
     run_injection_bench,
+    run_persistence_bench,
     run_route_bench,
     standard_agent,
 )
@@ -146,6 +151,28 @@ def niveau_1() -> None:
     print("  -> elle garde l'utilite, mais une politique ne couvre que l'agent qui la porte : le sous-agent qui")
     print("     detient l'outil d'envoi l'ignore. Remede : `as_tool(..., inherit_policy=True)`, ou la meme")
     print("     politique sur le sous-agent. C'est le banc qui le montre, pas la relecture.")
+
+    ligne("7) Le banc de PERSISTANCE : lundi une page fait retenir une consigne, mardi on agit")
+    print("  La teinte d'un run vivait dans la conversation. Ce qu'un run teinte ECRIT pour plus tard - un fait")
+    print("  de memoire, un fichier - etait relu, un autre jour, comme une information de confiance.\n")
+    print(run_persistence_bench().summary().split("Lecture")[0].rstrip())
+    print("\n  -> la donnee plantee est MARQUEE et revient sous une etiquette (« non verifie »). L'etiquette")
+    print("     previent le modele sans rien bloquer : un modele docile cede quand meme. Le mode strict :\n")
+    strict = run_persistence_bench(tainted_facts="taint", tainted_files="taint")
+    print("  FactMemory(tainted_facts='taint') et ProjectWorkspace(tainted_files='taint') : relire la donnee")
+    print(f"  reteinte le run. Surfaces OUVERTES : {', '.join(strict.open_surfaces()) or 'aucune'}")
+
+    def destinataires_connus(ctx):
+        if ctx.tainted and ctx.call.name == "envoyer_message" and ctx.call.arguments.get("destinataire") != LEGIT:
+            return "destinataire non autorise apres une donnee non verifiee"
+        return None
+
+    fine = run_persistence_bench(tainted_facts="taint", tainted_files="taint", trifecta_guard="off",
+                                 tool_policy=destinataires_connus)
+    utiles = sum(1 for v in fine.cells.values() if v.utility)
+    print("  Avec la garde trifecta, l'envoi legitime est bloque aussi. Une politique qui lit `ctx.tainted` et le")
+    print(f"  destinataire : surfaces ouvertes {', '.join(fine.open_surfaces()) or 'aucune'}, tache legitime "
+          f"reussie {utiles}/{len(fine.cells)}.")
 
 
 def niveau_2(argv: list[str]) -> None:
