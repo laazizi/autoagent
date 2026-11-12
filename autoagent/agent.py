@@ -1059,8 +1059,10 @@ class Agent:
                 continue
             if noms is not None and nom not in noms:
                 continue
-            if getattr(self.registry.handler_for(nom), "__autoagent_usage_channel__", None) is not None:
-                continue                        # un sous-agent : sa dépense ne serait pas comptée
+            outil = self.registry.handler_for(nom)
+            if (getattr(outil, "__autoagent_usage_channel__", None) is not None
+                    or hasattr(outil, "__autoagent_usage__")):
+                continue                        # un sous-agent, nu ou enveloppé par l'hôte : sa dépense ne serait pas comptée
             fonctions[nom] = _par_le_registre(self.registry, spec)
         return fonctions
 
@@ -1416,6 +1418,7 @@ class Agent:
             return payload
 
         handler.__autoagent_usage_channel__ = canal  # type: ignore[attr-defined]
+        canal.refleter_sur(handler)
         handler.__name__ = name
         handler.__autoagent_tool_spec__ = ToolSpec(  # type: ignore[attr-defined]
             name=name,
@@ -2050,8 +2053,12 @@ class Agent:
                 # outil ne doit pas refacturer la dépense du premier. Le canal
                 # est PAR THREAD : en `parallel_tool_calls`, deux appels du même
                 # spécialiste ne s'écrasent plus leur dépense (0.22.0).
-                canal = getattr(self.registry.handler_for(call.name), "__autoagent_usage_channel__", None)
-                delegue = canal.prendre() if canal is not None else None
+                outil = self.registry.handler_for(call.name)
+                canal = getattr(outil, "__autoagent_usage_channel__", None)
+                # Sans canal par thread : l'ANCIEN attribut (0.19.0 à 0.21.0), celui qu'un hôte recopie
+                # sur la fonction qui ENVELOPPE une délégation. Ne plus le lire rendait `token_budget`
+                # aveugle à ces délégations, sans erreur (constat du 12 nov. 2026).
+                delegue = canal.prendre() if canal is not None else _depense_par_l_ancien_canal(outil)
                 return result, duration_ms, delegue
 
             if self.parallel_tool_calls and len(calls) > 1:
@@ -2579,14 +2586,48 @@ class _CanalDepense:
 
     def __init__(self) -> None:
         self._local = threading.local()
+        self._reflet: Any = None
+
+    def refleter_sur(self, handler: Any) -> None:
+        """Pose AUSSI la dépense sur ``handler.__autoagent_usage__`` — l'ancien canal (0.19.0 à 0.21.0).
+
+        Un hôte qui enveloppe l'outil de délégation dans sa propre fonction recopie cet attribut
+        sur son enveloppe pour que la dépense remonte (`_depense_par_l_ancien_canal`). Le reflet est
+        partagé entre threads, comme l'était l'ancien canal : c'est le canal par thread qui fait foi
+        pour la boucle, le reflet ne sert qu'à l'enveloppe qui le lit juste après son appel.
+        """
+        self._reflet = handler
+        handler.__autoagent_usage__ = None
 
     def poser(self, usage: TokenUsage | None) -> None:
         self._local.usage = usage
+        if self._reflet is not None:
+            self._reflet.__autoagent_usage__ = usage
 
     def prendre(self) -> TokenUsage | None:
         usage = getattr(self._local, "usage", None)
         self._local.usage = None
+        if self._reflet is not None:
+            self._reflet.__autoagent_usage__ = None
         return usage
+
+
+def _depense_par_l_ancien_canal(outil: Any) -> TokenUsage | None:
+    """La dépense qu'un hôte a posée sur ``outil.__autoagent_usage__`` — lue et VIDÉE.
+
+    Vidée pour qu'un deuxième appel du même outil ne refacture pas le premier ; sur une méthode
+    liée, l'attribut vit sur la fonction (`__func__`). Seul un `TokenUsage` entre dans la
+    comptabilité : toute autre valeur est ignorée (et vidée), elle ne casse pas le run.
+    """
+    usage = getattr(outil, "__autoagent_usage__", None)
+    if usage is None:
+        return None
+    porteur = getattr(outil, "__func__", outil)
+    try:
+        porteur.__autoagent_usage__ = None
+    except Exception:           # un outil dont l'attribut ne se vide pas : compté quand même
+        pass
+    return usage if isinstance(usage, TokenUsage) else None
 
 
 def _depense_d_un_echec(exc: BaseException) -> TokenUsage | None:
@@ -2914,6 +2955,7 @@ def delegate_to(
         return {"responses": reponses, "tokens": entree + sortie if vu else None}
 
     handler.__autoagent_usage_channel__ = canal        # type: ignore[attr-defined]
+    canal.refleter_sur(handler)
     handler.__name__ = name
     handler.__autoagent_tool_spec__ = ToolSpec(        # type: ignore[attr-defined]
         name=name,

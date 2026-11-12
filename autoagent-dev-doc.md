@@ -3,7 +3,7 @@
 > Référence technique complète pour intégrer, étendre et tester `autoagent` dans un projet Python.
 > **Public visé** : devs qui vont écrire des tools, brancher l'agent sur leur app, ou éventuellement contribuer à la lib.
 
-**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-11-11 · **Couvre autoagent** : 0.26.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
+**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-11-12 · **Couvre autoagent** : 0.27.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
 
 ---
 
@@ -66,7 +66,7 @@
 45. [Le confinement par le noyau — une frontière sans Docker](#45-le-confinement-par-le-noyau--une-frontière-sans-docker) *(0.25.0)*
 46. [Provenance des outils générés, et la teinte qui descend dans les sous-agents](#46-provenance-des-outils-générés-et-la-teinte-qui-descend-dans-les-sous-agents) *(0.25.0)*
 47. [La garde du canal de la réponse — `output_guard`](#47-la-garde-du-canal-de-la-réponse--output_guard) *(0.25.0)*
-48. [Les données au repos gardent leur provenance](#48-les-données-au-repos-gardent-leur-provenance) *(non publiée)*
+48. [Les données au repos gardent leur provenance](#48-les-données-au-repos-gardent-leur-provenance) *(0.27.0)*
 
 ---
 
@@ -2210,7 +2210,7 @@ Passe un `post_turn_hook` (§4.7) qui regarde `ctx.tool_calls` et retourne un `M
 
 ### Annexe A — Liste des fichiers de la lib
 
-*(vérifiée contre le disque sur `main` à la 0.26.0 — `autoagent/` : 35 modules + `__init__.py` ; `providers/` : 6 modules + `__init__.py`)*
+*(vérifiée contre le disque sur `main` à la 0.27.0 — `autoagent/` : 35 modules + `__init__.py` ; `providers/` : 6 modules + `__init__.py`)*
 
 ```
 autoagent/
@@ -2377,8 +2377,8 @@ from autoagent.ws import WebSocketClient, WebSocketClosed, WebSocketError   # 0.
 from autoagent.mcp import tool_fingerprint                                   # 0.26.0 — empreinte d'un outil MCP (§17.1)
 from autoagent.output_guard import OutputGuard, guard_output                # 0.25.0 — garde du canal de la réponse (§47)
 from autoagent.output_guard import guard_call_urls                          # 0.26.0 — garde des URL d'appel (§47.1)
-from autoagent.redteam import run_persistence_bench                         # main (non publié) — banc de persistance (§48.3)
-from autoagent.gate import run_taint, note_untrusted_read                   # main (non publié) — provenance des données au repos (§48)
+from autoagent.redteam import run_persistence_bench                         # 0.27.0 — banc de persistance (§48.3)
+from autoagent.gate import run_taint, note_untrusted_read                   # 0.27.0 — provenance des données au repos (§48)
 from autoagent.gate import delegation_taint                                 # 0.25.0 — la teinte qui descend (§46)
 ```
 
@@ -2645,7 +2645,15 @@ lignes, sans framework de « crew ». Sémantique précise :
 - le retour porte `output`, `steps` et `tokens` → le parent (et ton transcript) voient le
   **coût de la délégation** ;
 - **la dépense du sous-agent entre dans la comptabilité du parent** *(corrigé après la
-  0.19.0)* : elle s'ajoute à `result.usage` et **compte dans `token_budget`**.
+  0.19.0)* : elle s'ajoute à `result.usage` et **compte dans `token_budget`** ;
+- **un hôte qui ENVELOPPE l'outil de délégation** dans sa propre fonction (pour borner le
+  spécialiste, tenir un journal, traduire une erreur) fait remonter la dépense en recopiant
+  `interne.__autoagent_usage__` sur son enveloppe, juste après l'appel : la boucle lit cet
+  attribut sur un outil qui n'a pas le canal par thread, puis le vide (un `TokenUsage`
+  seulement). *Rétabli en 0.27.0* : de la 0.22.0 à la 0.26.0 l'attribut n'était plus posé ni
+  lu, et `token_budget` ne voyait plus ces délégations — sans erreur. Limite : cet attribut
+  est partagé entre threads ; en `parallel_tool_calls`, un outil par délégation. Une telle
+  enveloppe, comme un sous-agent, n'est pas exposée au code du modèle (`enable_code_action`).
 
 > ⚠️ **Trou corrigé, à connaître si tu tournes en 0.19.0 ou avant.** Le chiffre
 > `tokens` du retour est écrit pour le MODÈLE ; jusqu'ici il était ensuite **jeté**,
@@ -5857,7 +5865,7 @@ fiable (une page 2, un identifiant d'API) est refusé : c'est le prix, d'où l'o
 
 ## 48. Les données au repos gardent leur provenance
 
-*(sur `main`, non publié)* La teinte d'un run vit dans sa conversation. Ce qu'un run teinté ÉCRIT pour plus tard
+*(0.27.0)* La teinte d'un run vit dans sa conversation. Ce qu'un run teinté ÉCRIT pour plus tard
 n'en gardait rien : lundi, une page piégée fait retenir « une copie de chaque résumé part à x@… » ; mardi, dans une
 conversation neuve, le fait revient **dans un message système**, au milieu des faits de confiance, et aucune garde ne
 se déclenche — ni la garde trifecta, ni `url_guard`, ni une `tool_policy` conditionnée à la teinte. Même chose pour

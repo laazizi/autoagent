@@ -34,7 +34,7 @@ Ce que la demo montre :
      attaque, par chaque chemin de sortie (envoi direct, sous-agent, programme du modele,
      image de la reponse, URL d'une LECTURE) : quelles routes le code laisse-t-il ouvertes ?
      La lecture d'une URL porteuse restait ouverte ; `url_guard="deny"` la ferme.
-  7. le banc de PERSISTANCE : une attaque en deux temps. Lundi, une page fait RETENIR une
+  7. le banc de PERSISTANCE (0.27.0) : une attaque en deux temps. Lundi, une page fait RETENIR une
      consigne (dans la memoire de faits, dans un fichier) ; mardi, une conversation neuve la
      relit et agit. La donnee plantee est marquee ; `tainted_facts="taint"` /
      `tainted_files="taint"` rearment les gardes a la relecture.

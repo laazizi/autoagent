@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-11-12
+
 ### Added
 
 - **Data at rest keeps its provenance.** A run's taint lived in its conversation; what a tainted run WROTE for
@@ -50,6 +52,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mark; with none, the rendering is byte-identical. `ProjectWorkspace.read_file` adds two keys for an unverified
   file; `.autoagent` is now ALWAYS ignored by the workspace, even with a host-supplied `ignored_dirs` (the
   provenance registry lives there); `ChangeRecord` gains `was_unverified`.
+
+### Fixed
+
+- **A host function that wraps a delegation tool counts in the parent's budget again.** From 0.19.0 to 0.21.0,
+  `Agent.as_tool()` put the sub-agent's spend on the tool function (`handler.__autoagent_usage__`) and the parent's
+  loop read it. 0.22.0 replaced it with a per-thread channel and stopped both setting and reading that attribute,
+  without saying so. A host that wraps the delegation tool in its own function (to bound the specialist, keep a
+  journal, translate an error) had one way to report the spend: copy that attribute onto its wrapper. With 0.22.0
+  to 0.26.0 that spend no longer reached the parent — no error, `result.usage` under-reported the run and
+  `token_budget` no longer saw the delegation. Found on 12 Nov 2026 by running the test suite of a consumer
+  project written against 0.21.0 on this version: 2 of its 541 library-related tests failed, and a replay against
+  each tag showed they had failed since 0.22.0. Restored: `as_tool` and `delegate_to` tools carry
+  `__autoagent_usage__` again (next to the per-thread channel, which stays the one the loop reads for them); the
+  loop reads the attribute on a tool that has no per-thread channel — a `TokenUsage` only, read then cleared;
+  such a wrapper is not exposed to code-as-action, for the same reason as a sub-agent. Limit, as before 0.22.0:
+  the attribute is shared between threads, so give each parallel delegation its own tool. 14 tests
+  (`tests/test_delegation_ancien_canal.py`), 10 mutants killed; the consumer's 541 tests pass again with no change
+  on its side. Dev-doc §16.3.
 
 ### Fixed (documentation and demos)
 
@@ -2861,7 +2881,8 @@ underscored or imported from a submodule path is internal and may change.
 - CI invariants: `ruff check`, `ruff format --check`, `mypy autoagent/`,
   and `pytest` are all green.
 
-[Unreleased]: https://github.com/laazizi/autoagent/compare/v0.26.0...HEAD
+[Unreleased]: https://github.com/laazizi/autoagent/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/laazizi/autoagent/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/laazizi/autoagent/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/laazizi/autoagent/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/laazizi/autoagent/compare/v0.23.1...v0.24.0
