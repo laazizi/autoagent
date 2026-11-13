@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A call log for the tools the model creates** (`DynamicToolBuilder(persist=True, record_calls=N)`,
+  `builder.calls(name, failed=, limit=)`). The persistent library only kept counters and the last error message:
+  not WHAT a tool failed on, how long it took, or whether the failure was its own. The last N calls of each tool
+  are now kept in `tools_dir/<name>.calls.jsonl`: arguments and result (with their sha256), outcome (`kind`),
+  error text, duration, the version of the code that ran, whether the calling run was tainted. Off by default
+  (`0`). The outcome is classified by what the HOST saw, never by the error text (which the tool chooses): `ok`,
+  `exception`, `timeout`, `host` (a host function refused or failed — counted by the bridge, host-side),
+  `sandbox` (the sandbox itself failed). Bounded (N calls per tool, the file never exceeds 2 N lines;
+  `max_record_chars` per value, beyond which only the hash is kept). Personal data: the log keeps what the tool
+  RECEIVES, so `redact=` (a `value -> value` function) runs BEFORE anything is written, on arguments, result and
+  error text — the catalogue's `last_error` included; a `redact` that raises writes neither value nor hash
+  (fail-closed). Observability fails open: a log that cannot be written never breaks a call. New hook
+  `GeneratedPythonTool.recorder(call)`. Limit: the log sees what the tool RETURNS — a tool that swallows its
+  errors, or returns a wrong result, shows as `ok`.
+  Checked on a tool really written by a model (`deepseek-chat`, 13 Nov 2026, Windows, `require_boundary=True` so
+  inside Docker; 5,436 tokens for two runs): the model writes `jours_entre` (two YYYY-MM-DD dates), a first agent
+  uses it twice, a second agent reloads it and uses it once — three `ok` entries, `tainted: false`, 0.45 to 0.59 s
+  each (the container). Called by hand with a wrongly formatted date, an impossible date and an empty string, it
+  raises `ValueError` three times: three `exception` entries with the exact input and the error text. What this
+  run teaches: those three failures are INVALID inputs the tool was right to refuse — and they RETIRED it (three
+  errors in a row). The log cannot tell "the tool has a bug" from "it was given a bad input": both are an
+  `exception`, and the retirement rule, which already existed, counts them alike. Telling them apart belongs to
+  quality measurement (the next step). One run, one tool: an observation, not a rate.
+  47 tests (`tests/test_carnet_outils.py`), 43 code mutations all caught. Demo 42; builder option. Dev-doc §11.10.
+
 - **`Agent(require_boundary=True)` — model-written code runs only behind a real boundary.** Requiring a boundary
   used to be said sandbox by sandbox (`make_sandbox(require_boundary=True)`), in three places. Without a sandbox
   chosen, the library took kernel confinement where it exists, else the PLAIN subprocess (a denylist, not a
@@ -51,6 +76,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   survivors do not change behaviour (each read size already falls to zero at the limit; Teredo is already
   non-public for Python, the rule stays in case that changes). Demo 41; builder options `require_boundary` and
   « http_fetch : sites permis », preset `lecture_web` (35 presets). Dev-doc §49.
+
+### Changed
+
+- The persistent tool library counts through the new `recorder` hook; `GeneratedPythonTool.observer(name, ok,
+  error)` (0.22.0) keeps its signature and stays free for the host — the library no longer sets it, so a host
+  that sets its own no longer switches the library's counting off. Catalogue entries gain
+  `unattributed_failures`; `errors` now counts the tool's OWN failures only (see Fixed).
+
+### Fixed
+
+- **A sound generated tool was retired for failures that were not its own.** Every failed call counted towards
+  `retire_after_errors`: reproduced on the previous code (13 Nov 2026), two refusals of a host function by the
+  host's policy, or two calls while the sandbox was down (a stopped Docker daemon), RETIRED the tool
+  (`retire_after_errors=2`) — a Docker hiccup could empty the whole library. Now only the tool's own failures
+  (`exception`, `timeout`) extend the streak and can retire it; `host` and `sandbox` failures are counted apart
+  and leave the streak untouched. Calling a host function that is not on the allow-list is the tool's defect.
 
 ### Fixed (documentation)
 

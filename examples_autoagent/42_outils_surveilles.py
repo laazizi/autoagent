@@ -1,0 +1,153 @@
+"""42 - Surveiller les outils que le modele a crees : le carnet d'appels.
+
+L'agent ecrit l'outil qui lui manque (demo 06) et la bibliotheque le garde (`persist=True`). Mais que
+vaut cet outil a l'usage ? Jusqu'ici on n'avait que des compteurs. Le carnet (`record_calls=N`, main,
+non publie) note chaque appel : ce que l'outil a recu, l'issue, la cause, la duree, la version du code.
+
+Trois choses a voir, sans cle (le « modele » qui ecrit les outils est scripte) :
+
+  1. un outil a defaut plante sur une entree qu'il n'attendait pas : le carnet dit SUR QUOI ;
+  2. une fonction de l'hote refusee par la politique n'est pas un defaut de l'outil : elle est comptee
+     a part et ne le fait pas retirer (avant, deux refus retiraient un outil sain) ;
+  3. le carnet garde ce que l'outil recoit : `redact=` masque un nom AVANT toute ecriture.
+
+    python examples_autoagent/42_outils_surveilles.py
+"""
+
+from __future__ import annotations
+
+import json
+import tempfile
+from pathlib import Path
+from typing import Any
+
+import _common  # noqa: F401  (chemin vers la lib du depot, console UTF-8)
+
+from autoagent import Agent, DynamicToolBuilder, ToolBuildRequest
+from autoagent.errors import ToolError
+from autoagent.providers.base import LLMProvider
+from autoagent.schema import LLMRequest, LLMResponse, ModelConfig, ToolCall
+
+# Ce qu'un modele aurait pu ecrire : il convertit « 1h30 » en minutes, et n'a pas prevu « 90 min ».
+CODE_DUREE = (
+    "def run(args, context):\n"
+    "    heures, minutes = args['duree'].split('h')\n"
+    "    return {'minutes': int(heures) * 60 + int(minutes or 0)}\n"
+)
+# Un outil qui passe par une fonction de l'hote pour lire une fiche.
+CODE_FICHE = (
+    "def run(args, context):\n"
+    "    fiche = context['call_host']('lire_fiche', {'client': args['client']})\n"
+    "    return {'client': args['client'], 'ville': fiche['ville']}\n"
+)
+
+
+def _outil(nom: str, description: str, code: str, parametre: str) -> str:
+    return json.dumps({
+        "tool": {"name": nom, "description": description, "permissions": [],
+                 "input_schema": {"type": "object", "properties": {parametre: {"type": "string"}}, "required": [parametre]}},
+        "code": code, "self_tests": [],
+    })
+
+
+class Scripte(LLMProvider):
+    """Joue le modele : rend les reponses prevues, dans l'ordre. Aucun appel reseau."""
+
+    def __init__(self, reponses: list[Any]) -> None:
+        super().__init__(ModelConfig(provider="scripte", model="scripte", api_key="x"))
+        self.reponses = list(reponses)
+
+    def complete(self, request: LLMRequest) -> LLMResponse:
+        suivante = self.reponses.pop(0) if self.reponses else "fini"
+        return suivante if isinstance(suivante, LLMResponse) else LLMResponse(content=suivante)
+
+
+def _appel(numero: int, nom: str, **arguments: Any) -> LLMResponse:
+    return LLMResponse(tool_calls=[ToolCall(id=f"c{numero}", name=nom, arguments=arguments)])
+
+
+def _afficher(constructeur: DynamicToolBuilder, nom: str) -> None:
+    for appel in constructeur.calls(nom):
+        vu = appel.get("result") if appel["ok"] else appel.get("error")
+        print(f"    {appel['kind']:9s} {appel['seconds']:5.2f} s  {json.dumps(appel.get('args'), ensure_ascii=False):28s} -> "
+              f"{str(vu)[:70]}")
+    e = constructeur.catalogue()[nom]
+    print(f"    compteurs : {e['calls']} appels, {e['errors']} defauts de l'outil, "
+          f"{e['unattributed_failures']} echecs non attribues, retire = {e['retired']}")
+
+
+def partie_1(dossier: Path) -> None:
+    print("=" * 78)
+    print("1) Un outil a defaut : le carnet dit SUR QUOI il a plante")
+    print("=" * 78)
+    constructeur = DynamicToolBuilder(Scripte([_outil("convertir_duree", "Convertit 1h30 en minutes.", CODE_DUREE, "duree")]),
+                                      tools_dir=dossier, persist=True, record_calls=20)
+    outil = constructeur.build(ToolBuildRequest(capability="convertir une duree en minutes"))
+    for duree in ("1h30", "2h", "90 min", "0h45"):
+        try:
+            outil(duree=duree)
+        except ToolError:
+            pass
+    _afficher(constructeur, "convertir_duree")
+    rates = constructeur.calls("convertir_duree", failed=True)
+    print(f"\n  Les entrees a reprendre : {[a['args']['duree'] for a in rates]}")
+    print("  Sans le carnet on savait « 1 erreur » ; avec, on sait laquelle - de quoi corriger l'outil.")
+
+
+def partie_2(dossier: Path) -> None:
+    print()
+    print("=" * 78)
+    print("2) Une fonction de l'hote refusee par la politique n'est pas un defaut de l'outil")
+    print("=" * 78)
+
+    def lire_fiche(client: str) -> dict:
+        """La fiche d'un client."""
+        return {"ville": "Lyon"}
+
+    DynamicToolBuilder(Scripte([_outil("ville_du_client", "La ville d'un client.", CODE_FICHE, "client")]),
+                       tools_dir=dossier, persist=True, host_functions={"lire_fiche": lire_fiche}
+                       ).build(ToolBuildRequest(capability="la ville d'un client"))
+
+    constructeur = DynamicToolBuilder(Scripte([]), tools_dir=dossier, persist=True, record_calls=20, retire_after_errors=2)
+    agent = Agent(Scripte([_appel(1, "ville_du_client", client="C-17"), _appel(2, "ville_du_client", client="C-18"),
+                           _appel(3, "ville_du_client", client="C-19")]),
+                  max_steps=5,
+                  # La politique de l'hote : les fiches ne se lisent pas depuis du code ecrit par le modele.
+                  tool_policy=lambda ctx: "fiches interdites aux outils generes" if ctx.call.name == "lire_fiche" else None)
+    agent.enable_dynamic_tools(constructeur, host_functions={"lire_fiche": lire_fiche})
+    agent.run("Dans quelle ville sont les clients C-17, C-18 et C-19 ?")
+    _afficher(constructeur, "ville_du_client")
+    print("\n  Trois refus, retire_after_errors=2 : l'outil n'est PAS retire. Le refus vient de la politique de")
+    print("  l'hote (issue « host »), pas du code de l'outil. Avant, il aurait ete retire au deuxieme appel.")
+
+
+def partie_3(dossier: Path) -> None:
+    print()
+    print("=" * 78)
+    print("3) Le carnet garde ce que l'outil recoit : redact= passe avant toute ecriture")
+    print("=" * 78)
+    code = "def run(args, context):\n    return {'bonjour': args['nom'].upper()}\n"
+
+    def masquer(valeur: Any) -> Any:
+        """La pseudonymisation de l'hote (ici : un seul nom, pour l'exemple)."""
+        return json.loads(json.dumps(valeur, ensure_ascii=False).replace("Dupont", "<NOM>").replace("DUPONT", "<NOM>"))
+
+    constructeur = DynamicToolBuilder(Scripte([_outil("saluer", "Salue quelqu'un.", code, "nom")]),
+                                      tools_dir=dossier, persist=True, record_calls=20, redact=masquer)
+    outil = constructeur.build(ToolBuildRequest(capability="saluer"))
+    print("  l'outil, lui, voit tout :", outil(nom="Dupont"))
+    (appel,) = constructeur.calls("saluer")
+    print("  le carnet garde         :", {"args": appel["args"], "result": appel["result"], "redacted": appel["redacted"]})
+    sur_disque = (dossier / "saluer.calls.jsonl").read_text(encoding="utf-8")
+    print("  « Dupont » sur le disque :", "oui" if "upont" in sur_disque.lower().replace("<nom>", "") else "non")
+
+
+if __name__ == "__main__":
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        partie_1(Path(tmp) / "a")
+        partie_2(Path(tmp) / "b")
+        partie_3(Path(tmp) / "c")
+    print("\n  Limite : le carnet voit ce que l'outil REND. Un outil qui avale ses erreurs, ou qui rend un")
+    print("  resultat faux, apparait « ok » - le voir demande le verdict de l'hote (la fiche de qualite, a venir).")
+    print("  Et une mauvaise entree que l'outil refuse A RAISON compte comme un defaut de l'outil : vu sur un vrai")
+    print("  modele, trois dates mal ecrites de suite ont fait retirer un outil juste. A traiter par la mesure de qualite.")

@@ -1791,7 +1791,7 @@ python -m autoagent.approval reject  ./dynamic_tools/foo.py [--to ./rejected]
 **Bibliothèque persistante** — `DynamicToolBuilder(provider, tools_dir=…, persist=True)`. Chaque
 outil accepté est inscrit dans `tools_dir/catalogue.json` (écriture atomique, fichier illisible
 mis de côté en `.corrompu-<date>`) : `sha256` du fichier, date, description, permissions,
-`calls`, `errors`, `consecutive_errors`, `retired`. Au démarrage, `enable_dynamic_tools` appelle
+`calls`, `errors`, `consecutive_errors`, `unattributed_failures`, `retired`. Au démarrage, `enable_dynamic_tools` appelle
 `builder.load_library()` et ne recharge un outil **que si** : il n'est pas retiré ; son fichier
 existe et son sha256 est celui noté à la validation (un fichier modifié depuis n'est **pas**
 rechargé, jamais « re-validé en silence ») ; l'AST l'accepte encore ; ses permissions tiennent
@@ -1799,7 +1799,7 @@ sous le plafond `allowed_permissions` **actuel** ; son nom n'est pas celui d'un 
 Les fichiers sans entrée au catalogue (provenance inconnue) sont ignorés. Les outils rechargés
 sont marqués dynamiques et **ne comptent pas** dans `max_dynamic_tools_per_run` (rien n'est construit).
 `retire_after_errors=3` erreurs de suite retirent l'outil du *rechargement* (le run en cours
-n'est pas perturbé) ; `builder.retire(nom, raison)` le fait à la main ; `builder.catalogue()`
+n'est pas perturbé ; seuls les défauts de l'OUTIL comptent, pas un refus de l'hôte ni une panne du bac — §11.10) ; `builder.retire(nom, raison)` le fait à la main ; `builder.catalogue()`
 rend une copie à afficher. Honnêteté : le sha256 protège de la dérive et des écritures partielles,
 **pas** de quelqu'un qui peut écrire dans `tools_dir` (il pourrait aussi réécrire le catalogue) —
 pour cela, l'approbation par manifeste (§11.6). Un seul processus écrivain par `tools_dir`.
@@ -1896,6 +1896,76 @@ jetons (98,7 %) », chiffre d'un exemple illustratif d'Anthropic (« Code execut
 (« renvoie EXACTEMENT la valeur de la fonction ») a fait passer de 14 329 à 8 216 jetons — réglage
 fait **après** avoir vu les erreurs sur les mêmes tâches, donc optimiste. Un seul modèle, des tâches
 jouets : une direction à valider, pas un résultat général.
+
+### 11.10 Surveiller un outil créé — le carnet d'appels *(sur `main`, non publié)*
+
+Le but des outils dynamiques n'est pas seulement que l'agent écrive l'outil qui lui manque : c'est qu'on puisse
+SURVEILLER ces outils, MESURER leur qualité et APPRENDRE de leurs erreurs. Première marche : savoir ce qui s'est
+passé. Jusqu'ici la bibliothèque ne gardait d'un outil que des compteurs et le dernier message d'erreur — ni sur
+quoi il avait échoué, ni combien de temps il mettait, ni si l'échec venait de lui.
+
+```python
+constructeur = DynamicToolBuilder(provider, tools_dir="outils", persist=True,
+                                  record_calls=50)          # défaut 0 : rien n'est écrit
+agent.enable_dynamic_tools(constructeur)
+...
+for appel in constructeur.calls("convertir_duree", failed=True):       # les appels ratés, du plus ancien au plus récent
+    print(appel["kind"], appel["args"], appel["error"])
+```
+
+`record_calls=N` garde les N derniers appels de chaque outil de la bibliothèque dans `tools_dir/<nom>.calls.jsonl` :
+
+| champ | sens |
+|---|---|
+| `id`, `ts`, `version` | un identifiant, l'heure (UTC), le début du sha256 du code qui a tourné |
+| `ok`, `kind` | l'issue : `ok`, `exception` (l'outil a planté), `timeout`, `host` (une fonction de l'hôte a refusé ou échoué), `sandbox` (le bac lui-même a échoué) |
+| `seconds` | la durée vue par l'hôte (démarrage du bac compris) |
+| `args` + `args_sha256` | ce que l'outil a reçu |
+| `result` + `result_sha256` | ce qu'il a rendu (appel réussi) |
+| `error` | le texte de l'erreur, borné à 300 caractères (appel raté) |
+| `tainted` | le run avait-il lu du contenu non fiable (`None` hors d'un run) |
+| `truncated`, `redacted` | les champs trop gros, gardés par leur seule empreinte ; l'entrée est passée par `redact` |
+
+- **L'issue est classée par ce que l'HÔTE a vu**, jamais par le texte de l'erreur, que l'outil choisit : le pont
+  compte de son côté les fonctions de l'hôte refusées (la porte) ou en échec ; un outil qui lève
+  `RuntimeError("ToolPolicyDenied: …")` de lui-même reste une `exception`. Appeler une fonction qui n'est pas dans
+  la liste blanche est un défaut de l'outil (`exception`).
+- **Seuls les défauts de l'outil comptent contre lui** — `exception` et `timeout` allongent `consecutive_errors` et
+  peuvent le faire retirer. `host` et `sandbox` sont comptés à part (`unattributed_failures` au catalogue) et ne
+  touchent pas à la série. **Défaut corrigé** : avant, tout échec comptait — constaté le 13 nov. 2026 sur le code
+  d'avant, deux refus d'une fonction de l'hôte par la politique, ou deux appels pendant une panne du bac (un démon
+  Docker arrêté), RETIRAIENT un outil sain (`retire_after_errors=2`).
+- **Borné** : N appels par outil (le fichier ne dépasse jamais 2 N lignes), `max_record_chars=4000` par valeur
+  (au-delà : l'empreinte seule, et `truncated`).
+- **Données personnelles** : le carnet garde ce que l'outil REÇOIT. Il est donc désactivé par défaut, et
+  `redact=` (une fonction `valeur -> valeur`, par exemple ta pseudonymisation de la démo 12) passe AVANT toute
+  écriture sur les arguments, le résultat et le texte de l'erreur — y compris le `last_error` du catalogue, qui
+  existait déjà. Un `redact` qui plante n'écrit ni valeur ni empreinte (fail-closed) ; l'issue reste notée.
+- **Fail-open** : un carnet qui ne s'écrit pas (disque plein, fichier verrouillé) ne casse jamais un appel ; une
+  ligne coupée par un arrêt brutal est ignorée à la lecture.
+- Les auto-tests de la construction ne sont pas des appels. Reconstruire un outil sous le même nom garde son
+  histoire : chaque entrée porte la `version` qui a tourné.
+- Crochets de `GeneratedPythonTool` : `recorder(appel)` (nouveau, celui que la bibliothèque utilise) ;
+  `observer(nom, ok, erreur)` (0.22.0) garde sa signature et reste libre pour l'hôte — la bibliothèque ne s'en
+  sert plus, donc poser le sien ne coupe plus le comptage.
+
+**Limite à connaître** : le carnet voit ce que l'outil REND. Un outil qui avale ses erreurs (il rend
+`{"error": …}` au lieu de lever) ou qui rend un résultat faux apparaît `ok`. Le voir demandera le verdict de
+l'hôte — c'est la marche suivante (la fiche de qualité).
+
+**Vérifié sur un outil vraiment écrit par un modèle** (`deepseek-chat`, 13 nov. 2026, Windows,
+`require_boundary=True` donc dans Docker ; 5 436 jetons pour deux runs). Le modèle écrit `jours_entre` (deux dates
+AAAA-MM-JJ) ; un premier agent s'en sert deux fois, un second agent le recharge et s'en sert une fois : trois
+entrées `ok`, `tainted: false`, 0,45 à 0,59 s chacune (le conteneur). Appelé ensuite à la main avec une date au
+mauvais format, une date impossible et une chaîne vide, il lève `ValueError` trois fois : trois entrées
+`exception`, avec l'entrée exacte et le texte de l'erreur. **Ce que ce run apprend** : ces trois échecs sont des
+entrées INVALIDES, que l'outil a eu raison de refuser — et ils l'ont fait RETIRER (trois erreurs de suite). Le
+carnet ne distingue pas « l'outil a un bogue » de « on lui a donné une mauvaise entrée » : les deux sont une
+`exception`, et la règle de retrait, qui existait déjà, les compte de la même façon. Les séparer relève de la
+mesure de qualité (la marche suivante). Un seul run, un seul outil : un constat, pas un taux.
+
+**Preuves.** `tests/test_carnet_outils.py` (47 tests) ; 43 mutations du code, toutes attrapées. Démo 42 ;
+constructeur : option « carnet d'appels » du bloc Outils dynamiques.
 
 ---
 

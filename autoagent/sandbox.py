@@ -13,6 +13,7 @@ import subprocess
 import sys
 import sysconfig
 import threading
+import time
 import uuid
 import weakref
 from dataclasses import dataclass, field
@@ -859,6 +860,10 @@ def _drive_bridge(
         except OSError as exc:
             raise _fin_sans_resultat() from exc
 
+    # Combien d'appels à une fonction de l'hôte ont été REFUSÉS (la porte) ou ont ÉCHOUÉ (la fonction a levé).
+    # Compté ici, par l'hôte : le texte d'une erreur est choisi par l'outil, ce compteur non. Un nom hors de la
+    # liste blanche n'y entre pas : appeler une fonction qui n'existe pas est un défaut de l'outil.
+    echecs_hote = 0
     timer = threading.Timer(timeout, _kill)
     timer.start()
     try:
@@ -889,14 +894,18 @@ def _drive_bridge(
                         spec=getattr(fn, "__autoagent_tool_spec__", None))
                     if refus is not None:
                         resp = {"ok": False, "error": f"ToolPolicyDenied: {refus}"}
+                        echecs_hote += 1
                     else:
                         try:
                             resp = {"ok": True, "result": fn(**(msg.get("args") or {}))}
                         except Exception as exc:
                             resp = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                            echecs_hote += 1
                 _ecrire(json.dumps(resp, ensure_ascii=False, default=repr))
             elif kind == "result":
-                return {key: value for key, value in msg.items() if key != "t"}
+                sortie = {key: value for key, value in msg.items() if key != "t"}
+                sortie["host_failures"] = echecs_hote      # posé APRÈS lecture : l'outil ne peut pas l'écrire
+                return sortie
             else:
                 raise ToolError(f"Unknown sandbox protocol message: {kind!r}")
     finally:
@@ -1201,6 +1210,11 @@ class SubprocessSandbox:
         return parsed
 
 
+# Le début de TOUS les messages de délai dépassé que les bacs lèvent eux-mêmes (sous-processus, worker chaud,
+# pont, Docker). Une erreur venue du code de l'outil commence par le nom de son exception, jamais par ceci.
+_DELAI_DEPASSE = "Generated tool timed out"
+
+
 @dataclass
 class GeneratedPythonTool:
     spec: ToolSpec
@@ -1217,6 +1231,12 @@ class GeneratedPythonTool:
     # raison d'un refus. La bibliothèque persistante y refuse un outil en quarantaine hors du
     # run qui l'a construit. Sécurité = fail-CLOSED : un contrôle qui plante refuse.
     admission: "Callable[[str], str | None] | None" = None
+    # Crochet de SURVEILLANCE (main, non publié) : `recorder(appel)` après CHAQUE appel, avec ce que l'outil a
+    # reçu et rendu — `{"name", "ok", "kind", "seconds", "args", "result", "error"}`. `kind` est l'issue classée
+    # par ce que l'HÔTE a vu, jamais par le texte de l'erreur (que l'outil choisit) : `ok`, `exception` (l'outil
+    # a planté), `timeout`, `host` (une fonction de l'hôte a refusé ou échoué), `sandbox` (le bac lui-même a
+    # échoué). La bibliothèque persistante y tient ses compteurs et son carnet. Fail-open comme `observer`.
+    recorder: "Callable[[dict[str, Any]], None] | None" = None
 
     # Lu par le registre : un outil écrit par le modèle ne reçoit PAS le `context`
     # du run (0.22.0). Il partait tel quel dans le bac à sable — l'id utilisateur,
@@ -1242,6 +1262,8 @@ class GeneratedPythonTool:
                 raise ToolError(refus)
         _exiger_la_frontiere(self.sandbox)
         allow_network = "network" in (self.spec.permissions or [])
+        debut = time.monotonic()
+        issue = "sandbox"               # tant que le bac n'a rien rendu, l'échec est le sien
         try:
             result = self.sandbox.run_python_tool(
                 self.file_path,
@@ -1251,12 +1273,29 @@ class GeneratedPythonTool:
                 host_functions=host_functions if host_functions is not None else self.host_functions,
             )
             if not result.get("ok"):
+                issue = "host" if result.get("host_failures") else "exception"
                 raise ToolError(result.get("error") or "Generated tool failed")
         except Exception as exc:
-            self._observer_dit(False, f"{type(exc).__name__}: {exc}")
+            if issue == "sandbox" and str(exc).startswith(_DELAI_DEPASSE):
+                issue = "timeout"
+            erreur = f"{type(exc).__name__}: {exc}"
+            self._observer_dit(False, erreur)
+            self._recorder_dit(issue, kwargs, None, erreur, debut)
             raise
         self._observer_dit(True, None)
+        self._recorder_dit("ok", kwargs, result.get("result"), None, debut)
         return result.get("result")
+
+    def _recorder_dit(self, issue: str, args: dict[str, Any], resultat: Any, erreur: str | None, debut: float) -> None:
+        if self.recorder is None:
+            return
+        try:
+            self.recorder({
+                "name": self.spec.name, "ok": issue == "ok", "kind": issue,
+                "seconds": time.monotonic() - debut, "args": args, "result": resultat, "error": erreur,
+            })
+        except Exception:                                   # fail-open
+            pass
 
     def _observer_dit(self, ok: bool, erreur: str | None) -> None:
         if self.observer is None:

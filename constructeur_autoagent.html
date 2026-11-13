@@ -582,6 +582,7 @@ const DEFS = {
       {k:"repairs", l:"reprises max (max_repairs)", kind:"number", def:"0", w:"half", hint:"un refus (JSON, validateur, self-test faux) est renvoyé au constructeur ; 0 = comme avant. Chaque reprise est un appel payé."},
       {k:"ceil",    l:"permissions que le modèle peut s'accorder (plafond)", kind:"text", def:"", w:"half", hint:"ex. filesystem.*, network — VIDE = aucune. Sans plafond, le modèle choisit lui-même ses droits (réseau compris)."},
       {k:"persist", l:"bibliothèque persistante (réutiliser les outils d'un run à l'autre)", kind:"check", def:false},
+      {k:"carnet",  l:"carnet d'appels : derniers appels gardés par outil (vide = aucun)", kind:"number", def:"", w:"half", hint:"main, non publié — avec la bibliothèque persistante : note ce que chaque outil créé a reçu, l'issue (ok, exception, timeout, host, sandbox), la cause, la durée ; se relit par builder.calls(nom). Seuls les défauts de l'outil comptent contre lui. Le carnet peut contenir des données personnelles : passe redact= dans ton code."},
       {k:"runpy",   l:"ajouter run_python (extrait de code éphémère, jamais gardé)", kind:"check", def:false},
       {k:"manifest", l:"manifest d'approbation (vide = pas de promotion)", kind:"text", def:"", hint:"ex. approved_tools.json — un outil généré tourne en NATIF seulement si son sha256 y est"},
     ],
@@ -1069,6 +1070,7 @@ function generate(){
     for(const r of regles) if(r.err) note("warn", `Politique : condition JSON invalide, ignorée → ${r.err}`);
     if(polApprove || trifApprove) note("ok", "ApprovalRequired est géré : la boucle s'arrête AVANT l'effet de bord et demande à l'humain.");
     if(tools.some(x=>x.f.egress||x.f.untrusted)) note("ok", "audit_trifecta() au démarrage : lint des outils egress / untrusted.");
+    if(dyn && num(dyn.f.carnet,0) > 0 && !dyn.f.persist) note("warn", "Carnet d'appels ignoré : il lui faut la bibliothèque persistante (coche-la dans « Outils dynamiques »).");
     if(sb && sb.f.warm && sb.f.kind!=="SubprocessSandbox")
       note("info", "« sandbox chaud » est ignoré : il ne s'applique qu'au type SubprocessSandbox (Docker lance un conteneur par appel).");
     if(sb && sandboxPlafonds(sb).length && sb.f.kind!=="SubprocessSandbox")
@@ -1352,6 +1354,7 @@ function generate(){
       barg.push(`allowed_permissions=${plafond.length ? "{"+plafond.map(pyStr).join(", ")+"}" : "set()"}`);
       if(num(dyn.f.repairs,0) > 0) barg.push(`max_repairs=${num(dyn.f.repairs,0)}`);
       if(dyn.f.persist) barg.push(`persist=True`);
+      if(dyn.f.persist && num(dyn.f.carnet,0) > 0) barg.push(`record_calls=${num(dyn.f.carnet,0)}`);
       L.push(`    ${barg.join(", ")})`);
       L.push(``);
     }
@@ -1910,6 +1913,14 @@ function generate(){
         L.push(`# L'efficacité lue dans la trace, après coup : appels redondants, refus des gardes,`);
         L.push(`# résultats élagués, jetons par succès. Rien n'a été ajouté au run pour l'obtenir.`);
         L.push(`print(summarize_trace(${pyStr(tr.f.file||"trace.jsonl")}).summary())`);
+      }
+      if(dyn && dyn.f.persist && num(dyn.f.carnet,0) > 0){
+        L.push(``);
+        L.push(`# Le carnet des outils créés : ce que chacun a reçu, l'issue (ok, exception, timeout, host, sandbox)`);
+        L.push(`# et la durée. Seuls les défauts de l'outil (exception, timeout) comptent contre lui.`);
+        L.push(`for _nom in builder.catalogue():`);
+        L.push(`    for _appel in builder.calls(_nom):`);
+        L.push(`        print(f"  [{_appel['kind']}] {_nom}({_appel.get('args')}) en {_appel['seconds']} s")`);
       }
       if(mem && mem.f.kind==="FactMemory" && mem.f.background) L.push(`${mv}.flush()   # consolidation en arrière-plan : on attend qu'elle soit écrite`);
       if(recB && !replay) L.push(`session.close()   # la fixture est complète : rejouable avec ReplaySession`);
@@ -2491,7 +2502,7 @@ const PRESETS = [
   {id:"dynpro", grp:"Outils qui s'écrivent", label:"Outils dynamiques, version pro (reprise, bibliothèque, run_python)", make:()=>[
     mk("agent",{var:"agent",system:"Tu résous des problèmes en créant les outils Python qui te manquent, ou en exécutant un extrait de code pour un calcul ponctuel.",steps:"8",budget:"60000"}),
     mk("sandbox",{var:"bac",kind:"DockerSandbox",timeout:"10",image:"python:3.11-slim"}),
-    mk("dynamic",{dir:"outils_generes",timeout:"10",maxrun:"3",repairs:"2",ceil:"",persist:true,runpy:true}),
+    mk("dynamic",{dir:"outils_generes",timeout:"10",maxrun:"3",repairs:"2",ceil:"",persist:true,carnet:"20",runpy:true}),
     mk("run",{prompt:"Crée un outil qui calcule la distance de haversine entre deux points (rayon 6371 km), puis donne-moi la distance Paris (48.8566, 2.3522) – Lyon (45.7640, 4.8357)."}),
   ]},
   {id:"plafonds", grp:"Outils qui s'écrivent", label:"Sandbox avec plafonds (mémoire, CPU, fichiers — Linux)", make:()=>[

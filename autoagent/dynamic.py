@@ -11,6 +11,7 @@ import re
 import tempfile
 import threading
 import time
+import uuid
 import weakref
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -40,6 +41,25 @@ __all__ = ["DynamicToolBuilder", "PythonRunner", "ToolBuildRequest"]
 _log = get_logger("dynamic")
 
 _CATALOGUE = "catalogue.json"
+
+# Les issues qui comptent CONTRE l'outil (série d'erreurs, retrait). `host` (une fonction de l'hôte a refusé ou
+# échoué) et `sandbox` (le bac lui-même a échoué) ne disent rien du code de l'outil : comptées à part.
+_ISSUES_DE_L_OUTIL = frozenset({"exception", "timeout"})
+
+
+def _json_canonique(valeur: Any) -> str:
+    """La forme sous laquelle une valeur est gardée et empreintée au carnet : clés triées, sans espaces."""
+    return json.dumps(valeur, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=repr)
+
+
+def _teinte_du_run() -> bool | None:
+    """Le run qui appelle l'outil a-t-il ingéré du contenu non fiable ? `None` hors de tout run. Une lecture
+    qui plante : on suppose teinté (comme `_provenance_du_run`)."""
+    from .gate import run_taint
+    try:
+        return run_taint()
+    except Exception:
+        return True
 
 
 class _PermissionRefusee(ToolValidationError):
@@ -272,8 +292,20 @@ class DynamicToolBuilder:
         retire_after_errors: int = 3,
         self_test_rel_tol: float = 1e-6,
         host_functions: dict[str, Callable[..., Any]] | None = None,
+        record_calls: int = 0,
+        redact: Callable[[Any], Any] | None = None,
+        max_record_chars: int = 4000,
     ) -> None:
-        """``host_functions`` (0.22.0) : callbacks de l'HÔTE que les outils générés
+        """``record_calls`` (main, non publié) : le CARNET d'appels. Les ``N`` derniers appels de chaque outil de
+        la bibliothèque sont gardés dans ``tools_dir/<nom>.calls.jsonl`` — ce qu'il a reçu, l'issue (``kind``),
+        la cause, la durée, la version du code, la teinte du run — et relus par ``calls(nom)``. ``0`` (défaut) :
+        rien n'est écrit. Demande ``persist=True``. Le carnet garde ce que l'outil REÇOIT : il peut porter des
+        données personnelles. ``redact`` (une fonction ``valeur -> valeur``) passe AVANT toute écriture sur les
+        arguments, le résultat et le texte de l'erreur (aussi le ``last_error`` du catalogue) ; s'il plante, ni
+        valeur ni empreinte ne sont écrites. ``max_record_chars`` : au-delà, une valeur n'est gardée que par son
+        empreinte. Observabilité : un carnet qui ne s'écrit pas ne casse jamais un appel.
+
+        ``host_functions`` (0.22.0) : callbacks de l'HÔTE que les outils générés
         peuvent appeler — ``context["call_host"]("nom", {"arg": valeur})`` — par le
         pont du bac à sable (il passe par stdin/stdout : marche même sans réseau).
         Liste blanche : un nom absent est refusé, et chaque fonction s'exécute DANS
@@ -336,6 +368,18 @@ class DynamicToolBuilder:
         self.host_functions: dict[str, Callable[..., Any]] | None = dict(host_functions) if host_functions else None
         self.persist = bool(persist)
         self.retire_after_errors = max(0, int(retire_after_errors))
+        if isinstance(record_calls, bool) or not isinstance(record_calls, int) or record_calls < 0:
+            raise ValueError(f"record_calls must be an integer >= 0, got {record_calls!r}")
+        if record_calls and not self.persist:
+            raise ValueError("record_calls needs persist=True: the call log belongs to the persistent library")
+        if isinstance(max_record_chars, bool) or not isinstance(max_record_chars, int) or max_record_chars <= 0:
+            raise ValueError(f"max_record_chars must be an integer > 0, got {max_record_chars!r}")
+        if redact is not None and not callable(redact):
+            raise TypeError("redact must be a callable (value -> value) or None")
+        self.record_calls = record_calls
+        self.redact = redact
+        self.max_record_chars = max_record_chars
+        self._lignes_du_carnet: dict[str, int] = {}     # par outil : lignes du fichier (pour borner sans le relire)
         self._verrou = threading.RLock()        # lecture-modification-écriture du catalogue
         # Provenance : les outils de la bibliothèque que le modèle VOIT dans ce processus
         # (rechargés par `load_library` + construits ici). Un outil en quarantaine n'y est jamais.
@@ -481,7 +525,7 @@ class DynamicToolBuilder:
         generated_tool.host_functions = self.host_functions
         if self.persist:
             self._noter_construction(generated_tool, _provenance_du_run())
-            generated_tool.observer = self._observer
+            generated_tool.recorder = self._noter_appel
             generated_tool.admission = self._admission
         return generated_tool
 
@@ -590,8 +634,10 @@ class DynamicToolBuilder:
 
     def catalogue(self) -> dict[str, dict[str, Any]]:
         """Copie du catalogue de la bibliothèque : par nom d'outil, `sha256`, `created`,
-        `description`, `permissions`, `calls`, `errors`, `consecutive_errors`,
-        `retired` (+ `retired_reason`, `last_error`). Vide sans `persist=True`."""
+        `description`, `permissions`, `calls`, `errors` (les défauts de l'OUTIL : il a planté ou dépassé son
+        délai), `consecutive_errors`, `unattributed_failures` (les échecs qui ne disent rien de son code : une
+        fonction de l'hôte refusée, un bac en panne), `retired` (+ `retired_reason`, `last_error`).
+        Vide sans `persist=True`."""
         with self._verrou:
             copie: dict[str, dict[str, Any]] = json.loads(json.dumps(self._lire_catalogue()))
             return copie
@@ -612,7 +658,7 @@ class DynamicToolBuilder:
                 "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "description": outil.spec.description,
                 "permissions": list(outil.spec.permissions or []),
-                "calls": 0, "errors": 0, "consecutive_errors": 0, "retired": False,
+                "calls": 0, "errors": 0, "consecutive_errors": 0, "unattributed_failures": 0, "retired": False,
                 "provenance": provenance,
             }
             if provenance.get("tainted"):
@@ -633,8 +679,13 @@ class DynamicToolBuilder:
             outils[nom] = entree
             self._ecrire_catalogue(outils)
 
-    def _observer(self, nom: str, ok: bool, erreur: str | None) -> None:
-        """Compte chaque appel d'un outil de la bibliothèque ; retire celui qui échoue de suite."""
+    def _noter_appel(self, appel: dict[str, Any]) -> None:
+        """Après CHAQUE appel d'un outil de la bibliothèque (`GeneratedPythonTool.recorder`) : les compteurs du
+        catalogue, puis le carnet. Seul un défaut de l'OUTIL (`exception`, `timeout`) allonge la série d'erreurs
+        et peut le faire retirer : avant, une fonction de l'hôte refusée par la politique ou un bac en panne
+        (un démon Docker arrêté) retiraient un outil sain au bout de `retire_after_errors` appels."""
+        nom, ok, issue = str(appel.get("name")), bool(appel.get("ok")), str(appel.get("kind"))
+        masque = self._masquer(appel)
         with self._verrou:
             outils = self._lire_catalogue()
             entree = outils.get(nom)
@@ -643,16 +694,120 @@ class DynamicToolBuilder:
             entree["calls"] = int(entree.get("calls") or 0) + 1
             if ok:
                 entree["consecutive_errors"] = 0
-            else:
+            elif issue in _ISSUES_DE_L_OUTIL:
                 entree["errors"] = int(entree.get("errors") or 0) + 1
                 entree["consecutive_errors"] = int(entree.get("consecutive_errors") or 0) + 1
-                entree["last_error"] = (erreur or "")[:300]
+                entree["last_error"] = (masque["error"] or "")[:300]
                 limite = self.retire_after_errors
                 if limite and entree["consecutive_errors"] >= limite and not entree.get("retired"):
                     entree["retired"] = True
                     entree["retired_reason"] = f"{entree['consecutive_errors']} consecutive errors"
                     _log.warning("generated tool %r retired from the library (%s)", nom, entree["retired_reason"])
+            else:
+                entree["unattributed_failures"] = int(entree.get("unattributed_failures") or 0) + 1
             self._ecrire_catalogue(outils)
+            if self.record_calls:
+                self._ecrire_au_carnet(nom, self._ligne_du_carnet(appel, masque, str(entree.get("sha256") or "")[:12]))
+
+    def _masquer(self, appel: dict[str, Any]) -> dict[str, Any]:
+        """Ce qui peut porter une donnée — arguments, résultat, texte de l'erreur — passé par `redact`.
+        Un `redact` qui plante ne laisse RIEN passer (fail-closed) : ni valeur, ni empreinte, ni texte."""
+        args, resultat, erreur = appel.get("args"), appel.get("result"), appel.get("error")
+        if self.redact is None:
+            return {"args": args, "result": resultat, "error": erreur, "redacted": None}
+        try:
+            return {
+                "args": self.redact(args),
+                "result": None if resultat is None else self.redact(resultat),
+                "error": None if erreur is None else str(self.redact(erreur)),
+                "redacted": True,
+            }
+        except Exception as exc:
+            # Le type seulement : le message d'une exception de `redact` peut citer la donnée qu'il devait masquer.
+            _log.warning("redact raised %s; the call is recorded without its data", type(exc).__name__)
+            return {"args": None, "result": None, "error": None, "redacted": "failed"}
+
+    def _ligne_du_carnet(self, appel: dict[str, Any], masque: dict[str, Any], version: str) -> str:
+        entree: dict[str, Any] = {
+            "id": uuid.uuid4().hex[:12],
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "version": version,
+            "ok": bool(appel.get("ok")),
+            "kind": str(appel.get("kind")),
+            "seconds": round(float(appel.get("seconds") or 0.0), 3),
+            "tainted": _teinte_du_run(),
+        }
+        if masque["redacted"] is not None:
+            entree["redacted"] = masque["redacted"]
+        if masque["redacted"] != "failed":
+            champs = [("args", masque["args"])] + ([("result", masque["result"])] if entree["ok"] else [])
+            tronques: list[str] = []
+            for cle, valeur in champs:
+                texte = _json_canonique(valeur)
+                entree[f"{cle}_sha256"] = hashlib.sha256(texte.encode("utf-8")).hexdigest()
+                if len(texte) <= self.max_record_chars:
+                    entree[cle] = json.loads(texte)         # gardé sous la forme empreintée
+                else:
+                    tronques.append(cle)
+            if tronques:
+                entree["truncated"] = tronques
+            if not entree["ok"] and masque["error"]:
+                entree["error"] = str(masque["error"])[:300]
+        return json.dumps(entree, ensure_ascii=False)
+
+    def _chemin_du_carnet(self, nom: str) -> Path:
+        return self.tools_dir / f"{nom}.calls.jsonl"
+
+    def _ecrire_au_carnet(self, nom: str, ligne: str) -> None:
+        """Ajoute une ligne ; au-delà de 2 N lignes, ne garde que les N dernières (réécriture atomique).
+        Appelé sous le verrou. Fail-open : un carnet qui ne s'écrit pas ne casse jamais un appel."""
+        chemin = self._chemin_du_carnet(nom)
+        try:
+            lignes = self._lignes_du_carnet.get(nom)
+            if lignes is None:
+                lignes = len(chemin.read_text(encoding="utf-8").splitlines()) if chemin.is_file() else 0
+            with chemin.open("a", encoding="utf-8", newline="\n") as fh:
+                fh.write(ligne + "\n")
+            lignes += 1
+            if lignes > 2 * self.record_calls:
+                gardees = chemin.read_text(encoding="utf-8").splitlines()[-self.record_calls:]
+                atomic_write_text(chemin, "\n".join(gardees) + "\n")
+                lignes = len(gardees)
+            self._lignes_du_carnet[nom] = lignes
+        except (OSError, ValueError):
+            warn_once(_log, f"dynamic.carnet.{nom}",
+                      f"could not write the call log of generated tool {nom!r} ({chemin}); calls go on unrecorded")
+
+    def calls(self, name: str, *, failed: bool | None = None, limit: int | None = None) -> list[dict[str, Any]]:
+        """Le carnet d'un outil de la bibliothèque, du plus ancien au plus récent (`record_calls=N`).
+
+        Chaque appel : `id`, `ts`, `version` (début du sha256 du code qui a tourné), `ok`, `kind` (`ok`,
+        `exception`, `timeout`, `host`, `sandbox`), `seconds`, `tainted` (le run avait-il lu du contenu non
+        fiable ; `None` hors d'un run), `args` + `args_sha256`, `result` + `result_sha256` (appel réussi),
+        `error` (appel raté), `truncated` (les champs trop gros, gardés par leur seule empreinte), `redacted`
+        (`True` : passé par `redact` ; `"failed"` : `redact` a planté, aucune donnée n'a été écrite).
+        `failed=True` / `False` ne rend que les ratés / les réussis ; `limit` les derniers. Un nom qui n'est
+        pas au catalogue rend une liste vide."""
+        with self._verrou:
+            if name not in self._lire_catalogue():
+                return []
+            try:
+                lignes = self._chemin_du_carnet(name).read_text(encoding="utf-8").splitlines()
+            except (OSError, ValueError):
+                return []
+        appels: list[dict[str, Any]] = []
+        for ligne in lignes:
+            try:
+                entree = json.loads(ligne)
+            except ValueError:
+                continue                                    # une ligne coupée par un arrêt brutal
+            if isinstance(entree, dict):
+                appels.append(entree)
+        if self.record_calls:
+            appels = appels[-self.record_calls:]
+        if failed is not None:
+            appels = [a for a in appels if (not a.get("ok")) is bool(failed)]
+        return appels[-limit:] if limit else appels
 
     def descendants(self, name: str) -> list[str]:
         """Les outils construits APRÈS ``name`` dans un run où il était visible (transitif).
@@ -785,7 +940,7 @@ class DynamicToolBuilder:
             if outil.spec.name != nom:
                 _log.warning("library tool %r declares another name (%r); skipped", nom, outil.spec.name)
                 continue
-            outil.observer = self._observer
+            outil.recorder = self._noter_appel
             outil.admission = self._admission
             outil.host_functions = self.host_functions
             self._visibles.add(nom)
