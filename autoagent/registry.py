@@ -86,7 +86,9 @@ class RegisteredTool:
         if self.spec.input_schema:
             errors = validate(args, self.spec.input_schema)
             if errors:
-                return ToolResult(ok=False, error=format_errors(errors))
+                message = format_errors(errors)
+                _signaler_le_refus(self.handler, args, message)
+                return ToolResult(ok=False, error=message)
 
         try:
             if self._wants_context:
@@ -98,6 +100,19 @@ class RegisteredTool:
             return ToolResult(ok=True, result=value)
         except Exception as exc:
             return ToolResult(ok=False, error=f"{type(exc).__name__}: {exc}")
+
+
+def _signaler_le_refus(handler: Any, args: Any, message: str) -> None:
+    """Un outil peut vouloir SAVOIR que son schéma d'entrée a refusé un appel avant qu'il tourne : s'il porte
+    `__autoagent_rejected__(args, message)`, il est prévenu (la bibliothèque d'outils créés par le modèle le note
+    à son carnet). Observabilité : un crochet qui plante ne change rien au refus."""
+    crochet = getattr(handler, "__autoagent_rejected__", None)
+    if crochet is None:
+        return
+    try:
+        crochet(args, message)
+    except Exception:                                       # fail-open
+        pass
 
 
 def _run_awaitable(awaitable: Any) -> Any:

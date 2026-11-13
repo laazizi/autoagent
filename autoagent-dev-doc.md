@@ -1791,7 +1791,7 @@ python -m autoagent.approval reject  ./dynamic_tools/foo.py [--to ./rejected]
 **Bibliothèque persistante** — `DynamicToolBuilder(provider, tools_dir=…, persist=True)`. Chaque
 outil accepté est inscrit dans `tools_dir/catalogue.json` (écriture atomique, fichier illisible
 mis de côté en `.corrompu-<date>`) : `sha256` du fichier, date, description, permissions,
-`calls`, `errors`, `consecutive_errors`, `unattributed_failures`, `retired`. Au démarrage, `enable_dynamic_tools` appelle
+`calls`, `errors`, `consecutive_errors`, `unattributed_failures`, `rejected_calls`, `verified_by`, `retired`. Au démarrage, `enable_dynamic_tools` appelle
 `builder.load_library()` et ne recharge un outil **que si** : il n'est pas retiré ; son fichier
 existe et son sha256 est celui noté à la validation (un fichier modifié depuis n'est **pas**
 rechargé, jamais « re-validé en silence ») ; l'AST l'accepte encore ; ses permissions tiennent
@@ -1966,6 +1966,73 @@ mesure de qualité (la marche suivante). Un seul run, un seul outil : un constat
 
 **Preuves.** `tests/test_carnet_outils.py` (47 tests) ; 43 mutations du code, toutes attrapées. Démo 42 ;
 constructeur : option « carnet d'appels » du bloc Outils dynamiques.
+
+### 11.11 Mesurer un outil créé — la fiche de qualité *(sur `main`, non publié)*
+
+Le carnet (§11.10) dit ce qui s'est passé. Il ne dit pas ce que VAUT l'outil : il ne voit ni un résultat faux qui
+ne plante pas, ni une mauvaise entrée refusée à raison, ni un appel que le schéma a refusé avant que l'outil
+tourne — et rien ne disait comment l'outil avait été vérifié avant d'être gardé. Trois responsabilités restent
+séparées : le modèle CRÉE, du code VÉRIFIE et mesure, l'hôte JUGE et autorise.
+
+```python
+juste, faux, refus = constructeur.calls("moyenne")          # trois appels du carnet (§11.10)
+constructeur.report("moyenne", faux["id"], correct=False,   # le VERDICT DE L'HÔTE : un résultat faux qui n'a pas planté
+                    reason="la moyenne de 10, 20, 30 est 20", expected={"moyenne": 20})
+constructeur.report("moyenne", refus["id"], correct=True, reason="liste vide : refus attendu")
+
+fiche = constructeur.health("moyenne")                      # ToolHealth ; health_all() pour toute la bibliothèque
+print(fiche.summary())                                      # ci-dessous : la sortie réelle de la démo 42 (partie 4)
+#   moyenne — actif · version 3b2831d3239c · jamais vérifié
+#     1 défaut sur 3 appels jugés (33 %, intervalle à 95 % : 6 % à 79 %) · durée médiane 0.30 s
+#     issues (carnet, 3 appels) : 2 ok, 1 exception
+#     verdicts de l'hôte : 1 « correct », 1 « faux »
+#     1 fois : la moyenne de 10, 20, 30 est 20   (ex. {"valeurs": [10, 20, 30]})
+
+constructeur.reinstate("moyenne")                           # remettre un outil retiré : seul l'hôte le fait
+```
+
+- **L'origine des tests est écrite** (`verified_by`, au catalogue et sur l'outil) : `{"kind": "none"}` — un outil
+  peut être gardé sans AUCUN test, les auto-tests sont facultatifs ; `"self_tests"` + `cases` — écrits par le
+  modèle qui a écrit l'outil (cinq exécutés au plus) ; `"examples"` + `shown` / `hidden` — des cas de l'hôte dont
+  une part cachée (`synthesize_tool`) ; `"unknown"` pour un catalogue d'avant. Le résumé le dit en clair
+  (« jamais vérifié », « 2 auto-tests écrits par le modèle », « 10 exemples de l'hôte, dont 4 cachés »).
+- **Les appels refusés par le schéma d'entrée sont notés** (`kind: "rejected"`, compteur `rejected_calls`) : le
+  registre prévient tout outil qui porte `__autoagent_rejected__(args, message)`. Ce n'est ni une exécution, ni
+  un défaut du code, ni une réussite : la série d'erreurs ne bouge pas. Avant, un modèle qui appelait mal l'outil
+  — ou un schéma trop strict — ne laissait aucune trace sur l'outil.
+- **Le verdict de l'hôte** (`report(nom, id, correct=…, reason=, expected=)`) : c'est l'hôte qui juge, pas le
+  modèle. `correct=False` : un résultat faux, un échec sur une entrée valide, un refus du schéma à tort ;
+  `expected` peut donner ce qu'il fallait rendre. `correct=True` : le résultat est juste, ou l'échec était
+  légitime. Le verdict est écrit sur l'appel, PRIME sur l'issue dans la fiche, et un nouveau remplace l'ancien.
+  `reason` et `expected` passent par `redact` et sont bornés. Il ne change ni les compteurs ni le statut.
+- **La fiche** (`ToolHealth`) : `status`, `version`, `verified_by` ; `outcomes` (les appels par issue) ;
+  `judged` / `defects` / `defect_rate` et son intervalle de Wilson à 95 % — un appel est JUGÉ s'il dit quelque
+  chose de l'outil (`ok`, `exception`, `timeout`, ou tout appel qui porte un verdict) ; les échecs de l'hôte, du
+  bac et du schéma n'entrent pas dans le taux ; `median_seconds` ; `errors_seen` (les défauts regroupés : deux
+  erreurs qui ne diffèrent que par une valeur sont la même, avec le dernier exemple d'entrée) ; `verdicts` ;
+  `versions` (par version du code). Sans carnet, la fiche se calcule sur les compteurs du catalogue (`basis`).
+- **`reinstate(nom)`** remet un outil retiré (il se recharge au prochain `load_library`). Il ne lève pas une
+  quarantaine : c'est une décision de sécurité, qui se lève par `release`, empreinte en main.
+- Les passes d'exemples de `synthesize_tool` ne sont plus des appels (ni compteurs ni carnet), comme les
+  auto-tests : elles pouvaient faire RETIRER, pendant sa synthèse, un outil qui ratait trois cas de suite.
+
+**Limites.** Le taux est celui des appels du carnet : avec peu d'appels, l'intervalle est large — il est affiché
+pour cela. Sans verdict de l'hôte, un résultat faux reste `ok` et un refus légitime reste un défaut : la
+bibliothèque ne peut pas le deviner. Le retrait automatique (trois erreurs de suite) ne lit pas les verdicts.
+
+**Vérifié sur un outil vraiment écrit par un modèle** (`deepseek-chat`, 13 nov. 2026, Windows, dans Docker ;
+5 316 jetons pour deux runs). Le modèle écrit `jours_entre` avec cinq auto-tests : la fiche dit « 5 auto-tests
+écrits par le modèle ». Deux agents s'en servent trois fois ; un appel du mauvais type (un entier au lieu d'une
+date) est refusé par le schéma et noté `rejected` ; trois entrées invalides (mauvais format, date impossible,
+chaîne vide) lèvent `ValueError` et font retirer l'outil. La fiche, avant tout verdict : « 3 défauts sur 6 appels
+jugés (50 %, intervalle à 95 % : 19 % à 81 %) », les erreurs regroupées en deux lignes avec l'entrée qui les
+montre. L'hôte juge les trois refus légitimes (`report(correct=True)`) : « 0 défaut sur 6 appels jugés (0 %,
+intervalle à 95 % : 0 % à 39 %) ». `reinstate` : l'outil redevient `active` et se recharge. Le cas constaté au
+§11.10 — un outil juste retiré pour de mauvaises entrées — a donc une issue, mais elle passe par l'hôte : la
+bibliothèque ne devine pas qu'un refus était légitime. Un seul run, un seul outil : un constat, pas un taux.
+
+**Preuves.** `tests/test_fiche_outils.py` (44 tests) ; 45 mutations du code, toutes attrapées. Démo 42
+(partie 4) ; le preset « Outils dynamiques, version pro » du constructeur affiche la fiche après le run.
 
 ---
 
@@ -2454,6 +2521,7 @@ from autoagent.redteam import run_persistence_bench                         # 0.
 from autoagent.gate import run_taint, note_untrusted_read                   # 0.27.0 — provenance des données au repos (§48)
 from autoagent.gate import delegation_taint                                 # 0.25.0 — la teinte qui descend (§46)
 from autoagent.webfetch import http_fetch_tool                             # main (non publié) — lecture web par l'hôte (§49.2)
+from autoagent.dynamic import ToolHealth                                   # main (non publié) — la fiche de qualité d'un outil créé (§11.11)
 ```
 
 ### Annexe C — Cheat-sheet

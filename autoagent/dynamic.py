@@ -8,6 +8,7 @@ import json
 import math
 import pprint
 import re
+import statistics
 import tempfile
 import threading
 import time
@@ -36,7 +37,7 @@ from .sandbox import (
 )
 from .schema import LLMRequest, Message, TokenUsage
 
-__all__ = ["DynamicToolBuilder", "PythonRunner", "ToolBuildRequest"]
+__all__ = ["DynamicToolBuilder", "PythonRunner", "ToolBuildRequest", "ToolHealth"]
 
 _log = get_logger("dynamic")
 
@@ -50,6 +51,119 @@ _ISSUES_DE_L_OUTIL = frozenset({"exception", "timeout"})
 def _json_canonique(valeur: Any) -> str:
     """La forme sous laquelle une valeur est gardée et empreintée au carnet : clés triées, sans espaces."""
     return json.dumps(valeur, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=repr)
+
+
+_ABSENT: Any = object()                                    # « argument non donné », quand `None` est une valeur
+_VARIABLE = re.compile(r"'[^']*'|\"[^\"]*\"|-?\d+(?:\.\d+)?")   # ce qui change d'une erreur à l'autre
+
+
+def _signature(erreur: str) -> str:
+    """Deux erreurs qui ne diffèrent que par une valeur (« negatif : -1 », « negatif : -22 ») sont la même."""
+    premiere = erreur.splitlines()[0] if erreur else ""
+    return _VARIABLE.sub("…", premiere)[:160]
+
+
+def _jugement(appel: dict[str, Any]) -> bool | None:
+    """Cet appel montre-t-il un DÉFAUT de l'outil ? `True` oui, `False` non, `None` : il ne dit rien de l'outil.
+    Le verdict de l'hôte prime ; sans lui, l'issue : `ok` non, `exception` / `timeout` oui, le reste (`host`,
+    `sandbox`, `rejected`) ne dit rien."""
+    verdict = appel.get("verdict")
+    if isinstance(verdict, dict) and isinstance(verdict.get("correct"), bool):
+        return not verdict["correct"]
+    issue = appel.get("kind")
+    if issue == "ok":
+        return False
+    return True if issue in _ISSUES_DE_L_OUTIL else None
+
+
+def _origine_des_tests(verified_by: dict[str, Any]) -> str:
+    sorte = verified_by.get("kind")
+    if sorte == "none":
+        return "jamais vérifié"
+    if sorte == "self_tests":
+        n = int(verified_by.get("cases") or 0)
+        return f"{n} auto-test écrit par le modèle" if n == 1 else f"{n} auto-tests écrits par le modèle"
+    if sorte == "examples":
+        montres, caches = int(verified_by.get("shown") or 0), int(verified_by.get("hidden") or 0)
+        return f"{montres + caches} exemples de l'hôte, dont {caches} cachés au modèle"
+    return "vérification inconnue"
+
+
+@dataclass(frozen=True)
+class ToolHealth:
+    """La fiche de qualité d'un outil créé par le modèle (`DynamicToolBuilder.health`, main, non publié).
+
+    Attributes:
+        name, status: le nom ; `"active"`, `"retired"` ou `"quarantined"`.
+        version, created: le début du sha256 du code courant ; sa date de construction.
+        verified_by: d'où viennent ses tests — `{"kind": "none"}`, `"self_tests"` (+ `cases`), `"examples"`
+            (+ `shown`, `hidden`), `"unknown"` (un catalogue d'avant).
+        calls, errors, unattributed_failures, rejected_calls: les compteurs du catalogue, depuis la construction
+            de la version courante (`errors` : les défauts de l'outil ; non attribués : hôte, bac ; refusés : schéma).
+        basis: `"call log"` (les chiffres ci-dessous viennent du carnet) ou `"catalogue"` (pas de carnet).
+        window: appels du carnet pris en compte (0 sans carnet).
+        outcomes: appels de la fenêtre, par issue.
+        judged, defects: appels qui disent quelque chose de l'outil, et ceux qui montrent un DÉFAUT — le verdict
+            de l'hôte (`report`) prime ; sinon `exception` et `timeout`.
+        defect_rate, defect_interval: `defects / judged` et son intervalle de Wilson à 95 % (`None` sans appel jugé).
+        median_seconds: durée médiane d'une exécution, vue par l'hôte.
+        errors_seen: les défauts regroupés — `{"error", "count", "example_args", "last_id"}`, du plus fréquent.
+        verdicts: verdicts de l'hôte dans la fenêtre — `{"correct": n, "wrong": n}`.
+        versions: par version vue dans la fenêtre — `{"judged": n, "defects": n}`.
+    """
+
+    name: str
+    status: str
+    version: str
+    created: str
+    verified_by: dict[str, Any]
+    calls: int
+    errors: int
+    unattributed_failures: int
+    rejected_calls: int
+    basis: str
+    window: int
+    outcomes: dict[str, int]
+    judged: int
+    defects: int
+    defect_rate: float | None
+    defect_interval: tuple[float, float] | None
+    median_seconds: float | None
+    errors_seen: list[dict[str, Any]]
+    verdicts: dict[str, int]
+    versions: dict[str, dict[str, int]]
+
+    def to_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    def summary(self) -> str:
+        statut = {"active": "actif", "retired": "retiré", "quarantined": "en quarantaine"}.get(self.status, self.status)
+        lignes = [f"{self.name} — {statut} · version {self.version or '?'} · {_origine_des_tests(self.verified_by)}"]
+        if self.judged and self.defect_rate is not None and self.defect_interval is not None:
+            bas, haut = self.defect_interval
+            mot = "défaut" if self.defects <= 1 else "défauts"
+            juges = "appel jugé" if self.judged == 1 else "appels jugés"
+            ligne = (f"  {self.defects} {mot} sur {self.judged} {juges} ({self.defect_rate * 100:.0f} %, intervalle à "
+                     f"95 % : {bas * 100:.0f} % à {haut * 100:.0f} %)")
+            if self.median_seconds is not None:
+                ligne += f" · durée médiane {self.median_seconds:.2f} s"
+            lignes.append(ligne)
+        else:
+            lignes.append("  aucun appel qui dise quelque chose de l'outil")
+        source = "carnet" if self.basis == "call log" else "catalogue seul (pas de carnet)"
+        if self.outcomes:
+            detail = ", ".join(f"{n} {issue}" for issue, n in sorted(self.outcomes.items(), key=lambda p: (-p[1], p[0])))
+            lignes.append(f"  issues ({source}, {self.window} appels) : {detail}")
+        else:
+            lignes.append(f"  source : {source} · {self.calls} exécutions, {self.unattributed_failures} échecs non "
+                          f"attribués, {self.rejected_calls} appels refusés par le schéma")
+        if self.verdicts.get("correct") or self.verdicts.get("wrong"):
+            lignes.append(f"  verdicts de l'hôte : {self.verdicts.get('correct', 0)} « correct », "
+                          f"{self.verdicts.get('wrong', 0)} « faux »")
+        for vue in self.errors_seen[:5]:
+            exemple = "" if vue.get("example_args") is None else f"   (ex. {json.dumps(vue['example_args'], ensure_ascii=False)[:80]})"
+            lignes.append(f"  {vue['count']} fois : {str(vue['error'])[:110]}{exemple}")
+        return "\n".join(lignes)
 
 
 def _teinte_du_run() -> bool | None:
@@ -577,6 +691,9 @@ class DynamicToolBuilder:
         except Exception:
             discard_generated_tool(file_path)
             raise
+        # L'origine des tests est ÉCRITE : aucun, ou ceux que le modèle a fournis lui-même (5 exécutés au plus).
+        executes = len(tests[:5]) if isinstance(tests, list) else 0
+        generated_tool.verified_by = {"kind": "self_tests", "cases": executes} if executes else {"kind": "none"}
         return generated_tool
 
     @staticmethod
@@ -658,7 +775,9 @@ class DynamicToolBuilder:
                 "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "description": outil.spec.description,
                 "permissions": list(outil.spec.permissions or []),
-                "calls": 0, "errors": 0, "consecutive_errors": 0, "unattributed_failures": 0, "retired": False,
+                "calls": 0, "errors": 0, "consecutive_errors": 0, "unattributed_failures": 0,
+                "rejected_calls": 0, "retired": False,
+                "verified_by": dict(outil.verified_by or {"kind": "none"}),
                 "provenance": provenance,
             }
             if provenance.get("tainted"):
@@ -691,10 +810,15 @@ class DynamicToolBuilder:
             entree = outils.get(nom)
             if entree is None:
                 return
-            entree["calls"] = int(entree.get("calls") or 0) + 1
-            if ok:
+            if issue == "rejected":
+                # Le schéma d'entrée a refusé l'appel : l'outil n'a pas tourné. Ni une exécution, ni un défaut
+                # de son code, ni une réussite : la série d'erreurs ne bouge pas.
+                entree["rejected_calls"] = int(entree.get("rejected_calls") or 0) + 1
+            elif ok:
+                entree["calls"] = int(entree.get("calls") or 0) + 1
                 entree["consecutive_errors"] = 0
             elif issue in _ISSUES_DE_L_OUTIL:
+                entree["calls"] = int(entree.get("calls") or 0) + 1
                 entree["errors"] = int(entree.get("errors") or 0) + 1
                 entree["consecutive_errors"] = int(entree.get("consecutive_errors") or 0) + 1
                 entree["last_error"] = (masque["error"] or "")[:300]
@@ -704,6 +828,7 @@ class DynamicToolBuilder:
                     entree["retired_reason"] = f"{entree['consecutive_errors']} consecutive errors"
                     _log.warning("generated tool %r retired from the library (%s)", nom, entree["retired_reason"])
             else:
+                entree["calls"] = int(entree.get("calls") or 0) + 1
                 entree["unattributed_failures"] = int(entree.get("unattributed_failures") or 0) + 1
             self._ecrire_catalogue(outils)
             if self.record_calls:
@@ -848,6 +973,165 @@ class DynamicToolBuilder:
         peut être libéré par `release`. ``cascade=True`` y met aussi ses `descendants`."""
         return self._marquer(name, "quarantined", "quarantine_reason", reason, cascade) is not None
 
+    def reinstate(self, name: str) -> bool:
+        """Remet dans la bibliothèque un outil RETIRÉ (par sa série d'erreurs, ou par `retire`) : il sera
+        rechargé au prochain `load_library`. ``True`` si l'outil est connu. La bibliothèque retire toute seule ;
+        seul l'hôte remet — par exemple quand la fiche (`health`) montre que les échecs étaient des entrées
+        invalides, refusées à raison. Ne lève PAS une quarantaine : c'est une décision de sécurité (`release`)."""
+        with self._verrou:
+            outils = self._lire_catalogue()
+            entree = outils.get(name)
+            if entree is None:
+                return False
+            entree["retired"] = False
+            entree["consecutive_errors"] = 0
+            entree.pop("retired_reason", None)
+            self._ecrire_catalogue(outils)
+            return True
+
+    def _noter_verification(self, outil: GeneratedPythonTool, verified_by: dict[str, Any]) -> None:
+        """L'origine des tests d'un outil, quand elle est connue APRÈS sa construction (`synthesize_tool`)."""
+        outil.verified_by = dict(verified_by)
+        if not self.persist:
+            return
+        with self._verrou:
+            outils = self._lire_catalogue()
+            entree = outils.get(outil.spec.name)
+            if entree is not None:
+                entree["verified_by"] = dict(verified_by)
+                self._ecrire_catalogue(outils)
+
+    def report(self, name: str, call_id: str, *, correct: bool, reason: str | None = None,
+               expected: Any = _ABSENT) -> bool:
+        """Le VERDICT DE L'HÔTE sur un appel du carnet : l'outil a-t-il bien fait ?
+
+        C'est l'hôte qui juge, pas le modèle. ``correct=False`` : un résultat faux qui n'avait pas planté, un
+        échec sur une entrée valide, un refus du schéma à tort — ``expected`` peut donner ce qu'il fallait
+        rendre. ``correct=True`` : le résultat est juste, ou l'échec était LÉGITIME (une entrée invalide, refusée
+        à raison). Le verdict est écrit sur l'appel (``verdict``), prime sur l'issue dans la fiche (`health`),
+        et un nouveau verdict remplace l'ancien. Il ne change ni les compteurs ni le statut de l'outil : voir
+        `reinstate` et `retire`. ``reason`` et ``expected`` passent par ``redact`` et sont bornés comme le reste
+        du carnet. ``False`` si l'outil ou l'appel est inconnu (déjà sorti du carnet)."""
+        if not isinstance(correct, bool):
+            raise TypeError(f"correct must be True or False, got {correct!r}")
+        verdict: dict[str, Any] = {"correct": correct, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        try:
+            details: dict[str, Any] = {}
+            if reason is not None:
+                details["reason"] = str(reason if self.redact is None else self.redact(str(reason)))[:300]
+            if expected is not _ABSENT:
+                texte = _json_canonique(expected if self.redact is None else self.redact(expected))
+                details["expected_sha256"] = hashlib.sha256(texte.encode("utf-8")).hexdigest()
+                if len(texte) <= self.max_record_chars:
+                    details["expected"] = json.loads(texte)
+            verdict.update(details)
+        except Exception as exc:                       # un `redact` qui plante : le verdict seul, aucune donnée
+            _log.warning("redact raised %s; the verdict is recorded without its data", type(exc).__name__)
+        with self._verrou:
+            if name not in self._lire_catalogue():
+                return False
+            chemin = self._chemin_du_carnet(name)
+            try:
+                lignes = chemin.read_text(encoding="utf-8").splitlines()
+            except (OSError, ValueError):
+                return False
+            for index, ligne in enumerate(lignes):
+                try:
+                    entree = json.loads(ligne)
+                except ValueError:
+                    continue
+                if isinstance(entree, dict) and entree.get("id") == call_id:
+                    entree["verdict"] = verdict
+                    lignes[index] = json.dumps(entree, ensure_ascii=False)
+                    try:
+                        atomic_write_text(chemin, "\n".join(lignes) + "\n")
+                    except OSError:
+                        return False
+                    self._lignes_du_carnet[name] = len(lignes)
+                    return True
+            return False
+
+    def health(self, name: str) -> ToolHealth:
+        """La FICHE DE QUALITÉ d'un outil de la bibliothèque (`ToolHealth`, `.summary()`, `.to_dict()`).
+
+        Avec un carnet (`record_calls`), elle est calculée sur ses derniers appels : issues, taux de défaut JUGÉ
+        — le verdict de l'hôte (`report`) prime ; sinon `exception` et `timeout` — avec son intervalle de Wilson,
+        durée médiane, erreurs regroupées, chiffres par version. Sans carnet, sur les compteurs du catalogue.
+        Elle dit aussi d'où viennent les tests de l'outil (`verified_by`). ``KeyError`` si l'outil est inconnu."""
+        from .compare import wilson_interval  # import paresseux : `compare` importe l'agent
+
+        with self._verrou:
+            entree = self._lire_catalogue().get(name)
+        if entree is None:
+            raise KeyError(name)
+        appels = self.calls(name)
+        verified = entree.get("verified_by")
+        executions = int(entree.get("calls") or 0)
+        non_attribues = int(entree.get("unattributed_failures") or 0)
+        outcomes: dict[str, int] = {}
+        verdicts = {"correct": 0, "wrong": 0}
+        versions: dict[str, dict[str, int]] = {}
+        vues: dict[str, dict[str, Any]] = {}
+        durees: list[float] = []
+        if appels:
+            juges = defauts = 0
+            for appel in appels:
+                issue = str(appel.get("kind"))
+                outcomes[issue] = outcomes.get(issue, 0) + 1
+                par_version = versions.setdefault(str(appel.get("version") or ""), {"judged": 0, "defects": 0})
+                verdict = appel.get("verdict")
+                if isinstance(verdict, dict) and isinstance(verdict.get("correct"), bool):
+                    verdicts["correct" if verdict["correct"] else "wrong"] += 1
+                if issue in ("ok", *_ISSUES_DE_L_OUTIL) and isinstance(appel.get("seconds"), (int, float)):
+                    durees.append(float(appel["seconds"]))
+                jugement = _jugement(appel)
+                if jugement is None:
+                    continue
+                juges += 1
+                par_version["judged"] += 1
+                if not jugement:
+                    continue
+                defauts += 1
+                par_version["defects"] += 1
+                raison = verdict.get("reason") if isinstance(verdict, dict) else None
+                texte = str(appel.get("error") or raison or "wrong result (reported by the host)")
+                vue = vues.setdefault(_signature(texte), {"count": 0})
+                vue.update(error=texte, count=vue["count"] + 1, example_args=appel.get("args"), last_id=appel.get("id"))
+        else:
+            juges = max(0, executions - non_attribues)
+            defauts = min(juges, int(entree.get("errors") or 0))
+            if defauts and entree.get("last_error"):
+                vues["catalogue"] = {"error": str(entree["last_error"]), "count": defauts, "example_args": None,
+                                     "last_id": None}
+        return ToolHealth(
+            name=name,
+            status="quarantined" if entree.get("quarantined") else "retired" if entree.get("retired") else "active",
+            version=str(entree.get("sha256") or "")[:12],
+            created=str(entree.get("created") or ""),
+            verified_by=dict(verified) if isinstance(verified, dict) else {"kind": "unknown"},
+            calls=executions,
+            errors=int(entree.get("errors") or 0),
+            unattributed_failures=non_attribues,
+            rejected_calls=int(entree.get("rejected_calls") or 0),
+            basis="call log" if appels else "catalogue",
+            window=len(appels),
+            outcomes=outcomes,
+            judged=juges,
+            defects=defauts,
+            defect_rate=(defauts / juges) if juges else None,
+            defect_interval=wilson_interval(defauts, juges) if juges else None,
+            median_seconds=round(statistics.median(durees), 3) if durees else None,
+            errors_seen=sorted(vues.values(), key=lambda vue: -int(vue["count"])),
+            verdicts=verdicts,
+            versions=versions,
+        )
+
+    def health_all(self) -> dict[str, ToolHealth]:
+        """La fiche de chaque outil du catalogue, par nom."""
+        with self._verrou:
+            noms = sorted(self._lire_catalogue())
+        return {nom: self.health(nom) for nom in noms}
+
     def quarantined(self) -> list[str]:
         """Noms des outils en quarantaine, à faire relire par un humain."""
         with self._verrou:
@@ -941,6 +1225,7 @@ class DynamicToolBuilder:
                 _log.warning("library tool %r declares another name (%r); skipped", nom, outil.spec.name)
                 continue
             outil.recorder = self._noter_appel
+            outil.verified_by = entree.get("verified_by") if isinstance(entree.get("verified_by"), dict) else None
             outil.admission = self._admission
             outil.host_functions = self.host_functions
             self._visibles.add(nom)

@@ -1,15 +1,18 @@
-"""42 - Surveiller les outils que le modele a crees : le carnet d'appels.
+"""42 - Surveiller et mesurer les outils que le modele a crees : le carnet, puis la fiche de qualite.
 
 L'agent ecrit l'outil qui lui manque (demo 06) et la bibliotheque le garde (`persist=True`). Mais que
 vaut cet outil a l'usage ? Jusqu'ici on n'avait que des compteurs. Le carnet (`record_calls=N`, main,
 non publie) note chaque appel : ce que l'outil a recu, l'issue, la cause, la duree, la version du code.
 
-Trois choses a voir, sans cle (le « modele » qui ecrit les outils est scripte) :
+Quatre choses a voir, sans cle (le « modele » qui ecrit les outils est scripte) :
 
   1. un outil a defaut plante sur une entree qu'il n'attendait pas : le carnet dit SUR QUOI ;
   2. une fonction de l'hote refusee par la politique n'est pas un defaut de l'outil : elle est comptee
      a part et ne le fait pas retirer (avant, deux refus retiraient un outil sain) ;
-  3. le carnet garde ce que l'outil recoit : `redact=` masque un nom AVANT toute ecriture.
+  3. le carnet garde ce que l'outil recoit : `redact=` masque un nom AVANT toute ecriture ;
+  4. la FICHE DE QUALITE (`builder.health(nom)`) : d'ou viennent les tests de l'outil, son taux de defaut
+     avec son intervalle, ses erreurs regroupees. Le carnet ne voit ni un resultat faux qui ne plante pas,
+     ni un refus legitime : c'est l'HOTE qui juge (`builder.report(nom, id, correct=...)`), pas le modele.
 
     python examples_autoagent/42_outils_surveilles.py
 """
@@ -142,12 +145,55 @@ def partie_3(dossier: Path) -> None:
     print("  « Dupont » sur le disque :", "oui" if "upont" in sur_disque.lower().replace("<nom>", "") else "non")
 
 
+# Une moyenne qui divise toujours par 2 : juste pour deux valeurs, FAUSSE au-dela - et elle ne plante pas.
+CODE_MOYENNE = (
+    "def run(args, context):\n"
+    "    valeurs = args['valeurs']\n"
+    "    if not valeurs:\n"
+    "        raise ValueError('liste vide')\n"
+    "    return {'moyenne': sum(valeurs) / 2}\n"
+)
+
+
+def partie_4(dossier: Path) -> None:
+    print()
+    print("=" * 78)
+    print("4) La fiche de qualite, et le verdict de l'hote")
+    print("=" * 78)
+    reponse = json.dumps({
+        "tool": {"name": "moyenne", "description": "La moyenne d'une liste de nombres.", "permissions": [],
+                 "input_schema": {"type": "object", "required": ["valeurs"],
+                                  "properties": {"valeurs": {"type": "array", "items": {"type": "number"}}}}},
+        "code": CODE_MOYENNE, "self_tests": [],
+    })
+    constructeur = DynamicToolBuilder(Scripte([reponse]), tools_dir=dossier, persist=True, record_calls=20)
+    outil = constructeur.build(ToolBuildRequest(capability="la moyenne d'une liste"))
+    for valeurs in ([10, 30], [10, 20, 30], []):
+        try:
+            print(f"  moyenne({valeurs}) -> {outil(valeurs=valeurs)}")
+        except ToolError as echec:
+            print(f"  moyenne({valeurs}) -> ECHEC {str(echec)[:60]}")
+
+    print("\n  La fiche, telle que le code la voit :\n")
+    print("  " + constructeur.health("moyenne").summary().replace("\n", "\n  "))
+    print("\n  Elle se trompe deux fois : la liste vide est un refus LEGITIME, et moyenne([10, 20, 30]) = 30")
+    print("  est FAUX sans avoir plante. Seul l'hote peut le dire :\n")
+
+    juste, faux, refus = constructeur.calls("moyenne")
+    constructeur.report("moyenne", refus["id"], correct=True, reason="liste vide : refus attendu")
+    constructeur.report("moyenne", faux["id"], correct=False, reason="la moyenne de 10, 20, 30 est 20",
+                        expected={"moyenne": 20})
+    print("  " + constructeur.health("moyenne").summary().replace("\n", "\n  "))
+    print("\n  Le taux est le meme (1 sur 3), mais ce n'est plus le meme appel : le vrai defaut est trouve,")
+    print("  avec l'entree qui le montre et le resultat attendu - ce qu'il faut pour corriger l'outil.")
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         partie_1(Path(tmp) / "a")
         partie_2(Path(tmp) / "b")
         partie_3(Path(tmp) / "c")
-    print("\n  Limite : le carnet voit ce que l'outil REND. Un outil qui avale ses erreurs, ou qui rend un")
-    print("  resultat faux, apparait « ok » - le voir demande le verdict de l'hote (la fiche de qualite, a venir).")
-    print("  Et une mauvaise entree que l'outil refuse A RAISON compte comme un defaut de l'outil : vu sur un vrai")
-    print("  modele, trois dates mal ecrites de suite ont fait retirer un outil juste. A traiter par la mesure de qualite.")
+        partie_4(Path(tmp) / "d")
+    print("\n  Limite : sans verdict de l'hote, un resultat faux reste « ok » et un refus legitime reste un defaut.")
+    print("  La bibliotheque retire toute seule un outil qui echoue trois fois de suite ; seul l'hote le remet")
+    print("  (`builder.reinstate(nom)`). Vu sur un vrai modele : trois dates mal ecrites ont fait retirer un outil juste.")

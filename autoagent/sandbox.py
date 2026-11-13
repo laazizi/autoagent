@@ -1235,8 +1235,13 @@ class GeneratedPythonTool:
     # reçu et rendu — `{"name", "ok", "kind", "seconds", "args", "result", "error"}`. `kind` est l'issue classée
     # par ce que l'HÔTE a vu, jamais par le texte de l'erreur (que l'outil choisit) : `ok`, `exception` (l'outil
     # a planté), `timeout`, `host` (une fonction de l'hôte a refusé ou échoué), `sandbox` (le bac lui-même a
-    # échoué). La bibliothèque persistante y tient ses compteurs et son carnet. Fail-open comme `observer`.
+    # échoué), `rejected` (le schéma d'entrée a refusé l'appel avant que l'outil tourne). La bibliothèque
+    # persistante y tient ses compteurs et son carnet. Fail-open comme `observer`.
     recorder: "Callable[[dict[str, Any]], None] | None" = None
+    # D'où viennent les TESTS de cet outil (main, non publié) — `{"kind": "none"}` (aucun), `"self_tests"` (écrits
+    # par le modèle qui a écrit l'outil), `"examples"` (des cas de l'hôte, dont une part cachée au modèle).
+    # `None` : inconnu (un outil chargé hors de la bibliothèque persistante).
+    verified_by: "dict[str, Any] | None" = None
 
     # Lu par le registre : un outil écrit par le modèle ne reçoit PAS le `context`
     # du run (0.22.0). Il partait tel quel dans le bac à sable — l'id utilisateur,
@@ -1285,6 +1290,12 @@ class GeneratedPythonTool:
         self._observer_dit(True, None)
         self._recorder_dit("ok", kwargs, result.get("result"), None, debut)
         return result.get("result")
+
+    def __autoagent_rejected__(self, args: Any, erreur: str) -> None:
+        """Appelé par le registre quand le SCHÉMA d'entrée refuse un appel avant que l'outil tourne : noté à
+        part (`kind: "rejected"`). Ni le modèle qui appelle mal ni un schéma trop strict ne se voyaient."""
+        self._recorder_dit("rejected", args if isinstance(args, dict) else {"value": args}, None, erreur,
+                           time.monotonic())
 
     def _recorder_dit(self, issue: str, args: dict[str, Any], resultat: Any, erreur: str | None, debut: float) -> None:
         if self.recorder is None:

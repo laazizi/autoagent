@@ -134,14 +134,21 @@ def _run_cases(tool: GeneratedPythonTool, cases: list[Example]) -> list[tuple[Ex
     """Exécute les cas dans le bac à sable ; rend ceux qui RATENT avec ce qu'on a
     obtenu (ou l'erreur), dans l'ordre."""
     rates: list[tuple[Example, Any]] = []
-    for ex in cases:
-        try:
-            obtenu = tool(**ex.args)
-        except ToolError as exc:
-            rates.append((ex, f"error: {exc}"))
-            continue
-        if not _json_equal(obtenu, ex.expected):
-            rates.append((ex, obtenu))
+    # Faire passer des exemples n'est pas SE SERVIR de l'outil : comme les auto-tests de la construction, ces
+    # passes ne vont ni aux compteurs ni au carnet de la bibliothèque (elles pouvaient même faire RETIRER,
+    # pendant sa synthèse, un outil qui ratait trois cas de suite).
+    crochet, tool.recorder = tool.recorder, None
+    try:
+        for ex in cases:
+            try:
+                obtenu = tool(**ex.args)
+            except ToolError as exc:
+                rates.append((ex, f"error: {exc}"))
+                continue
+            if not _json_equal(obtenu, ex.expected):
+                rates.append((ex, obtenu))
+    finally:
+        tool.recorder = crochet
     return rates
 
 
@@ -263,6 +270,8 @@ def synthesize_tool(
 
             essai.accepted = True
             resultat.tool = tool
+            # L'origine des tests est écrite : des cas de l'HÔTE, dont une part que le modèle n'a jamais vue.
+            builder._noter_verification(tool, {"kind": "examples", "shown": len(shown), "hidden": len(hidden)})
             if register_on is not None:
                 register_on.registry.replace(tool.spec, tool)
             break

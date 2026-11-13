@@ -33,6 +33,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `exception`, and the retirement rule, which already existed, counts them alike. Telling them apart belongs to
   quality measurement (the next step). One run, one tool: an observation, not a rate.
   47 tests (`tests/test_carnet_outils.py`), 43 code mutations all caught. Demo 42; builder option. Dev-doc §11.10.
+- **A quality sheet for the tools the model creates** (`builder.health(name)` → `ToolHealth`, `health_all()`,
+  `builder.report(name, call_id, correct=…)`, `builder.reinstate(name)`). The call log says what happened, not what
+  a tool is WORTH: it sees neither a wrong result that does not crash, nor a bad input rightly refused, nor a call
+  the schema refused before the tool ran — and nothing said how a tool had been checked before being kept.
+  - `verified_by` (catalogue and tool): where the tool's tests come from — `none` (a tool can be kept with NO
+    test), `self_tests` (written by the model that wrote the tool), `examples` (host cases, part of them hidden:
+    `synthesize_tool`), `unknown` (an older catalogue).
+  - Calls refused by the tool's input schema are recorded (`kind: "rejected"`, `rejected_calls`): the registry
+    notifies any tool carrying `__autoagent_rejected__(args, message)`. Neither an execution, nor a defect, nor a
+    success: the error streak does not move.
+  - The HOST's verdict on a logged call: `report(..., correct=False, reason=, expected=)` (a wrong result, a
+    failure on a valid input, a wrongful schema refusal) or `correct=True` (right result, or a LEGITIMATE refusal).
+    It is written on the call, overrides the outcome in the sheet, goes through `redact`, and changes neither the
+    counters nor the tool's status. The host judges, not the model.
+  - The sheet: outcomes, JUDGED defect rate with its 95 % Wilson interval (host, sandbox and schema failures stay
+    out of the rate), median duration, defects grouped by error signature with the last failing input, host
+    verdicts, figures per code version; computed from the catalogue counters when there is no call log.
+  - `reinstate(name)` puts a retired tool back (the library retires by itself; only the host reinstates). It
+    does not lift a quarantine.
+  Checked on a tool really written by a model (`deepseek-chat`, 13 Nov 2026, Windows, inside Docker; 5,316 tokens
+  for two runs): the model writes `jours_entre` with five self-tests — the sheet says so. Two agents use it three
+  times; a call of the wrong type is refused by the schema and recorded `rejected`; three invalid inputs raise
+  `ValueError` and retire the tool. The sheet before any verdict: 3 defects out of 6 judged calls (50 %, 95 %
+  interval 19 % to 81 %), errors grouped in two lines with the input that shows them. The host judges the three
+  refusals legitimate (`report(correct=True)`): 0 defects out of 6 (0 %, interval 0 % to 39 %). `reinstate`: the
+  tool is `active` again and reloads. So the case seen with the call log — a sound tool retired for bad inputs —
+  has a way out, but it goes through the host: the library does not guess that a refusal was legitimate. One
+  run, one tool: an observation, not a rate.
+  44 tests (`tests/test_fiche_outils.py`), 45 code mutations all caught. Demo 42 (part 4); the builder's
+  « dynpro » preset prints the sheet. Dev-doc §11.11.
 
 - **`Agent(require_boundary=True)` — model-written code runs only behind a real boundary.** Requiring a boundary
   used to be said sandbox by sandbox (`make_sandbox(require_boundary=True)`), in three places. Without a sandbox
@@ -83,6 +113,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error)` (0.22.0) keeps its signature and stays free for the host — the library no longer sets it, so a host
   that sets its own no longer switches the library's counting off. Catalogue entries gain
   `unattributed_failures`; `errors` now counts the tool's OWN failures only (see Fixed).
+- `synthesize_tool`: running the host's examples is no longer counted as USING the tool (no counters, no call
+  log) — like the builder's self-tests. With `persist=True` those passes could even RETIRE, during its own
+  synthesis, a tool that failed three cases in a row. An accepted tool records `verified_by`.
 
 ### Fixed
 
