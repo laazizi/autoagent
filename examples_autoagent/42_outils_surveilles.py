@@ -1,10 +1,10 @@
-"""42 - Surveiller et mesurer les outils que le modele a crees : le carnet, puis la fiche de qualite.
+"""42 - Surveiller, mesurer, corriger les outils que le modele a crees : le carnet, la fiche, puis improve.
 
 L'agent ecrit l'outil qui lui manque (demo 06) et la bibliotheque le garde (`persist=True`). Mais que
 vaut cet outil a l'usage ? Jusqu'ici on n'avait que des compteurs. Le carnet (`record_calls=N`, main,
 non publie) note chaque appel : ce que l'outil a recu, l'issue, la cause, la duree, la version du code.
 
-Quatre choses a voir, sans cle (le « modele » qui ecrit les outils est scripte) :
+Cinq choses a voir, sans cle (le « modele » qui ecrit les outils est scripte) :
 
   1. un outil a defaut plante sur une entree qu'il n'attendait pas : le carnet dit SUR QUOI ;
   2. une fonction de l'hote refusee par la politique n'est pas un defaut de l'outil : elle est comptee
@@ -12,7 +12,10 @@ Quatre choses a voir, sans cle (le « modele » qui ecrit les outils est scripte
   3. le carnet garde ce que l'outil recoit : `redact=` masque un nom AVANT toute ecriture ;
   4. la FICHE DE QUALITE (`builder.health(nom)`) : d'ou viennent les tests de l'outil, son taux de defaut
      avec son intervalle, ses erreurs regroupees. Le carnet ne voit ni un resultat faux qui ne plante pas,
-     ni un refus legitime : c'est l'HOTE qui juge (`builder.report(nom, id, correct=...)`), pas le modele.
+     ni un refus legitime : c'est l'HOTE qui juge (`builder.report(nom, id, correct=...)`), pas le modele ;
+  5. APPRENDRE de l'erreur (`builder.improve(nom)`) : le modele recoit le vrai cas rate et ecrit une nouvelle
+     version ; du CODE la juge - le cas rate doit etre resolu, et les cas qui marchaient, que le modele n'a
+     jamais vus, doivent donner le meme resultat. Sinon l'ancienne version reste.
 
     python examples_autoagent/42_outils_surveilles.py
 """
@@ -155,7 +158,7 @@ CODE_MOYENNE = (
 )
 
 
-def partie_4(dossier: Path) -> None:
+def partie_4(dossier: Path) -> DynamicToolBuilder:
     print()
     print("=" * 78)
     print("4) La fiche de qualite, et le verdict de l'hote")
@@ -186,6 +189,64 @@ def partie_4(dossier: Path) -> None:
     print("  " + constructeur.health("moyenne").summary().replace("\n", "\n  "))
     print("\n  Le taux est le meme (1 sur 3), mais ce n'est plus le meme appel : le vrai defaut est trouve,")
     print("  avec l'entree qui le montre et le resultat attendu - ce qu'il faut pour corriger l'outil.")
+    return constructeur
+
+
+# Deux « corrections » que le modele pourrait rendre. La premiere repare le cas signale EN DUR et casse le reste.
+CODE_MOYENNE_HATIVE = (
+    "def run(args, context):\n"
+    "    valeurs = args['valeurs']\n"
+    "    if len(valeurs) == 3:\n"
+    "        return {'moyenne': sum(valeurs) / 3}\n"
+    "    return {'moyenne': sum(valeurs)}\n"
+)
+CODE_MOYENNE_JUSTE = (
+    "def run(args, context):\n"
+    "    valeurs = args['valeurs']\n"
+    "    if not valeurs:\n"
+    "        raise ValueError('invalid input: liste vide')\n"
+    "    return {'moyenne': sum(valeurs) / len(valeurs)}\n"
+)
+
+
+def partie_5(constructeur: DynamicToolBuilder) -> None:
+    print()
+    print("=" * 78)
+    print("5) Apprendre de l'erreur : une nouvelle version, gardee seulement si du code le prouve")
+    print("=" * 78)
+
+    def proposition(code: str) -> str:
+        return json.dumps({
+            "tool": {"name": "moyenne", "description": "La moyenne d'une liste de nombres.", "permissions": [],
+                     "input_schema": {"type": "object", "required": ["valeurs"],
+                                      "properties": {"valeurs": {"type": "array", "items": {"type": "number"}}}}},
+            "code": code, "self_tests": [],
+        })
+
+    constructeur.provider.reponses.extend([proposition(CODE_MOYENNE_HATIVE), proposition(CODE_MOYENNE_JUSTE)])
+    print("  Le modele recoit le code actuel et le cas que l'hote a juge faux. Premier essai : il repare")
+    print("  ce cas-la en dur, et change un resultat qui etait juste.\n")
+    premier = constructeur.improve("moyenne")
+    print("  " + premier.summary())
+    for cas in premier.regressions:
+        print(f"      change : moyenne({cas['args']['valeurs']}) rendait {cas['expected']}, rendrait {cas['got']}")
+    print("\n  Second essai :\n")
+    second = constructeur.improve("moyenne")
+    print("  " + second.summary())
+    outil = second.tool
+    assert outil is not None
+    print(f"\n  moyenne([10, 20, 30]) -> {outil(valeurs=[10, 20, 30])}")
+    try:
+        outil(valeurs=[])
+    except ToolError as refus:
+        print(f"  moyenne([]) -> {str(refus)[:50]}")
+    print(f"  ... note « {constructeur.calls('moyenne')[-1]['kind']} » au carnet : un refus DECLARE par l'outil")
+    print("  (ValueError('invalid input: ...')), plus un plantage. Il ne compte pas contre lui.")
+    print("\n  " + constructeur.health("moyenne").summary().replace("\n", "\n  "))
+    print("\n  Le modele n'a vu que le cas rate ; le cas qui marchait a ete rejoue sans qu'il le voie.")
+    print("  L'ancienne version est gardee : builder.rollback('moyenne') la remet.")
+
+
 
 
 if __name__ == "__main__":
@@ -193,7 +254,8 @@ if __name__ == "__main__":
         partie_1(Path(tmp) / "a")
         partie_2(Path(tmp) / "b")
         partie_3(Path(tmp) / "c")
-        partie_4(Path(tmp) / "d")
-    print("\n  Limite : sans verdict de l'hote, un resultat faux reste « ok » et un refus legitime reste un defaut.")
-    print("  La bibliotheque retire toute seule un outil qui echoue trois fois de suite ; seul l'hote le remet")
-    print("  (`builder.reinstate(nom)`). Vu sur un vrai modele : trois dates mal ecrites ont fait retirer un outil juste.")
+        partie_5(partie_4(Path(tmp) / "d"))
+    print("\n  Limites : sans verdict de l'hote, un resultat faux reste « ok » - et il compte meme comme un cas")
+    print("  REUSSI a ne pas changer. improve ne s'applique pas a un outil qui appelle des fonctions de l'hote")
+    print("  (le rejouer referait des effets de bord). « Meme resultat qu'avant » prouve qu'on n'a rien casse,")
+    print("  pas que l'outil est juste partout.")

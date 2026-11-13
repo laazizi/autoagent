@@ -63,6 +63,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run, one tool: an observation, not a rate.
   44 tests (`tests/test_fiche_outils.py`), 45 code mutations all caught. Demo 42 (part 4); the builder's
   « dynpro » preset prints the sheet. Dev-doc §11.11.
+- **Learning from a tool's errors: `builder.improve(name)` → `ImprovementResult`, and `builder.rollback(name)`.** A
+  generated tool that failed was retired, and that was all: rebuilt, it could make the same mistake. Now the
+  builder model receives the current code and up to five REAL failing calls of the call log (the input, the error
+  or the wrong result, what the host expected if it said so) — never the calls that succeed, never a call from a
+  run that had ingested untrusted content (that one is still replayed). The version it returns is built ASIDE and
+  judged in the sandbox BY CODE: every failing case must be fixed — against the expected result when the host
+  gave one; otherwise the tool must no longer crash (a result, or a refusal) — and every PASSING call of the log,
+  replayed unseen by the model, must give the same result as before; it may not ask for more permissions. If all
+  pass, it replaces the old version, which is archived (`.versions/<name>/<sha>.py`, `rollback`); `verified_by`
+  becomes `{"kind": "replay", ...}`, counters restart, a retired tool is reinstated. Otherwise NOTHING changes on
+  disk and the attempt is logged. The candidate is built and replayed in the SAME sandbox as the old version (the
+  host's, or the boundary `require_boundary` demands): no other sandbox is created. The quality sheet now
+  describes the CURRENT version: calls made on a previous one stay in `versions` and `calls()`, counted apart
+  (`ToolHealth.previous_calls`). No model call when there is nothing to fix, no usable case, a tool that calls
+  host functions (replaying would repeat side effects), a quarantined tool, or a tainted run.
+  On a real model (`deepseek-chat`, 13 Nov 2026, inside Docker; two series of 3 independent tries, 10,932 tokens
+  each, builds included): the model wrote `minutes_de` ("converts a duration written like 1h30 into minutes"),
+  which read five of six spellings and REFUSED `"1:30"` — a declared refusal, not a crash. The host judged that
+  refusal wrong and gave the expected value; `improve` installed a new version six times out of six (the case
+  fixed against the expected result, the five passing calls replayed identically), and all six read three
+  spellings they had never seen. One model, one simple task, the most favourable case (the host gave the expected
+  value); no candidate was rejected on that model — the rejection path is proven by the tests and demo 42 only.
+- **A generated tool can say NO: `raise ValueError("invalid input: ...")` is a declared refusal, not a crash.**
+  Recorded `refused`, apart (`refused_calls`): neither a defect nor a success, the error streak does not move, the
+  tool is not retired — on a real model, three badly written dates had retired a sound tool. It stays visible
+  (call log, sheet, the error returned to the caller), never hides a host failure (counted host-side), and the
+  host can judge it wrong (`report(correct=False)`).
+  The sentence added to the builder prompt was measured (`deepseek-chat`, 13 Nov 2026, inside Docker; 4 tasks x 5
+  builds per arm, arms alternating; 43,929 tokens, plus 9,360 for a control). With it: 18 tools built out of 20,
+  right 18/18 on a valid input; on an INVALID input, 16 declared refusals, 0 crashes, 2 values returned (an empty
+  string for an empty name). Without it: 20/20 built, right 20/20; on the invalid input, 0 refusals, 11 crashes,
+  9 values returned — 4 of them an ERROR VALUE (`{"error": ...}`) returned as a result, which the call log would
+  have recorded `ok`. The 2 failed builds of the "with" arm are the same task and the same cause: a self-test
+  written by the model with a wrong expectation; ten more builds of that task with the same prompt: 10/10. The
+  sentence is neither cleared nor convicted: 2/20 against 0/20 cannot be told apart at this size.
+  44 + 13 tests (`tests/test_apprentissage_outils.py`, `tests/test_refus_outils.py`), 55 code
+  mutations all caught. Demo 42 (part 5); the builder's « dynpro » preset calls `improve`. Dev-doc §11.12.
 
 - **`Agent(require_boundary=True)` — model-written code runs only behind a real boundary.** Requiring a boundary
   used to be said sandbox by sandbox (`make_sandbox(require_boundary=True)`), in three places. Without a sandbox
@@ -116,6 +153,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `synthesize_tool`: running the host's examples is no longer counted as USING the tool (no counters, no call
   log) — like the builder's self-tests. With `persist=True` those passes could even RETIRE, during its own
   synthesis, a tool that failed three cases in a row. An accepted tool records `verified_by`.
+- **The builder's system prompt gains one sentence**: "If an input is invalid for the tool, raise
+  ValueError("invalid input: <why>") — never return an error value in its place." Tools built from now on refuse
+  an invalid input instead of crashing or returning an error value (measured, see Added). Catalogue entries gain
+  `refused_calls` and, after an improvement, `history`, `improvement_attempts`, `last_improvement`.
 
 ### Fixed
 

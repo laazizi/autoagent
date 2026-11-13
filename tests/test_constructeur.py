@@ -167,7 +167,9 @@ ATTENDUS = {
     "dynpro": ("allowed_permissions=set()", "max_repairs=2", "persist=True", "PythonRunner(sandbox=bac)",
                "enable_run_python(", "DockerSandbox(",
                # Le carnet d'appels et la fiche de qualité (main, non publié) : l'option ET la fiche après le run.
-               "record_calls=20", "for _fiche in builder.health_all().values():", "print(_fiche.summary())"),
+               "record_calls=20", "for _fiche in builder.health_all().values():", "print(_fiche.summary())",
+               # Apprendre de l'erreur (main, non publié) : seulement pour un outil qui a des défauts.
+               "if _fiche.defects:", "print(builder.improve(_fiche.name).summary())"),
     "04": ("except TokenBudgetExceeded", "except MaxStepsExceeded", ".resume(borne.state"),
     "11": ("describe=describe", "on_refused=", "on_offtopic="),
     # Bug vu à l'écran : un outil PARTAGÉ perdait ses drapeaux. Ils doivent suivre

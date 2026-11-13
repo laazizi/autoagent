@@ -1791,7 +1791,7 @@ python -m autoagent.approval reject  ./dynamic_tools/foo.py [--to ./rejected]
 **Bibliothèque persistante** — `DynamicToolBuilder(provider, tools_dir=…, persist=True)`. Chaque
 outil accepté est inscrit dans `tools_dir/catalogue.json` (écriture atomique, fichier illisible
 mis de côté en `.corrompu-<date>`) : `sha256` du fichier, date, description, permissions,
-`calls`, `errors`, `consecutive_errors`, `unattributed_failures`, `rejected_calls`, `verified_by`, `retired`. Au démarrage, `enable_dynamic_tools` appelle
+`calls`, `errors`, `consecutive_errors`, `unattributed_failures`, `rejected_calls`, `refused_calls`, `verified_by`, `history`, `retired`. Au démarrage, `enable_dynamic_tools` appelle
 `builder.load_library()` et ne recharge un outil **que si** : il n'est pas retiré ; son fichier
 existe et son sha256 est celui noté à la validation (un fichier modifié depuis n'est **pas**
 rechargé, jamais « re-validé en silence ») ; l'AST l'accepte encore ; ses permissions tiennent
@@ -2008,9 +2008,11 @@ constructeur.reinstate("moyenne")                           # remettre un outil 
 - **La fiche** (`ToolHealth`) : `status`, `version`, `verified_by` ; `outcomes` (les appels par issue) ;
   `judged` / `defects` / `defect_rate` et son intervalle de Wilson à 95 % — un appel est JUGÉ s'il dit quelque
   chose de l'outil (`ok`, `exception`, `timeout`, ou tout appel qui porte un verdict) ; les échecs de l'hôte, du
-  bac et du schéma n'entrent pas dans le taux ; `median_seconds` ; `errors_seen` (les défauts regroupés : deux
+  bac et du schéma n'entrent pas dans le taux, ni les refus déclarés par l'outil (§11.12) ; `median_seconds` ; `errors_seen` (les défauts regroupés : deux
   erreurs qui ne diffèrent que par une valeur sont la même, avec le dernier exemple d'entrée) ; `verdicts` ;
-  `versions` (par version du code). Sans carnet, la fiche se calcule sur les compteurs du catalogue (`basis`).
+  `versions` (par version du code). Ces chiffres portent sur la VERSION COURANTE : les appels faits sur une
+  version précédente (remplacée par `improve`, ou reconstruite) restent dans `versions` et dans `calls()`,
+  comptés à part (`previous_calls`). Sans carnet, la fiche se calcule sur les compteurs du catalogue (`basis`).
 - **`reinstate(nom)`** remet un outil retiré (il se recharge au prochain `load_library`). Il ne lève pas une
   quarantaine : c'est une décision de sécurité, qui se lève par `release`, empreinte en main.
 - Les passes d'exemples de `synthesize_tool` ne sont plus des appels (ni compteurs ni carnet), comme les
@@ -2033,6 +2035,92 @@ bibliothèque ne devine pas qu'un refus était légitime. Un seul run, un seul o
 
 **Preuves.** `tests/test_fiche_outils.py` (44 tests) ; 45 mutations du code, toutes attrapées. Démo 42
 (partie 4) ; le preset « Outils dynamiques, version pro » du constructeur affiche la fiche après le run.
+
+### 11.12 Apprendre des erreurs — `improve`, le refus déclaré, `rollback` *(sur `main`, non publié)*
+
+Un outil créé qui échouait était retiré, et c'était tout : refait, il pouvait refaire la même faute. Ici l'erreur
+sert, et les trois responsabilités restent séparées — le modèle CRÉE, du code VÉRIFIE, l'hôte JUGE et décide.
+
+```python
+resultat = constructeur.improve("moyenne")                  # ImprovementResult
+print(resultat.summary())                                   # ci-dessous : la sortie réelle de la démo 42 (partie 5)
+#   moyenne — amélioré : version 3b2831d3239c remplacée par d10f878debf1 · 1 cas raté corrigé (dont 1 contre le résultat attendu), 1 cas réussi rejoué à l'identique. L'ancienne est gardée (rollback).
+resultat.tool(valeurs=[10, 20, 30])                         # la nouvelle version, déjà surveillée (carnet, fiche)
+constructeur.rollback("moyenne")                            # revenir à la version d'avant
+```
+
+**`improve(nom, max_cases=5)`** :
+
+1. Le modèle constructeur reçoit le code actuel et jusqu'à cinq VRAIS cas ratés du carnet (§11.10) : l'entrée,
+   l'erreur ou le résultat faux, et ce que l'hôte attendait s'il l'a dit (`report`, §11.11). D'abord un cas par
+   sorte d'erreur, puis les plus récents. Il ne reçoit JAMAIS les cas qui réussissent, ni un cas venu d'un run
+   qui avait lu du contenu non fiable (ses arguments pourraient porter un ordre) — celui-là est tout de même
+   rejoué.
+2. La version qu'il rend est construite À CÔTÉ, puis jugée par du code, dans le MÊME bac que l'ancienne (celui
+   de l'hôte, ou la frontière exigée par `require_boundary`) : aucun autre bac n'est créé. Chaque cas raté doit être
+   RÉSOLU : contre le résultat attendu quand l'hôte l'a donné (prouvé) ; si l'hôte a jugé le résultat faux sans
+   dire l'attendu, il faut un résultat, et un autre ; pour un plantage que personne n'a jugé, l'outil ne doit
+   plus planter — il rend un résultat, ou il REFUSE l'entrée. Et chaque cas RÉUSSI du carnet, rejoué sans que le
+   modèle l'ait vu (comme le hold-out de `synthesize_tool`), doit donner le même résultat qu'avant. La nouvelle
+   version ne peut pas demander plus de permissions que l'ancienne.
+3. Si tout passe : elle remplace l'ancienne, archivée dans `tools_dir/.versions/<nom>/<sha>.py` ; ses compteurs
+   repartent de zéro, un outil retiré est remis, `verified_by` vaut `{"kind": "replay", "fixed", "checked",
+   "kept", "from"}` et la fiche le dit (« 2 cas ratés corrigés (dont 1 contre le résultat attendu), 1 cas réussi
+   rejoué à l'identique »). La fiche parle alors de la NOUVELLE version : les appels faits sur l'ancienne restent
+   au carnet et dans `versions`, comptés à part (`previous_calls`) — la faute corrigée n'est plus reprochée.
+   Sinon RIEN ne change sur le disque ; l'essai est noté au catalogue (`improvement_attempts`,
+   `last_improvement`) et le compte rendu liste `still_failing` et `regressions`.
+
+`improve` ne fait rien — et n'appelle pas le modèle — quand il n'y a rien à corriger (`nothing_to_fix`), quand
+aucun cas raté n'est utilisable (`no_usable_case` : masqués par `redact`, trop gros, ou tous venus de runs
+teintés), quand l'outil appelle des fonctions de l'hôte (`not_replayable` : rejouer referait des effets de bord),
+quand l'outil est en quarantaine, quand son fichier a changé sur le disque, ou depuis un run qui a lu du contenu
+non fiable (`tainted_run` : une page ne doit pas pouvoir faire réécrire un outil). Un appel au modèle par
+`improve` ; sa dépense est dans `.usage` et dans `last_build_usage`. C'est l'HÔTE qui décide quand l'appeler.
+
+**`rollback(nom)`** remet la version d'avant la dernière amélioration, si son archive a toujours l'empreinte
+notée au catalogue (une archive modifiée n'est jamais remise).
+
+**Le refus déclaré.** Demander au modèle de « corriger » un plantage sur une entrée invalide le pousserait à
+rendre n'importe quoi. La convention : un outil qui lève `ValueError("invalid input: …")` REFUSE l'entrée. C'est
+noté `refused`, à part (`refused_calls`) : ni un défaut de son code, ni une réussite ; la série d'erreurs ne bouge
+pas, l'outil n'est pas retiré. Ce n'est pas une porte dérobée : le refus est visible (carnet, fiche, erreur rendue
+au modèle qui appelle), il ne masque jamais un échec de l'hôte (compté côté hôte), et l'hôte peut le juger à tort
+(`report(correct=False)`), ce qui en fait un défaut. Seule la formule exacte compte, en tête de l'erreur. Le
+prompt du constructeur la demande depuis cette version : « If an input is invalid for the tool, raise
+ValueError("invalid input: <why>") — never return an error value in its place. »
+
+**La phrase ajoutée au prompt du constructeur, mesurée** (`deepseek-chat`, 13 nov. 2026, dans Docker ; 4 tâches ×
+5 constructions par bras, bras alternés ; 43 929 jetons, plus 9 360 pour un contrôle). Avec la phrase : 18 outils
+construits sur 20, justes 18 sur 18 sur une entrée valide ; sur une entrée INVALIDE, 16 refus déclarés, 0 plantage,
+2 valeurs rendues (une chaîne vide pour un nom vide). Sans la phrase : 20 construits sur 20, justes 20 sur 20 ; sur
+l'entrée invalide, 0 refus, 11 plantages, 9 valeurs rendues — dont 4 fois une VALEUR D'ERREUR (`{"error": "le
+total ne peut pas être zéro"}`) rendue comme un résultat, que le carnet aurait notée `ok`. Les 2 créations ratées
+du bras « avec » sont la même tâche et la même cause : un auto-test écrit par le modèle dont l'attendu était faux
+(« attendu 'MCO', obtenu 'MCON' ») ; dix constructions de plus de cette tâche, même prompt : 10 sur 10. La phrase
+n'en est ni innocentée ni convaincue : 2 sur 20 contre 0 sur 20 ne se distinguent pas à cette taille. Un seul
+modèle, quatre tâches simples.
+
+**Limites, dites.** Un résultat faux que l'hôte n'a pas signalé compte comme un cas RÉUSSI : la version qui le
+corrigerait est refusée, parce qu'elle « change un résultat qui marchait » (testé). « Même résultat qu'avant »
+prouve qu'on n'a rien cassé, pas que l'outil est juste partout. Pour un plantage sans verdict, « résolu » veut
+dire « ne plante plus » : le résultat rendu n'est vérifié que si l'hôte a donné l'attendu (`checked`). Un outil
+qui appelle des fonctions de l'hôte ne s'améliore pas par `improve`. Rien n'appelle `improve` tout seul.
+
+**Vu sur un vrai modèle** (`deepseek-chat`, 13 nov. 2026, dans Docker ; deux séries de 3 essais indépendants,
+10 932 jetons chacune, construction comprise). Le modèle écrit `minutes_de` (« convertit une durée écrite comme
+1h30 en minutes ») ; l'hôte l'appelle sur six écritures. Les six fois, l'outil a su en lire cinq (`"1h30"`,
+`"2h"`, `"0h45"`, `"90 min"`, `"1 h 30"`) et a REFUSÉ `"1:30"` — un refus déclaré, pas un plantage. L'hôte a
+jugé ce refus à tort en donnant l'attendu (`report(correct=False, expected=…)`), puis `improve` : les six fois, une
+nouvelle version installée — le cas corrigé contre le résultat attendu, les cinq cas réussis rejoués à
+l'identique. Sur trois écritures jamais vues (`"2 h 15"`, `"45 min"`, `"3:05"`), les six nouvelles versions ont
+rendu le bon nombre ; c'est une information, pas un juge. Ce que cet essai ne dit pas : un seul modèle, une tâche
+simple, et le cas le plus favorable (l'hôte a donné l'attendu). Aucune version candidate n'a été refusée sur ce
+modèle : le refus d'une mauvaise correction n'est prouvé que par les tests et par la démo 42.
+
+**Preuves.** `tests/test_apprentissage_outils.py` (44 tests), `tests/test_refus_outils.py` (13 tests) ;
+55 mutations du code, toutes attrapées. Démo 42 (partie 5) ; le preset « Outils dynamiques, version pro » du
+constructeur appelle `improve` pour un outil qui a des défauts.
 
 ---
 
@@ -2522,6 +2610,7 @@ from autoagent.gate import run_taint, note_untrusted_read                   # 0.
 from autoagent.gate import delegation_taint                                 # 0.25.0 — la teinte qui descend (§46)
 from autoagent.webfetch import http_fetch_tool                             # main (non publié) — lecture web par l'hôte (§49.2)
 from autoagent.dynamic import ToolHealth                                   # main (non publié) — la fiche de qualité d'un outil créé (§11.11)
+from autoagent.dynamic import ImprovementResult                            # main (non publié) — le compte rendu de improve (§11.12)
 ```
 
 ### Annexe C — Cheat-sheet

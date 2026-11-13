@@ -582,7 +582,7 @@ const DEFS = {
       {k:"repairs", l:"reprises max (max_repairs)", kind:"number", def:"0", w:"half", hint:"un refus (JSON, validateur, self-test faux) est renvoyé au constructeur ; 0 = comme avant. Chaque reprise est un appel payé."},
       {k:"ceil",    l:"permissions que le modèle peut s'accorder (plafond)", kind:"text", def:"", w:"half", hint:"ex. filesystem.*, network — VIDE = aucune. Sans plafond, le modèle choisit lui-même ses droits (réseau compris)."},
       {k:"persist", l:"bibliothèque persistante (réutiliser les outils d'un run à l'autre)", kind:"check", def:false},
-      {k:"carnet",  l:"carnet d'appels : derniers appels gardés par outil (vide = aucun)", kind:"number", def:"", w:"half", hint:"main, non publié — avec la bibliothèque persistante : note ce que chaque outil créé a reçu, l'issue (ok, exception, timeout, host, sandbox, rejected), la cause, la durée ; se relit par builder.calls(nom) et se résume par builder.health(nom) — la fiche de qualité. Seuls les défauts de l'outil comptent contre lui. Le carnet peut contenir des données personnelles : passe redact= dans ton code."},
+      {k:"carnet",  l:"carnet d'appels : derniers appels gardés par outil (vide = aucun)", kind:"number", def:"", w:"half", hint:"main, non publié — avec la bibliothèque persistante : note ce que chaque outil créé a reçu, l'issue (ok, exception, timeout, host, sandbox, rejected), la cause, la durée ; se relit par builder.calls(nom) et se résume par builder.health(nom) — la fiche de qualité ; builder.improve(nom) en tire une nouvelle version, gardée seulement si du code le prouve. Seuls les défauts de l'outil comptent contre lui. Le carnet peut contenir des données personnelles : passe redact= dans ton code."},
       {k:"runpy",   l:"ajouter run_python (extrait de code éphémère, jamais gardé)", kind:"check", def:false},
       {k:"manifest", l:"manifest d'approbation (vide = pas de promotion)", kind:"text", def:"", hint:"ex. approved_tools.json — un outil généré tourne en NATIF seulement si son sha256 y est"},
     ],
@@ -1922,6 +1922,11 @@ function generate(){
         L.push(`# un refus légitime : c'est à TOI de juger — builder.report(nom, appel["id"], correct=False, expected=...).`);
         L.push(`for _fiche in builder.health_all().values():`);
         L.push(`    print(_fiche.summary())`);
+        L.push(`    # APPRENDRE de l'erreur : le modèle écrit une nouvelle version à partir des VRAIS cas ratés du carnet ;`);
+        L.push(`    # elle n'est gardée que si du code le prouve (cas ratés résolus, cas réussis inchangés). Sinon`);
+        L.push(`    # l'ancienne reste. builder.rollback(nom) revient en arrière.`);
+        L.push(`    if _fiche.defects:`);
+        L.push(`        print(builder.improve(_fiche.name).summary())`);
       }
       if(mem && mem.f.kind==="FactMemory" && mem.f.background) L.push(`${mv}.flush()   # consolidation en arrière-plan : on attend qu'elle soit écrite`);
       if(recB && !replay) L.push(`session.close()   # la fixture est complète : rejouable avec ReplaySession`);

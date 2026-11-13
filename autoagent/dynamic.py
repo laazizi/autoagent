@@ -24,6 +24,7 @@ from .errors import ToolError, ToolValidationError
 from .logging import get_logger, warn_once
 from .providers.base import LLMProvider, loads_tolerant
 from .sandbox import (
+    _REFUS_DECLARE,
     DockerSandbox,
     GeneratedPythonTool,
     SubprocessSandbox,
@@ -36,8 +37,9 @@ from .sandbox import (
     validate_generated_tool_code,
 )
 from .schema import LLMRequest, Message, TokenUsage
+from .validation import format_errors, validate
 
-__all__ = ["DynamicToolBuilder", "PythonRunner", "ToolBuildRequest", "ToolHealth"]
+__all__ = ["DynamicToolBuilder", "ImprovementResult", "PythonRunner", "ToolBuildRequest", "ToolHealth"]
 
 _log = get_logger("dynamic")
 
@@ -66,7 +68,7 @@ def _signature(erreur: str) -> str:
 def _jugement(appel: dict[str, Any]) -> bool | None:
     """Cet appel montre-t-il un DÉFAUT de l'outil ? `True` oui, `False` non, `None` : il ne dit rien de l'outil.
     Le verdict de l'hôte prime ; sans lui, l'issue : `ok` non, `exception` / `timeout` oui, le reste (`host`,
-    `sandbox`, `rejected`) ne dit rien."""
+    `sandbox`, `rejected`, `refused`) ne dit rien."""
     verdict = appel.get("verdict")
     if isinstance(verdict, dict) and isinstance(verdict.get("correct"), bool):
         return not verdict["correct"]
@@ -86,7 +88,155 @@ def _origine_des_tests(verified_by: dict[str, Any]) -> str:
     if sorte == "examples":
         montres, caches = int(verified_by.get("shown") or 0), int(verified_by.get("hidden") or 0)
         return f"{montres + caches} exemples de l'hôte, dont {caches} cachés au modèle"
+    if sorte == "replay":
+        return _preuve_par_rejeu(int(verified_by.get("fixed") or 0), int(verified_by.get("checked") or 0),
+                                 int(verified_by.get("kept") or 0))
     return "vérification inconnue"
+
+
+def _preuve_par_rejeu(corriges: int, verifies: int, gardes: int) -> str:
+    """Ce qu'une version améliorée a prouvé, en clair (`improve`)."""
+    rates = f"{corriges} cas raté corrigé" if corriges == 1 else f"{corriges} cas ratés corrigés"
+    if verifies:
+        rates += f" (dont {verifies} contre le résultat attendu)"
+    reussis = (f"{gardes} cas réussi rejoué à l'identique" if gardes == 1
+               else f"{gardes} cas réussis rejoués à l'identique")
+    return f"{rates}, {reussis}"
+
+
+def _empreinte(valeur: Any) -> str:
+    return hashlib.sha256(_json_canonique(valeur).encode("utf-8")).hexdigest()
+
+
+def _verdict_de(appel: dict[str, Any]) -> dict[str, Any]:
+    verdict = appel.get("verdict")
+    return verdict if isinstance(verdict, dict) else {}
+
+
+def _texte_du_cas(appel: dict[str, Any]) -> str:
+    return str(_verdict_de(appel).get("reason") or appel.get("error") or "wrong result")
+
+
+def _choisir_les_cas(montrables: list[dict[str, Any]], combien: int) -> list[dict[str, Any]]:
+    """Les cas ratés MONTRÉS au modèle : d'abord un par sorte d'erreur (le plus récent), puis les plus récents."""
+    par_sorte: dict[str, dict[str, Any]] = {}
+    for appel in montrables:                                # du plus ancien au plus récent : le dernier gagne
+        par_sorte[_signature(_texte_du_cas(appel))] = appel
+    choisis = list(par_sorte.values())[-combien:]
+    pris = {id(appel) for appel in choisis}
+    for appel in reversed(montrables):
+        if len(choisis) >= combien:
+            break
+        if id(appel) not in pris:
+            choisis.append(appel)
+            pris.add(id(appel))
+    return choisis
+
+
+def _decrire_le_cas(numero: int, appel: dict[str, Any]) -> str:
+    args = json.dumps(appel.get("args"), ensure_ascii=False)[:600]
+    verdict = _verdict_de(appel)
+    attendu = (f" The right result is {json.dumps(verdict['expected'], ensure_ascii=False)[:400]}."
+               if "expected" in verdict else "")
+    raison = f" The host says: {str(verdict['reason'])[:200]}." if verdict.get("reason") else ""
+    issue = appel.get("kind")
+    if issue == "ok":
+        rendu = json.dumps(appel["result"], ensure_ascii=False)[:300] if "result" in appel else "a result"
+        return f"{numero}. args = {args} -> it returned {rendu}, which is WRONG.{attendu}{raison}"
+    if issue == "rejected":
+        return f"{numero}. args = {args} -> refused by the input_schema, but this input is VALID.{attendu}{raison}"
+    valide = " This input is VALID: the tool must handle it." if verdict.get("correct") is False else ""
+    return f"{numero}. args = {args} -> error: {str(appel.get('error'))[:300]}.{valide}{attendu}{raison}"
+
+
+def _demande_d_amelioration(description: str, code: str, montres: list[dict[str, Any]]) -> str:
+    cas = "\n".join(_decrire_le_cas(i, appel) for i, appel in enumerate(montres, 1))
+    return (
+        f"IMPROVE AN EXISTING TOOL - keep its name and its purpose: {description}\n\n"
+        f"Its current code:\n{code[:20000]}\n\n"
+        f"It failed on these REAL calls:\n{cas}\n\n"
+        "Fix the CAUSE, not only these inputs. Other real calls that succeed today will be replayed against your "
+        "new version, and you are not shown them: their results must not change.\n"
+        "If an input is truly invalid for this tool, REFUSE it: let input_schema reject it (pattern, enum, minimum, "
+        'minItems...) or raise ValueError("invalid input: <why>"). Never return an error value in place of a result.'
+    )
+
+
+def _cas_resolu(appel: dict[str, Any], issue: str, valeur: Any, tolerance: float) -> tuple[bool, bool]:
+    """Un cas RATÉ est-il résolu par la nouvelle version ? Rend (résolu, vérifié contre l'attendu de l'hôte).
+
+    L'hôte a donné l'attendu : il faut CE résultat (prouvé). L'hôte a jugé l'appel fautif sans donner l'attendu :
+    l'entrée était valide, il faut UN résultat — et un autre que le résultat faux. Un plantage que personne n'a
+    jugé : un résultat, un refus du schéma ou un refus déclaré le résolvent (l'outil ne plante plus)."""
+    verdict = _verdict_de(appel)
+    if "expected" in verdict:
+        return issue == "result" and _egal(verdict["expected"], valeur, tolerance), True
+    if "expected_sha256" in verdict:
+        return issue == "result" and _empreinte(valeur) == verdict["expected_sha256"], True
+    if verdict.get("correct") is False:
+        if issue != "result":
+            return False, False
+        return not (appel.get("kind") == "ok" and appel.get("result_sha256") == _empreinte(valeur)), False
+    return issue in ("result", "rejected", "refused"), False
+
+
+@dataclass
+class ImprovementResult:
+    """Le compte rendu d'un `DynamicToolBuilder.improve` (main, non publié).
+
+    Attributes:
+        name: l'outil.
+        status: `"improved"` (la nouvelle version a remplacé l'ancienne) ; `"rejected"` (elle n'a pas prouvé ce
+            qu'il fallait : l'ancienne reste) ; `"build_failed"` (le modèle n'a pas rendu un outil valide) ;
+            `"nothing_to_fix"` (aucun cas raté au carnet pour la version courante) ; `"no_usable_case"` (des cas
+            ratés, mais aucun qu'on puisse montrer ou rejouer) ; `"not_replayable"` (l'outil appelle des fonctions
+            de l'hôte) ; `"quarantined"` ; `"tainted_run"` (appelé depuis un run qui a lu du contenu non fiable).
+        reason: pourquoi, en une phrase.
+        old_version, new_version: le début du sha256 du code avant, et après (`None` si rien n'a été installé).
+        fixed, checked: cas ratés résolus ; dont vérifiés contre le résultat que l'hôte attendait.
+        kept: cas réussis du carnet rejoués à l'identique — jamais montrés au modèle.
+        still_failing: cas ratés non résolus — `{"args", "got" | "error", "expected"?}`.
+        regressions: cas réussis qui ne donnent plus le même résultat — `{"args", "expected", "got"}`.
+        skipped: cas ratés inutilisables (masqués par `redact`, ou trop gros pour avoir été gardés).
+        usage: jetons du modèle constructeur (`None` si aucun appel n'a été fait).
+        tool: la nouvelle version, prête à l'emploi (`None` si rien n'a été installé).
+    """
+
+    name: str
+    status: str = ""
+    reason: str = ""
+    old_version: str = ""
+    new_version: str | None = None
+    fixed: int = 0
+    checked: int = 0
+    kept: int = 0
+    still_failing: list[dict[str, Any]] = field(default_factory=list)
+    regressions: list[dict[str, Any]] = field(default_factory=list)
+    skipped: int = 0
+    usage: TokenUsage | None = None
+    tool: GeneratedPythonTool | None = None
+
+    def summary(self) -> str:
+        if self.status == "improved":
+            return (f"{self.name} — amélioré : version {self.old_version} remplacée par {self.new_version} · "
+                    f"{_preuve_par_rejeu(self.fixed, self.checked, self.kept)}. L'ancienne est gardée (rollback).")
+        if self.status == "rejected":
+            rates, changes = len(self.still_failing), len(self.regressions)
+            pourquoi = [f"{rates} cas raté non résolu" if rates == 1 else f"{rates} cas ratés non résolus"] if rates else []
+            if changes:
+                pourquoi.append(f"{changes} cas réussi changé" if changes == 1 else f"{changes} cas réussis changés")
+            # Sans cas en cause (des permissions en plus), c'est `reason` qui dit pourquoi.
+            return (f"{self.name} — nouvelle version REFUSÉE, l'ancienne reste : "
+                    + (", ".join(pourquoi) + "." if pourquoi else self.reason))
+        quoi = {
+            "nothing_to_fix": "rien à corriger : aucun cas raté au carnet pour la version courante",
+            "no_usable_case": "des cas ratés existent, mais aucun ne peut être montré au modèle ni rejoué",
+            "not_replayable": "l'outil appelle des fonctions de l'hôte : ses appels ne se rejouent pas sans effets de bord",
+            "quarantined": "l'outil est en quarantaine : le libérer d'abord (release)",
+            "tainted_run": "refusé : appelé depuis un run qui a lu du contenu non fiable",
+            "build_failed": "le modèle n'a pas rendu un outil valide ; l'ancienne version reste",
+        }.get(self.status, self.status)
+        return f"{self.name} — {quoi}." + (f" {self.reason}" if self.reason and self.status == "build_failed" else "")
 
 
 @dataclass(frozen=True)
@@ -98,10 +248,14 @@ class ToolHealth:
         version, created: le début du sha256 du code courant ; sa date de construction.
         verified_by: d'où viennent ses tests — `{"kind": "none"}`, `"self_tests"` (+ `cases`), `"examples"`
             (+ `shown`, `hidden`), `"unknown"` (un catalogue d'avant).
-        calls, errors, unattributed_failures, rejected_calls: les compteurs du catalogue, depuis la construction
-            de la version courante (`errors` : les défauts de l'outil ; non attribués : hôte, bac ; refusés : schéma).
+        calls, errors, unattributed_failures, rejected_calls, refused_calls: les compteurs du catalogue, depuis
+            la construction de la version courante (`errors` : les défauts de l'outil ; non attribués : hôte, bac ;
+            `rejected` : refusés par le schéma avant de tourner ; `refused` : refusés par l'outil lui-même).
         basis: `"call log"` (les chiffres ci-dessous viennent du carnet) ou `"catalogue"` (pas de carnet).
-        window: appels du carnet pris en compte (0 sans carnet).
+        window: appels du carnet pris en compte — ceux de la VERSION COURANTE (0 sans carnet).
+        previous_calls: appels du carnet faits sur une version précédente (remplacée par `improve`, ou
+            reconstruite) : lisibles dans `versions` et dans `calls()`, jamais comptés dans les chiffres ci-dessous
+            — la fiche parle du code qui tourne, pas des fautes qu'on vient de corriger.
         outcomes: appels de la fenêtre, par issue.
         judged, defects: appels qui disent quelque chose de l'outil, et ceux qui montrent un DÉFAUT — le verdict
             de l'hôte (`report`) prime ; sinon `exception` et `timeout`.
@@ -121,6 +275,7 @@ class ToolHealth:
     errors: int
     unattributed_failures: int
     rejected_calls: int
+    refused_calls: int
     basis: str
     window: int
     outcomes: dict[str, int]
@@ -132,6 +287,7 @@ class ToolHealth:
     errors_seen: list[dict[str, Any]]
     verdicts: dict[str, int]
     versions: dict[str, dict[str, int]]
+    previous_calls: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -156,7 +312,11 @@ class ToolHealth:
             lignes.append(f"  issues ({source}, {self.window} appels) : {detail}")
         else:
             lignes.append(f"  source : {source} · {self.calls} exécutions, {self.unattributed_failures} échecs non "
-                          f"attribués, {self.rejected_calls} appels refusés par le schéma")
+                          f"attribués, {self.rejected_calls} appels refusés par le schéma, {self.refused_calls} refusés "
+                          f"par l'outil")
+        if self.previous_calls:
+            mot = "appel d'une version précédente" if self.previous_calls == 1 else "appels de versions précédentes"
+            lignes.append(f"  {self.previous_calls} {mot} au carnet, non comptés ici")
         if self.verdicts.get("correct") or self.verdicts.get("wrong"):
             lignes.append(f"  verdicts de l'hôte : {self.verdicts.get('correct', 0)} « correct », "
                           f"{self.verdicts.get('wrong', 0)} « faux »")
@@ -398,7 +558,7 @@ class DynamicToolBuilder:
         provider: LLMProvider,
         *,
         tools_dir: str | Path = ".autoagent/tools",
-        sandbox: SubprocessSandbox | None = None,
+        sandbox: SubprocessSandbox | DockerSandbox | None = None,
         timeout: float = 10.0,
         allowed_permissions: Iterable[str] | None = None,
         max_repairs: int = 0,
@@ -776,7 +936,7 @@ class DynamicToolBuilder:
                 "description": outil.spec.description,
                 "permissions": list(outil.spec.permissions or []),
                 "calls": 0, "errors": 0, "consecutive_errors": 0, "unattributed_failures": 0,
-                "rejected_calls": 0, "retired": False,
+                "rejected_calls": 0, "refused_calls": 0, "retired": False,
                 "verified_by": dict(outil.verified_by or {"kind": "none"}),
                 "provenance": provenance,
             }
@@ -814,6 +974,12 @@ class DynamicToolBuilder:
                 # Le schéma d'entrée a refusé l'appel : l'outil n'a pas tourné. Ni une exécution, ni un défaut
                 # de son code, ni une réussite : la série d'erreurs ne bouge pas.
                 entree["rejected_calls"] = int(entree.get("rejected_calls") or 0) + 1
+            elif issue == "refused":
+                # L'outil a tourné et a REFUSÉ l'entrée (`ValueError("invalid input: …")`) : ni un défaut de son
+                # code, ni une réussite. Compté à part ; la série d'erreurs ne bouge pas. Avant, trois mauvaises
+                # entrées de suite faisaient retirer un outil juste (constaté sur un vrai modèle).
+                entree["calls"] = int(entree.get("calls") or 0) + 1
+                entree["refused_calls"] = int(entree.get("refused_calls") or 0) + 1
             elif ok:
                 entree["calls"] = int(entree.get("calls") or 0) + 1
                 entree["consecutive_errors"] = 0
@@ -989,6 +1155,250 @@ class DynamicToolBuilder:
             self._ecrire_catalogue(outils)
             return True
 
+    # ── Apprendre des erreurs ───────────────────────────────────────────────
+
+    def _cas_du_carnet(self, name: str, version: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+        """Les appels de la VERSION COURANTE, le dernier par entrée : (ratés utilisables, réussis rejouables,
+        nombre de ratés inutilisables). Raté : `_jugement` dit défaut. Réussi : un appel `ok` que personne n'a
+        jugé faux, avec son résultat (ou son empreinte). Inutilisable : sans ses arguments (trop gros) ou passé
+        par `redact` (les arguments gardés ne sont plus ceux que l'outil a reçus)."""
+        par_entree: dict[str, dict[str, Any]] = {}
+        for appel in self.calls(name):
+            if appel.get("version") != version:
+                continue
+            cle = str(appel.get("args_sha256") or appel.get("id"))
+            par_entree.pop(cle, None)                       # le dernier appel sur cette entrée prend sa place
+            par_entree[cle] = appel
+        rates: list[dict[str, Any]] = []
+        reussis: list[dict[str, Any]] = []
+        inutilisables = 0
+        for appel in par_entree.values():
+            jugement = _jugement(appel)
+            utilisable = "args" in appel and not appel.get("redacted")
+            if jugement is True:
+                if utilisable:
+                    rates.append(appel)
+                else:
+                    inutilisables += 1
+            elif (jugement is False and appel.get("kind") == "ok" and utilisable
+                    and ("result" in appel or "result_sha256" in appel)):
+                reussis.append(appel)
+        return rates, reussis, inutilisables
+
+    @staticmethod
+    def _rejouer(outil: GeneratedPythonTool, args: dict[str, Any]) -> tuple[str, Any]:
+        """UN appel rejoué sur une version candidate, comme le ferait le registre : le schéma d'entrée d'abord.
+        Rend (`"result"`, la valeur) · (`"rejected"`, le message du schéma) · (`"refused"` | `"error"`, l'erreur)."""
+        if outil.spec.input_schema:
+            erreurs = validate(args, outil.spec.input_schema)
+            if erreurs:
+                return "rejected", format_errors(erreurs)
+        try:
+            return "result", outil(**args)
+        except ToolError as exc:
+            texte = str(exc)
+            return ("refused" if texte.lower().startswith(_REFUS_DECLARE) else "error"), texte
+
+    def _noter_l_essai(self, name: str, statut: str, raison: str) -> None:
+        with self._verrou:
+            outils = self._lire_catalogue()
+            entree = outils.get(name)
+            if entree is None:
+                return
+            entree["improvement_attempts"] = int(entree.get("improvement_attempts") or 0) + 1
+            entree["last_improvement"] = {"status": statut, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                          "reason": raison[:200]}
+            self._ecrire_catalogue(outils)
+
+    def improve(self, name: str, *, max_cases: int = 5) -> ImprovementResult:
+        """APPRENDRE des erreurs d'un outil de la bibliothèque : une nouvelle version, gardée seulement si du CODE
+        le prouve (`ImprovementResult`, `.summary()`).
+
+        1. Le modèle constructeur reçoit le code actuel et jusqu'à ``max_cases`` VRAIS cas ratés du carnet
+           (`record_calls`) — l'entrée, l'erreur ou le résultat faux, ce que l'hôte attendait s'il l'a dit
+           (`report`). Jamais les cas qui réussissent ; jamais un cas venu d'un run qui avait lu du contenu non
+           fiable (ses arguments pourraient porter un ordre) — celui-là est tout de même rejoué.
+        2. La version qu'il rend est jugée dans le bac, PAR DU CODE : chaque cas raté doit être résolu — contre le
+           résultat attendu quand l'hôte l'a donné ; sinon l'outil ne plante plus (un résultat, ou un refus : son
+           schéma, ou `ValueError("invalid input: …")`) — et chaque cas réussi du carnet, rejoué sans que le
+           modèle l'ait vu, doit donner le même résultat qu'avant. Elle ne peut pas demander plus de permissions.
+        3. Si tout passe, elle remplace l'ancienne, qui est gardée (`rollback`) ; ses compteurs repartent de zéro,
+           un outil retiré est remis, et `verified_by` dit ce qui a été prouvé. Sinon RIEN ne change sur le
+           disque, et l'essai est noté au catalogue.
+
+        Ne fait rien, et n'appelle pas le modèle, quand il n'y a rien à corriger, quand aucun cas n'est utilisable,
+        quand l'outil appelle des fonctions de l'hôte (les rejouer referait des effets de bord), quand l'outil est
+        en quarantaine, ou depuis un run qui a lu du contenu non fiable. Un seul appel au modèle par `improve`
+        (plus les reprises de `max_repairs`) ; sa dépense est dans `.usage` et dans `last_build_usage`.
+        ``KeyError`` si l'outil est inconnu."""
+        with self._verrou:
+            entree = self._lire_catalogue().get(name)
+        if entree is None:
+            raise KeyError(name)
+        ancienne = str(entree.get("sha256") or "")
+        rendu = ImprovementResult(name=name, old_version=ancienne[:12])
+
+        def fin(statut: str, raison: str, *, noter: bool = False) -> ImprovementResult:
+            rendu.status, rendu.reason = statut, raison
+            if noter:
+                self._noter_l_essai(name, statut, raison)
+            return rendu
+
+        if entree.get("quarantined"):
+            return fin("quarantined", "the tool is quarantined; release it first")
+        if _provenance_du_run()["tainted"]:
+            return fin("tainted_run", "improve() was called from a run that has ingested untrusted content")
+        chemin = self.tools_dir / f"{name}.py"
+        try:
+            octets = chemin.read_bytes()
+        except OSError as exc:
+            return fin("build_failed", f"the tool file cannot be read: {exc}")
+        if hashlib.sha256(octets).hexdigest() != ancienne:
+            return fin("build_failed", "the tool file changed on disk since it was validated")
+        rates, reussis, rendu.skipped = self._cas_du_carnet(name, ancienne[:12])
+        if not rates:
+            if rendu.skipped:
+                return fin("no_usable_case", "failing calls exist, but their arguments were redacted or too large to keep")
+            return fin("nothing_to_fix", "no failing call of the current version in the call log")
+        code = octets.decode("utf-8")
+        if "call_host" in code:
+            return fin("not_replayable", "the tool calls host functions: replaying its calls would repeat side effects")
+        montrables = [appel for appel in rates if appel.get("tainted") is not True]
+        if not montrables:
+            return fin("no_usable_case", "every failing call comes from a run that had ingested untrusted content")
+        permissions = [str(p) for p in (entree.get("permissions") or [])]
+        demande = _demande_d_amelioration(str(entree.get("description") or name), code,
+                                          _choisir_les_cas(montrables, max(1, int(max_cases))))
+
+        with tempfile.TemporaryDirectory(prefix="autoagent_improve_", ignore_cleanup_errors=True) as brouillon:
+            # La candidate se construit À CÔTÉ : tant qu'elle n'a rien prouvé, la bibliothèque ne bouge pas.
+            # Dans le bac de CE constructeur, avec sa règle de choix : du code écrit par le modèle ne tourne jamais
+            # ailleurs que là où tournait l'ancienne version (aucun autre bac n'est créé).
+            essai = DynamicToolBuilder(self.provider, tools_dir=brouillon, sandbox=self.sandbox,
+                                       allowed_permissions=self.allowed_permissions, max_repairs=self.max_repairs,
+                                       self_test_rel_tol=self.self_test_rel_tol)
+            essai._bac_impose, essai._frontiere_requise = self._bac_impose, self._frontiere_requise
+            try:
+                candidat = essai.build(ToolBuildRequest(capability=demande, tool_name=name, permissions=permissions))
+            except (ToolValidationError, ToolError) as exc:
+                rendu.usage = self.last_build_usage = essai.last_build_usage
+                return fin("build_failed", f"{type(exc).__name__}: {exc}"[:300], noter=True)
+            rendu.usage = self.last_build_usage = essai.last_build_usage
+            en_plus = sorted(set(candidat.spec.permissions or []) - set(permissions))
+            if en_plus:
+                return fin("rejected", f"the new version asks for more permissions than the old one: {en_plus}", noter=True)
+
+            for appel in rates:
+                issue, valeur = self._rejouer(candidat, appel["args"])
+                resolu, verifie = _cas_resolu(appel, issue, valeur, self.self_test_rel_tol)
+                if resolu:
+                    rendu.fixed += 1
+                    rendu.checked += int(verifie)
+                    continue
+                reste: dict[str, Any] = {"args": appel["args"]}
+                reste["got" if issue == "result" else "error"] = valeur if issue == "result" else str(valeur)[:300]
+                if "expected" in _verdict_de(appel):
+                    reste["expected"] = _verdict_de(appel)["expected"]
+                rendu.still_failing.append(reste)
+            for appel in reussis:
+                issue, valeur = self._rejouer(candidat, appel["args"])
+                identique = issue == "result" and (
+                    _egal(appel["result"], valeur, self.self_test_rel_tol) if "result" in appel
+                    else appel.get("result_sha256") == _empreinte(valeur))
+                if identique:
+                    rendu.kept += 1
+                    continue
+                obtenu = valeur if issue == "result" else (
+                    f"refused by the input schema: {valeur}" if issue == "rejected" else f"error: {str(valeur)[:300]}")
+                rendu.regressions.append({"args": appel["args"], "got": obtenu,
+                                          "expected": appel["result"] if "result" in appel
+                                          else {"sha256": appel.get("result_sha256")}})
+            if rendu.still_failing or rendu.regressions:
+                return fin("rejected", f"{len(rendu.still_failing)} failing case(s) not fixed, {len(rendu.regressions)} "
+                                       "passing case(s) changed", noter=True)
+            verified = {"kind": "replay", "fixed": rendu.fixed, "checked": rendu.checked, "kept": rendu.kept,
+                        "from": ancienne[:12]}
+            rendu.tool = self._installer(name, entree, octets, candidat, verified)
+        rendu.new_version = hashlib.sha256(chemin.read_bytes()).hexdigest()[:12]
+        return fin("improved", "every failing case is fixed and every passing case still gives the same result")
+
+    def _installer(self, name: str, ancienne_entree: dict[str, Any], anciens_octets: bytes,
+                   candidat: GeneratedPythonTool, verified: dict[str, Any]) -> GeneratedPythonTool:
+        """La candidate a prouvé ce qu'il fallait : l'ancienne version est ARCHIVÉE (`.versions/<nom>/<sha>.py`),
+        la nouvelle prend sa place, et le catalogue repart pour elle — avec son histoire."""
+        maintenant = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        ancienne = str(ancienne_entree.get("sha256") or "")
+        nouveau_texte = candidat.file_path.read_bytes().decode("utf-8")
+        chemin = self.tools_dir / f"{name}.py"
+        with self._verrou:
+            archive = self.tools_dir / ".versions" / name / f"{ancienne[:12]}.py"
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            archive.write_bytes(anciens_octets)
+            atomic_write_text(chemin, nouveau_texte)
+            outils = self._lire_catalogue()
+            suite = max([int((e.get("provenance") or {}).get("seq") or 0) for e in outils.values()] + [0]) + 1
+            permissions = list(candidat.spec.permissions or [])
+            outils[name] = {
+                "sha256": hashlib.sha256(chemin.read_bytes()).hexdigest(),
+                "created": maintenant,
+                "description": candidat.spec.description,
+                "permissions": permissions,
+                "calls": 0, "errors": 0, "consecutive_errors": 0, "unattributed_failures": 0,
+                "rejected_calls": 0, "refused_calls": 0, "retired": False,
+                "verified_by": dict(verified),
+                "provenance": {"tainted": False, "context": "improve", "seq": suite,
+                               "visible_tools": sorted(self._visibles - {name}), "improved_from": ancienne},
+                "history": [*list(ancienne_entree.get("history") or []),
+                            {"sha256": ancienne, "created": ancienne_entree.get("created"),
+                             "verified_by": ancienne_entree.get("verified_by") or {"kind": "none"},
+                             "replaced": maintenant}],
+                "improvement_attempts": int(ancienne_entree.get("improvement_attempts") or 0) + 1,
+                "last_improvement": {"status": "improved", "ts": maintenant, "reason": ""},
+            }
+            self._ecrire_catalogue(outils)
+            self._visibles.add(name)
+        outil = load_generated_tool(chemin, sandbox=self._bac_pour(permissions))
+        outil.recorder = self._noter_appel
+        outil.admission = self._admission
+        outil.host_functions = self.host_functions
+        outil.verified_by = dict(verified)
+        return outil
+
+    def rollback(self, name: str) -> bool:
+        """Revient à la version d'AVANT la dernière amélioration (`improve`). ``True`` si c'est fait.
+
+        L'archive doit avoir l'empreinte notée au catalogue : une archive modifiée n'est jamais remise. Les
+        compteurs repartent de zéro ; la version quittée reste dans `.versions/<nom>/`, pour inspection."""
+        with self._verrou:
+            outils = self._lire_catalogue()
+            entree = outils.get(name)
+            histoire = list((entree or {}).get("history") or [])
+            if entree is None or not histoire:
+                return False
+            passee = histoire[-1]
+            empreinte = str(passee.get("sha256") or "")
+            dossier = self.tools_dir / ".versions" / name
+            chemin = self.tools_dir / f"{name}.py"
+            try:
+                octets = (dossier / f"{empreinte[:12]}.py").read_bytes()
+                if hashlib.sha256(octets).hexdigest() != empreinte:
+                    _log.warning("archived version of %r does not match its recorded sha256; NOT rolled back", name)
+                    return False
+                (dossier / f"{str(entree.get('sha256') or '')[:12]}.py").write_bytes(chemin.read_bytes())
+                atomic_write_text(chemin, octets.decode("utf-8"))
+            except (OSError, ValueError):
+                return False
+            entree.update({
+                "sha256": empreinte, "created": passee.get("created") or entree.get("created"),
+                "verified_by": passee.get("verified_by") or {"kind": "none"},
+                "calls": 0, "errors": 0, "consecutive_errors": 0, "unattributed_failures": 0,
+                "rejected_calls": 0, "refused_calls": 0, "retired": False, "history": histoire[:-1],
+                "last_improvement": {"status": "rolled_back", "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                     "reason": ""},
+            })
+            self._ecrire_catalogue(outils)
+            return True
+
     def _noter_verification(self, outil: GeneratedPythonTool, verified_by: dict[str, Any]) -> None:
         """L'origine des tests d'un outil, quand elle est connue APRÈS sa construction (`synthesize_tool`)."""
         outil.verified_by = dict(verified_by)
@@ -1065,40 +1475,51 @@ class DynamicToolBuilder:
         if entree is None:
             raise KeyError(name)
         appels = self.calls(name)
+        courante = str(entree.get("sha256") or "")[:12]
         verified = entree.get("verified_by")
         executions = int(entree.get("calls") or 0)
         non_attribues = int(entree.get("unattributed_failures") or 0)
+        refuses = int(entree.get("refused_calls") or 0)
         outcomes: dict[str, int] = {}
         verdicts = {"correct": 0, "wrong": 0}
         versions: dict[str, dict[str, int]] = {}
         vues: dict[str, dict[str, Any]] = {}
         durees: list[float] = []
+        anciens = 0
         if appels:
             juges = defauts = 0
             for appel in appels:
+                version = str(appel.get("version") or "")
+                par_version = versions.setdefault(version, {"judged": 0, "defects": 0})
+                jugement = _jugement(appel)
+                if jugement is not None:
+                    par_version["judged"] += 1
+                    par_version["defects"] += int(jugement)
+                if version and version != courante:
+                    # Un appel d'une version PRÉCÉDENTE (remplacée par `improve`, ou reconstruite) : il reste lisible
+                    # dans `versions`, mais la fiche parle du code qui tourne — pas des fautes qu'on vient de corriger.
+                    anciens += 1
+                    continue
                 issue = str(appel.get("kind"))
                 outcomes[issue] = outcomes.get(issue, 0) + 1
-                par_version = versions.setdefault(str(appel.get("version") or ""), {"judged": 0, "defects": 0})
                 verdict = appel.get("verdict")
                 if isinstance(verdict, dict) and isinstance(verdict.get("correct"), bool):
                     verdicts["correct" if verdict["correct"] else "wrong"] += 1
                 if issue in ("ok", *_ISSUES_DE_L_OUTIL) and isinstance(appel.get("seconds"), (int, float)):
                     durees.append(float(appel["seconds"]))
-                jugement = _jugement(appel)
                 if jugement is None:
                     continue
                 juges += 1
-                par_version["judged"] += 1
                 if not jugement:
                     continue
                 defauts += 1
-                par_version["defects"] += 1
                 raison = verdict.get("reason") if isinstance(verdict, dict) else None
-                texte = str(appel.get("error") or raison or "wrong result (reported by the host)")
+                # Quand l'hôte a dit pourquoi, c'est SA raison qu'on montre : elle dit ce qui était attendu.
+                texte = str(raison or appel.get("error") or "wrong result (reported by the host)")
                 vue = vues.setdefault(_signature(texte), {"count": 0})
                 vue.update(error=texte, count=vue["count"] + 1, example_args=appel.get("args"), last_id=appel.get("id"))
         else:
-            juges = max(0, executions - non_attribues)
+            juges = max(0, executions - non_attribues - refuses)
             defauts = min(juges, int(entree.get("errors") or 0))
             if defauts and entree.get("last_error"):
                 vues["catalogue"] = {"error": str(entree["last_error"]), "count": defauts, "example_args": None,
@@ -1113,8 +1534,10 @@ class DynamicToolBuilder:
             errors=int(entree.get("errors") or 0),
             unattributed_failures=non_attribues,
             rejected_calls=int(entree.get("rejected_calls") or 0),
+            refused_calls=refuses,
             basis="call log" if appels else "catalogue",
-            window=len(appels),
+            window=len(appels) - anciens,
+            previous_calls=anciens,
             outcomes=outcomes,
             judged=juges,
             defects=defauts,
@@ -1261,6 +1684,8 @@ class DynamicToolBuilder:
             "tool must contain name, description, input_schema, permissions. "
             "code must be a complete Python module defining TOOL = {...} and "
             "def run(args, context): ... . The run function must return JSON-serializable data. "
+            "If an input is invalid for the tool, raise ValueError(\"invalid input: <why>\") — never return an "
+            "error value in its place. "
             "Do not use network, filesystem, shell, eval, exec, or subprocess unless the requested "
             "permissions explicitly allow it. Prefer pure Python and standard library only. "
             "Your whole answer must be ONE valid JSON document: every value is a plain literal — "
