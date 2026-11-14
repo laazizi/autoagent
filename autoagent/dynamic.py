@@ -569,8 +569,16 @@ class DynamicToolBuilder:
         record_calls: int = 0,
         redact: Callable[[Any], Any] | None = None,
         max_record_chars: int = 4000,
+        max_build_tokens: int = 8192,
     ) -> None:
-        """``record_calls`` (main, non publié) : le CARNET d'appels. Les ``N`` derniers appels de chaque outil de
+        """``max_build_tokens`` (main, non publié) : le plafond de SORTIE de l'appel au modèle constructeur (8192,
+        comme avant). Un modèle qui réfléchit le dépense avant d'écrire l'outil — mesuré sur Gemini, à une demande
+        d'amélioration : 7 861 jetons de réflexion sur 8 192, réponse coupée. Une réponse coupée par ce plafond
+        lève ``ToolValidationError`` en le DISANT, et n'est jamais reprise par ``max_repairs`` : au même plafond,
+        la reprise rendrait la même réponse coupée. `improve` garde ce plafond. Un fournisseur peut refuser une
+        valeur plus haute que la limite de son modèle.
+
+        ``record_calls`` (main, non publié) : le CARNET d'appels. Les ``N`` derniers appels de chaque outil de
         la bibliothèque sont gardés dans ``tools_dir/<nom>.calls.jsonl`` — ce qu'il a reçu, l'issue (``kind``),
         la cause, la durée, la version du code, la teinte du run — et relus par ``calls(nom)``. ``0`` (défaut) :
         rien n'est écrit. Demande ``persist=True``. Le carnet garde ce que l'outil REÇOIT : il peut porter des
@@ -638,6 +646,9 @@ class DynamicToolBuilder:
         self._frontiere_requise = False
         self.allowed_permissions = None if allowed_permissions is None else set(allowed_permissions)
         self.max_repairs = max(0, int(max_repairs))
+        if isinstance(max_build_tokens, bool) or not isinstance(max_build_tokens, int) or max_build_tokens <= 0:
+            raise ValueError(f"max_build_tokens must be an integer > 0, got {max_build_tokens!r}")
+        self.max_build_tokens = max_build_tokens
         self.self_test_rel_tol = max(0.0, float(self_test_rel_tol))
         self.host_functions: dict[str, Callable[..., Any]] | None = dict(host_functions) if host_functions else None
         self.persist = bool(persist)
@@ -766,9 +777,10 @@ class DynamicToolBuilder:
                 LLMRequest(
                     messages=messages,
                     temperature=0,
-                    # 8192 : laisse de la marge aux modèles « thinking » (Gemini 2.5)
-                    # dont la réflexion consomme des tokens avant le JSON de sortie.
-                    max_tokens=8192,
+                    # 8192 par défaut : de la marge pour les modèles qui réfléchissent, dont la
+                    # réflexion consomme des jetons avant le JSON de sortie. Pas toujours assez :
+                    # voir `max_build_tokens`.
+                    max_tokens=self.max_build_tokens,
                     tool_choice="none",
                     # JSON mode natif quand le provider le supporte (OpenAI/
                     # DeepSeek/Gemini) : supprime les balises ```json à la source.
@@ -784,6 +796,15 @@ class DynamicToolBuilder:
             except _PermissionRefusee:
                 raise
             except (ToolValidationError, ToolError) as exc:
+                if response.finish_reason == "length":
+                    # La réponse a été COUPÉE par le plafond de sortie (mesuré sur Gemini : 7 861 jetons de
+                    # réflexion sur 8 192). Ce n'est pas un outil mal écrit, et une reprise au même plafond
+                    # rendrait la même réponse coupée : on le dit, sans la payer une seconde fois.
+                    raise ToolValidationError(
+                        f"Tool builder ran out of output tokens (max_tokens={self.max_build_tokens}) before it "
+                        "finished its answer: a reasoning model can spend them thinking. Raise "
+                        "DynamicToolBuilder(max_build_tokens=...) or lower the model's reasoning effort."
+                    ) from exc
                 if reprises >= self.max_repairs:
                     raise
                 reprises += 1
@@ -1276,7 +1297,7 @@ class DynamicToolBuilder:
             # ailleurs que là où tournait l'ancienne version (aucun autre bac n'est créé).
             essai = DynamicToolBuilder(self.provider, tools_dir=brouillon, sandbox=self.sandbox,
                                        allowed_permissions=self.allowed_permissions, max_repairs=self.max_repairs,
-                                       self_test_rel_tol=self.self_test_rel_tol)
+                                       self_test_rel_tol=self.self_test_rel_tol, max_build_tokens=self.max_build_tokens)
             essai._bac_impose, essai._frontiere_requise = self._bac_impose, self._frontiere_requise
             try:
                 candidat = essai.build(ToolBuildRequest(capability=demande, tool_name=name, permissions=permissions))

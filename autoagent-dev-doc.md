@@ -1512,7 +1512,9 @@ L'agent décide qu'il a besoin d'un compteur, appelle `create_python_tool(name="
    - refus si eval/exec/__import__/getattr suspect
    - refus si import d'un module hors allowlist selon permissions
    (0.22.0) un refus du validateur, un JSON illisible ou un self-test faux est RENVOYÉ au
-   constructeur jusqu'à `max_repairs` fois (défaut 0) ; un refus de PERMISSION n'est jamais repris
+   constructeur jusqu'à `max_repairs` fois (défaut 0) ; un refus de PERMISSION n'est jamais repris ;
+   une réponse COUPÉE par le plafond de sortie (`max_build_tokens`, 8192 par défaut) le dit et n'est
+   jamais reprise non plus (§11.13)
 5. Code passé → écrit dans tools_dir/<name>.py (retiré du disque s'il échoue au chargement ou aux self-tests)
 6. Wrapper créé : execute_in_sandbox(<name>.py, args) → subprocess
 7. Tool enregistré dans registry → visible au prochain tour LLM
@@ -2106,6 +2108,8 @@ corrigerait est refusée, parce qu'elle « change un résultat qui marchait » (
 prouve qu'on n'a rien cassé, pas que l'outil est juste partout. Pour un plantage sans verdict, « résolu » veut
 dire « ne plante plus » : le résultat rendu n'est vérifié que si l'hôte a donné l'attendu (`checked`). Un outil
 qui appelle des fonctions de l'hôte ne s'améliore pas par `improve`. Rien n'appelle `improve` tout seul.
+Mesuré au banc (§11.13) : sans verdict de l'hôte, `improve` n'a rien eu à corriger sur un vrai modèle — 24
+unités sur 24 —, parce que les outils du modèle refusent proprement au lieu de planter.
 
 **Vu sur un vrai modèle** (`deepseek-chat`, 13 nov. 2026, dans Docker ; deux séries de 3 essais indépendants,
 10 932 jetons chacune, construction comprise). Le modèle écrit `minutes_de` (« convertit une durée écrite comme
@@ -2121,6 +2125,93 @@ modèle : le refus d'une mauvaise correction n'est prouvé que par les tests et 
 **Preuves.** `tests/test_apprentissage_outils.py` (44 tests), `tests/test_refus_outils.py` (13 tests) ;
 55 mutations du code, toutes attrapées. Démo 42 (partie 5) ; le preset « Outils dynamiques, version pro » du
 constructeur appelle `improve` pour un outil qui a des défauts.
+
+### 11.13 Prouver — le banc « outils qui cassent » *(sur `main`, non publié)*
+
+`improve` (§11.12) est prouvé par ses tests. Reste la question qui compte : sur un VRAI modèle, vaut-il mieux que
+ce qui se faisait avant ? `autoagent.toolbench` le mesure.
+
+Un outil créé marche sur ses premières entrées ; puis d'autres écritures arrivent, et il échoue. Le banc compare
+quatre réactions, À PARTIR DU MÊME premier outil :
+
+| réaction | ce qu'elle fait |
+|---|---|
+| `none` | rien : l'outil reste comme il est |
+| `rebuild` | le refaire à l'aveugle, depuis la même demande (un retrait suivi d'une recréation) |
+| `improve` | `builder.improve`, quand l'hôte a dit ce qui était attendu (`report(correct=False, expected=…)`) |
+| `improve_unjudged` | `builder.improve`, quand l'hôte n'a RIEN dit : seuls les plantages sont connus |
+
+```python
+from autoagent.sandbox import make_sandbox
+from autoagent.toolbench import positive_control_tools, run_tool_bench
+
+print(positive_control_tools().summary())         # niveau 1 : hors ligne, sans clé — le banc voit-il quelque chose ?
+rapport = run_tool_bench(provider, sandbox=make_sandbox(require_boundary=True))       # niveau 2 : un vrai modèle
+print(rapport.summary())
+rapport.by_arm()["improve"]                        # units, solved, right, total, regressions, tokens, statuses
+rapport.compare("rebuild", "improve")              # delta, low, high, p, verdict
+[r.detail for r in rapport.rows if r.detail]       # pourquoi une réaction n'a rien donné
+```
+
+**Comment il juge.** Huit tâches fournies (`TOOL_TASKS` : durées, montants, pourcentages, tailles, heures,
+distances, mois, températures). Chacune est décrite par son cas facile — « Convertit une durée écrite comme 1h30
+en nombre de minutes » — et porte trois listes d'entrées, chacune avec son résultat attendu : `easy` (les
+premières), `hard` (d'autres écritures VALIDES qui arrivent ensuite : `"90 min"`, `"1:30"`), `later` (ce qui
+arrive APRÈS la réaction : jamais montré au modèle, jamais écrit au carnet). Le juge est du code (`same_result` :
+la valeur nue ou un objet à une clé, les nombres à 1e-9 près). Une UNITÉ (une tâche, un essai) est résolue quand
+TOUTES ses entrées `later` sont justes ; une entrée que le premier outil lisait et que la réaction a perdue est
+comptée à part (`regressions`). Deux réactions se comparent par la règle de `compare_configs` (§38), appariée par
+tâche. Tout le code écrit par le modèle tourne dans le bac donné (`sandbox=`), le modèle ne peut s'accorder aucune
+permission, et rien ne reste sur le disque.
+
+**Deux niveaux.** Niveau 1 : `ScriptedToolProvider`, un constructeur scripté (une version naïve, puis à `improve`
+la version complète). Il mesure le CODE du banc et d'`improve`, jamais un modèle. `positive_control_tools()` doit y
+voir `improve` résoudre ce que `none` ne résout pas, sinon le banc est aveugle : 8 unités sur 8 contre 0 sur 8
+(p = 0,008) ; et sans verdict, 6 sur 8 — les deux manquantes sont celles où la version naïve rendait une valeur
+FAUSSE sans planter. Niveau 2 : un vrai fournisseur.
+
+**Mesuré sur deux modèles** (13 nov. 2026, dans Docker, 8 tâches × 1 essai, `max_repairs=0`). Unités résolues
+sur 8 ; entre parenthèses, les entrées suivantes justes sur 40 :
+
+| modèle | le premier outil a cassé | `none` | `rebuild` | `improve` | `improve_unjudged` | jetons |
+|---|---|---|---|---|---|---|
+| `deepseek-chat` | 7 unités sur 8 | 1 (25) | 1 (25) | **7** (37) | 1 (25) | 31 192 |
+| `gemini-3.7-flash`, plafond de sortie 8 192 | 4 sur 8 | 4 (32) | 4 (32) | 6 (35) | 4 (32) | 74 664 |
+| `gemini-3.7-flash`, plafond de sortie 24 000 | 4 sur 8 | 4 (31) | 4 (32) | **8** (40) | 4 (31) | 77 639 |
+
+Ce que ça dit :
+
+1. **Refaire à l'aveugle n'apporte rien** : aucune unité gagnée sur 24, dans les trois passages — le modèle refait
+   le même outil. C'est aussi le contrôle du banc : deux constructions de la même demande doivent être
+   indistinguables, et elles le sont (écart 0, p = 1).
+2. **`improve` avec l'attendu de l'hôte corrige.** Là où il y avait quelque chose à apprendre : 6 unités sur 7 sur
+   DeepSeek (écart +75 points [+38 ; +89], p = 0,031 : il fait mieux) ; 4 sur 4 sur Gemini une fois le plafond
+   relevé (p = 0,125 : avec quatre unités à corriger, le test exact ne peut pas trancher, et le banc le dit). La
+   septième unité de DeepSeek : une construction refusée, dont la raison n'a pas été gardée ce jour-là (le banc la
+   garde depuis, `ToolBenchRow.detail`) ; rejouée seule, la même unité a été améliorée.
+3. **Aucune entrée perdue** : 0 dans les trois passages, tous bras confondus. Le rejeu des cas réussis fait son
+   travail.
+4. **Sans rien de l'hôte, `improve` n'apprend RIEN sur un vrai modèle** : `nothing_to_fix`, 24 unités sur 24. La
+   cause est la convention du refus déclaré (§11.12) : l'outil du modèle REFUSE proprement l'écriture qu'il ne
+   connaît pas au lieu de planter, et un refus que personne n'a jugé n'est pas un défaut. Compté sur DeepSeek
+   (un passage de plus, 8 332 jetons) : face aux 24 entrées dures, les premiers outils en ont lu 10 et REFUSÉ
+   14 — aucun plantage, aucune valeur fausse. Le niveau 1 ne le montrait pas — ses versions naïves plantent. C'est la limite la plus importante de cette version : apprendre
+   demande aujourd'hui que l'HÔTE signale (`report`).
+5. **Un défaut trouvé, et corrigé.** Sur Gemini, 2 améliorations sur 4 échouaient avec « did not contain JSON ».
+   Cause vérifiée sur une réponse : 7 861 jetons de RÉFLEXION sur un plafond de sortie de 8 192, réponse coupée
+   (`finish_reason == "length"`). Depuis : `DynamicToolBuilder(max_build_tokens=8192)` — l'hôte relève le plafond,
+   `improve` et le banc le gardent — et une réponse coupée par ce plafond le DIT et n'est jamais reprise par
+   `max_repairs` (au même plafond, la reprise rendrait la même réponse coupée). Avec 24 000 : 4 améliorations sur
+   4, dont une a pris 17 793 jetons.
+
+**Ce que le banc ne dit pas.** Huit tâches de conversion de texte à un paramètre : pas les outils en général. Un
+essai par tâche — à température 0 les essais d'un même modèle se ressemblent, c'est le nombre de TÂCHES qui porte
+la preuve, et huit, c'est peu. Deux modèles. « Résolu » est strict ; la part d'entrées justes est donnée à côté.
+Sur DeepSeek, `improve` coûte environ deux fois une reconstruction (≈ 2 040 jetons contre ≈ 1 060) : il porte le
+code et les cas.
+
+**Preuves.** `tests/test_banc_outils.py` (83 tests), `tests/test_plafond_du_constructeur.py` (15 tests) ;
+53 mutations du code, toutes attrapées. Démo 43 — dans la galerie du constructeur, avec sa sortie réelle.
 
 ---
 
@@ -2494,6 +2585,8 @@ autoagent/
 ├── redteam.py               # 0.24.0 — banc d'injection à canari : run_injection_bench, positive_control,
 │                            # DocileProvider, injection_variant / injection_tasks (§42.1)
 ├── faults.py                # 0.24.0 — banc de pannes : FaultServer (vrai serveur HTTP local) + run_fault_bench (§42.2)
+├── toolbench.py             # main (non publié) — banc « outils qui cassent » : run_tool_bench,
+│                            # positive_control_tools, TOOL_TASKS (§11.13)
 ├── ws.py                    # 0.25.0 — client WebSocket synchrone RFC 6455, stdlib seule (§44)
 ├── output_guard.py          # 0.25.0 — OutputGuard / guard_output : la garde du canal de la réponse (§47) ;
 │                            # 0.26.0 — guard_call_urls : la garde des URL d'appel, url_guard (§47.1)
@@ -2611,6 +2704,7 @@ from autoagent.gate import delegation_taint                                 # 0.
 from autoagent.webfetch import http_fetch_tool                             # main (non publié) — lecture web par l'hôte (§49.2)
 from autoagent.dynamic import ToolHealth                                   # main (non publié) — la fiche de qualité d'un outil créé (§11.11)
 from autoagent.dynamic import ImprovementResult                            # main (non publié) — le compte rendu de improve (§11.12)
+from autoagent.toolbench import run_tool_bench, positive_control_tools, TOOL_TASKS  # main (non publié) — le banc « outils qui cassent » (§11.13)
 ```
 
 ### Annexe C — Cheat-sheet

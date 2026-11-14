@@ -100,6 +100,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sentence is neither cleared nor convicted: 2/20 against 0/20 cannot be told apart at this size.
   44 + 13 tests (`tests/test_apprentissage_outils.py`, `tests/test_refus_outils.py`), 55 code
   mutations all caught. Demo 42 (part 5); the builder's « dynpro » preset calls `improve`. Dev-doc §11.12.
+- **A bench for generated tools that break: `autoagent.toolbench`** (`run_tool_bench`, `positive_control_tools`,
+  `TOOL_TASKS`, `ToolTask`, `same_result`, `ScriptedToolProvider`, `ToolBenchReport`). `improve` was proven by its
+  tests; this measures what it is WORTH. A tool the model built works on its first inputs, then other spellings
+  arrive and it fails. Four reactions are compared from the SAME first tool: `none`, `rebuild` (a blind rebuild
+  from the same request), `improve` (the host said what was expected), `improve_unjudged` (the host said
+  nothing). The judge is code: eight tasks, every input with its expected result; after the reaction the tool is
+  tried on inputs nothing has ever seen (never shown to the model, never written to the call log). A unit (a task,
+  a trial) is solved when all of them are right; an input the first tool read and the reaction lost is counted
+  apart. Verdict rule of `compare_configs`, paired by task. Level 1 (`ScriptedToolProvider`, offline): 8/8 units
+  for `improve` against 0/8, and 6/8 without a verdict. Level 2, measured on 13 Nov 2026 inside Docker (8 tasks x
+  1 trial): on `deepseek-chat`, `none` 1/8, `rebuild` 1/8, `improve` 7/8 (+75 points [+38; +89], p = 0.031),
+  31,192 tokens; on `gemini-3.7-flash` with `max_build_tokens=24000`, 4/8, 4/8 and 8/8 (p = 0.125: four units to
+  fix cannot settle it), 77,639 tokens. A blind rebuild gained no unit out of 24; no input was lost in any arm.
+  The limit that matters: WITHOUT a host verdict `improve` learned nothing on a real model (`nothing_to_fix`, 24
+  units out of 24) — the model's tools refuse an unknown spelling cleanly instead of crashing, and a refusal
+  nobody judged is not a defect (counted on `deepseek-chat`: of the 24 hard inputs the first tools read 10 and
+  REFUSED 14 — no crash, no wrong value). Eight text-conversion tasks, two models, one trial per task.
+  83 tests (`tests/test_banc_outils.py`), 53 code mutations all caught (with the next entry). Demo 43, in
+  the builder's gallery with its real output. Dev-doc §11.13.
+- **`DynamicToolBuilder(max_build_tokens=8192)` — the output cap of the builder call.** Found by the bench on
+  Gemini: on an improvement request the model spent 7,861 tokens REASONING out of a cap of 8,192, its answer was
+  cut (`finish_reason == "length"`) and 2 improvements out of 4 failed. The host can now raise the cap; `improve`
+  and the bench keep it. With 24,000 the same bench gave 4 improvements out of 4 (one took 17,793 tokens).
+  15 tests (`tests/test_plafond_du_constructeur.py`).
 
 - **`Agent(require_boundary=True)` — model-written code runs only behind a real boundary.** Requiring a boundary
   used to be said sandbox by sandbox (`make_sandbox(require_boundary=True)`), in three places. Without a sandbox
@@ -160,6 +184,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A builder answer cut by the output cap says so, and is never repaired.** It surfaced as "Tool builder response
+  did not contain JSON"; with `max_repairs` the same cut answer was paid for again (about 9,000 tokens each on
+  Gemini). It now raises `ToolValidationError("Tool builder ran out of output tokens (max_tokens=...)")` at once —
+  see `max_build_tokens` above. An answer that reaches the cap but is complete is still accepted.
 - **A sound generated tool was retired for failures that were not its own.** Every failed call counted towards
   `retire_after_errors`: reproduced on the previous code (13 Nov 2026), two refusals of a host function by the
   host's policy, or two calls while the sandbox was down (a stopped Docker daemon), RETIRED the tool
