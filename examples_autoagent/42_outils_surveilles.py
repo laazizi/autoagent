@@ -1,8 +1,8 @@
 """42 - Surveiller, mesurer, corriger les outils que le modele a crees : le carnet, la fiche, puis improve.
 
 L'agent ecrit l'outil qui lui manque (demo 06) et la bibliotheque le garde (`persist=True`). Mais que
-vaut cet outil a l'usage ? Jusqu'ici on n'avait que des compteurs. Le carnet (`record_calls=N`, main,
-non publie) note chaque appel : ce que l'outil a recu, l'issue, la cause, la duree, la version du code.
+vaut cet outil a l'usage ? Jusqu'ici on n'avait que des compteurs. Le carnet (`record_calls=N`, 0.28.0)
+note chaque appel : ce que l'outil a recu, l'issue, la cause, la duree, la version du code.
 
 Six choses a voir, sans cle (le « modele » qui ecrit les outils est scripte) :
 

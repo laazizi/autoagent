@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-11-14
+
 ### Added
 
 - **A call log for the tools the model creates** (`DynamicToolBuilder(persist=True, record_calls=N)`,
@@ -3100,7 +3102,8 @@ underscored or imported from a submodule path is internal and may change.
 - CI invariants: `ruff check`, `ruff format --check`, `mypy autoagent/`,
   and `pytest` are all green.
 
-[Unreleased]: https://github.com/laazizi/autoagent/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/laazizi/autoagent/compare/v0.28.0...HEAD
+[0.28.0]: https://github.com/laazizi/autoagent/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/laazizi/autoagent/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/laazizi/autoagent/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/laazizi/autoagent/compare/v0.24.0...v0.25.0

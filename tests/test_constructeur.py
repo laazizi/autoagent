@@ -166,11 +166,11 @@ ATTENDUS = {
     # Outils dynamiques, lots A-C : tout ce que les options émettent doit exister dans la lib.
     "dynpro": ("allowed_permissions=set()", "max_repairs=2", "persist=True", "PythonRunner(sandbox=bac)",
                "enable_run_python(", "DockerSandbox(",
-               # Le carnet d'appels et la fiche de qualité (main, non publié) : l'option ET la fiche après le run.
+               # Le carnet d'appels et la fiche de qualité (0.28.0) : l'option ET la fiche après le run.
                "record_calls=20", "for _fiche in builder.health_all().values():", "print(_fiche.summary())",
-               # Apprendre de l'erreur (main, non publié) : seulement pour un outil qui a des défauts.
+               # Apprendre de l'erreur (0.28.0) : seulement pour un outil qui a des défauts.
                "if _fiche.defects:", "print(builder.improve(_fiche.name).summary())",
-               # Apprendre aussi des refus (main, non publié) : sans défaut, mais avec des refus non jugés.
+               # Apprendre aussi des refus (0.28.0) : sans défaut, mais avec des refus non jugés.
                "elif _fiche.refused_calls:", "builder.improve(_fiche.name, learn_from_refusals=True)"),
     "04": ("except TokenBudgetExceeded", "except MaxStepsExceeded", ".resume(borne.state"),
     "11": ("describe=describe", "on_refused=", "on_offtopic="),
@@ -180,7 +180,7 @@ ATTENDUS = {
     # 0.25.0 : la garde de la réponse (kwarg d'Agent) et le code comme action, version compacte.
     "garde_reponse": ('output_guard="neutralize"', 'url_guard="deny"', "agent.enable_code_action(compact=True)",
                       "@agent.tool(untrusted=True)"),
-    # Frontière obligatoire et lecture web par l'hôte (main, non publié) : l'import, l'outil sur sa liste de sites,
+    # Frontière obligatoire et lecture web par l'hôte (0.28.0) : l'import, l'outil sur sa liste de sites,
     # le kwarg d'Agent, et le code comme action qui l'appelle.
     "lecture_web": ("from autoagent.webfetch import http_fetch_tool", 'agent.add_tool(http_fetch_tool(["pypi.org"]))',
                     "require_boundary=True", 'url_guard="deny"', "agent.enable_code_action(compact=True)"),

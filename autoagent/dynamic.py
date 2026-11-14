@@ -234,7 +234,7 @@ class _Cas:
 
 @dataclass
 class ImprovementResult:
-    """Le compte rendu d'un `DynamicToolBuilder.improve` (main, non publié).
+    """Le compte rendu d'un `DynamicToolBuilder.improve` (0.28.0).
 
     Attributes:
         name: l'outil.
@@ -310,7 +310,7 @@ class ImprovementResult:
 
 @dataclass(frozen=True)
 class ToolHealth:
-    """La fiche de qualité d'un outil créé par le modèle (`DynamicToolBuilder.health`, main, non publié).
+    """La fiche de qualité d'un outil créé par le modèle (`DynamicToolBuilder.health`, 0.28.0).
 
     Attributes:
         name, status: le nom ; `"active"`, `"retired"` ou `"quarantined"`.
@@ -640,14 +640,14 @@ class DynamicToolBuilder:
         max_record_chars: int = 4000,
         max_build_tokens: int = 8192,
     ) -> None:
-        """``max_build_tokens`` (main, non publié) : le plafond de SORTIE de l'appel au modèle constructeur (8192,
+        """``max_build_tokens`` (0.28.0) : le plafond de SORTIE de l'appel au modèle constructeur (8192,
         comme avant). Un modèle qui réfléchit le dépense avant d'écrire l'outil — mesuré sur Gemini, à une demande
         d'amélioration : 7 861 jetons de réflexion sur 8 192, réponse coupée. Une réponse coupée par ce plafond
         lève ``ToolValidationError`` en le DISANT, et n'est jamais reprise par ``max_repairs`` : au même plafond,
         la reprise rendrait la même réponse coupée. `improve` garde ce plafond. Un fournisseur peut refuser une
         valeur plus haute que la limite de son modèle.
 
-        ``record_calls`` (main, non publié) : le CARNET d'appels. Les ``N`` derniers appels de chaque outil de
+        ``record_calls`` (0.28.0) : le CARNET d'appels. Les ``N`` derniers appels de chaque outil de
         la bibliothèque sont gardés dans ``tools_dir/<nom>.calls.jsonl`` — ce qu'il a reçu, l'issue (``kind``),
         la cause, la durée, la version du code, la teinte du run — et relus par ``calls(nom)``. ``0`` (défaut) :
         rien n'est écrit. Demande ``persist=True``. Le carnet garde ce que l'outil REÇOIT : il peut porter des

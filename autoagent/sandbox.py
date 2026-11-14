@@ -1214,7 +1214,7 @@ class SubprocessSandbox:
 # pont, Docker). Une erreur venue du code de l'outil commence par le nom de son exception, jamais par ceci.
 _DELAI_DEPASSE = "Generated tool timed out"
 
-# Le REFUS DÉCLARÉ (main, non publié) : un outil qui lève `ValueError("invalid input: …")` dit qu'il refuse cette
+# Le REFUS DÉCLARÉ (0.28.0) : un outil qui lève `ValueError("invalid input: …")` dit qu'il refuse cette
 # entrée — ce n'est pas un plantage de son code. Le début de l'erreur telle que le runner la rend, en minuscules.
 # C'est la déclaration de l'outil sur LUI-MÊME : elle reste visible (carnet, fiche, erreur rendue à l'appelant),
 # l'hôte peut la juger à tort, et elle ne masque jamais un échec de l'hôte (compté de son côté).
@@ -1237,7 +1237,7 @@ class GeneratedPythonTool:
     # raison d'un refus. La bibliothèque persistante y refuse un outil en quarantaine hors du
     # run qui l'a construit. Sécurité = fail-CLOSED : un contrôle qui plante refuse.
     admission: "Callable[[str], str | None] | None" = None
-    # Crochet de SURVEILLANCE (main, non publié) : `recorder(appel)` après CHAQUE appel, avec ce que l'outil a
+    # Crochet de SURVEILLANCE (0.28.0) : `recorder(appel)` après CHAQUE appel, avec ce que l'outil a
     # reçu et rendu — `{"name", "ok", "kind", "seconds", "args", "result", "error"}`. `kind` est l'issue classée
     # par ce que l'HÔTE a vu, jamais par le texte de l'erreur (que l'outil choisit) : `ok`, `exception` (l'outil
     # a planté), `timeout`, `host` (une fonction de l'hôte a refusé ou échoué), `sandbox` (le bac lui-même a
@@ -1245,7 +1245,7 @@ class GeneratedPythonTool:
     # refusé l'entrée : `ValueError("invalid input: …")`). La bibliothèque
     # persistante y tient ses compteurs et son carnet. Fail-open comme `observer`.
     recorder: "Callable[[dict[str, Any]], None] | None" = None
-    # D'où viennent les TESTS de cet outil (main, non publié) — `{"kind": "none"}` (aucun), `"self_tests"` (écrits
+    # D'où viennent les TESTS de cet outil (0.28.0) — `{"kind": "none"}` (aucun), `"self_tests"` (écrits
     # par le modèle qui a écrit l'outil), `"examples"` (des cas de l'hôte, dont une part cachée au modèle).
     # `None` : inconnu (un outil chargé hors de la bibliothèque persistante).
     verified_by: "dict[str, Any] | None" = None

@@ -3,7 +3,7 @@
 > Référence technique complète pour intégrer, étendre et tester `autoagent` dans un projet Python.
 > **Public visé** : devs qui vont écrire des tools, brancher l'agent sur leur app, ou éventuellement contribuer à la lib.
 
-**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-11-12 · **Couvre autoagent** : 0.27.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
+**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-11-14 · **Couvre autoagent** : 0.28.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
 
 ---
 
@@ -67,7 +67,7 @@
 46. [Provenance des outils générés, et la teinte qui descend dans les sous-agents](#46-provenance-des-outils-générés-et-la-teinte-qui-descend-dans-les-sous-agents) *(0.25.0)*
 47. [La garde du canal de la réponse — `output_guard`](#47-la-garde-du-canal-de-la-réponse--output_guard) *(0.25.0)*
 48. [Les données au repos gardent leur provenance](#48-les-données-au-repos-gardent-leur-provenance) *(0.27.0)*
-49. [La frontière obligatoire et la lecture web par l'hôte](#49-la-frontière-obligatoire-et-la-lecture-web-par-lhôte) *(sur `main`, non publié)*
+49. [La frontière obligatoire et la lecture web par l'hôte](#49-la-frontière-obligatoire-et-la-lecture-web-par-lhôte) *(0.28.0)*
 
 ---
 
@@ -189,7 +189,7 @@ print(len(result.messages))  # historique complet
 python examples/demo_autoagent.py        # 3 agents + workspace borné, 55 lignes
 python examples/demo_pure_python.py      # LA MÊME chose sans la lib : 164 lignes
 
-# Les 40 démos thématiques (une facette chacune — voir leur README) :
+# Les 43 démos thématiques (une facette chacune — voir leur README) :
 python examples_autoagent/01_hello_tools.py
 python examples_autoagent/17_memoire_factuelle.py
 ```
@@ -1899,7 +1899,7 @@ jetons (98,7 %) », chiffre d'un exemple illustratif d'Anthropic (« Code execut
 fait **après** avoir vu les erreurs sur les mêmes tâches, donc optimiste. Un seul modèle, des tâches
 jouets : une direction à valider, pas un résultat général.
 
-### 11.10 Surveiller un outil créé — le carnet d'appels *(sur `main`, non publié)*
+### 11.10 Surveiller un outil créé — le carnet d'appels *(0.28.0)*
 
 Le but des outils dynamiques n'est pas seulement que l'agent écrive l'outil qui lui manque : c'est qu'on puisse
 SURVEILLER ces outils, MESURER leur qualité et APPRENDRE de leurs erreurs. Première marche : savoir ce qui s'est
@@ -1969,7 +1969,7 @@ mesure de qualité (la marche suivante). Un seul run, un seul outil : un constat
 **Preuves.** `tests/test_carnet_outils.py` (47 tests) ; 43 mutations du code, toutes attrapées. Démo 42 ;
 constructeur : option « carnet d'appels » du bloc Outils dynamiques.
 
-### 11.11 Mesurer un outil créé — la fiche de qualité *(sur `main`, non publié)*
+### 11.11 Mesurer un outil créé — la fiche de qualité *(0.28.0)*
 
 Le carnet (§11.10) dit ce qui s'est passé. Il ne dit pas ce que VAUT l'outil : il ne voit ni un résultat faux qui
 ne plante pas, ni une mauvaise entrée refusée à raison, ni un appel que le schéma a refusé avant que l'outil
@@ -2040,7 +2040,7 @@ bibliothèque ne devine pas qu'un refus était légitime. Un seul run, un seul o
 **Preuves.** `tests/test_fiche_outils.py` (44 tests) ; 45 mutations du code, toutes attrapées. Démo 42
 (partie 4) ; le preset « Outils dynamiques, version pro » du constructeur affiche la fiche après le run.
 
-### 11.12 Apprendre des erreurs — `improve`, le refus déclaré, `rollback` *(sur `main`, non publié)*
+### 11.12 Apprendre des erreurs — `improve`, le refus déclaré, `rollback` *(0.28.0)*
 
 Un outil créé qui échouait était retiré, et c'était tout : refait, il pouvait refaire la même faute. Ici l'erreur
 sert, et les trois responsabilités restent séparées — le modèle CRÉE, du code VÉRIFIE, l'hôte JUGE et décide.
@@ -2128,7 +2128,7 @@ modèle : le refus d'une mauvaise correction n'est prouvé que par les tests et 
 55 mutations du code, toutes attrapées. Démo 42 (partie 5) ; le preset « Outils dynamiques, version pro » du
 constructeur appelle `improve` pour un outil qui a des défauts.
 
-### 11.13 Prouver — le banc « outils qui cassent » *(sur `main`, non publié)*
+### 11.13 Prouver — le banc « outils qui cassent » *(0.28.0)*
 
 `improve` (§11.12) est prouvé par ses tests. Reste la question qui compte : sur un VRAI modèle, vaut-il mieux que
 ce qui se faisait avant ? `autoagent.toolbench` le mesure.
@@ -2221,7 +2221,7 @@ code et les cas.
 **Preuves.** `tests/test_banc_outils.py` (96 tests), `tests/test_plafond_du_constructeur.py` (15 tests) ;
 53 mutations du code, toutes attrapées. Démo 43 — dans la galerie du constructeur, avec sa sortie réelle.
 
-### 11.14 Apprendre des refus — sans rien demander à l'hôte *(sur `main`, non publié)*
+### 11.14 Apprendre des refus — sans rien demander à l'hôte *(0.28.0)*
 
 Le banc (§11.13) a montré la limite : l'outil d'un vrai modèle REFUSE proprement l'écriture qu'il ne connaît pas
 (« 1:30 ») au lieu de planter ; un refus que personne n'a jugé n'est pas un défaut ; sans l'hôte, `improve` n'avait
@@ -2612,7 +2612,7 @@ Passe un `post_turn_hook` (§4.7) qui regarde `ctx.tool_calls` et retourne un `M
 
 ### Annexe A — Liste des fichiers de la lib
 
-*(vérifiée contre le disque sur `main` à la 0.27.0 — `autoagent/` : 36 modules + `__init__.py` ; `providers/` : 6 modules + `__init__.py`)*
+*(vérifiée contre le disque sur `main` à la 0.28.0 — `autoagent/` : 37 modules + `__init__.py` ; `providers/` : 6 modules + `__init__.py`)*
 
 ```
 autoagent/
@@ -2670,12 +2670,12 @@ autoagent/
 ├── redteam.py               # 0.24.0 — banc d'injection à canari : run_injection_bench, positive_control,
 │                            # DocileProvider, injection_variant / injection_tasks (§42.1)
 ├── faults.py                # 0.24.0 — banc de pannes : FaultServer (vrai serveur HTTP local) + run_fault_bench (§42.2)
-├── toolbench.py             # main (non publié) — banc « outils qui cassent » : run_tool_bench,
+├── toolbench.py             # 0.28.0 — banc « outils qui cassent » : run_tool_bench,
 │                            # positive_control_tools, TOOL_TASKS (§11.13)
 ├── ws.py                    # 0.25.0 — client WebSocket synchrone RFC 6455, stdlib seule (§44)
 ├── output_guard.py          # 0.25.0 — OutputGuard / guard_output : la garde du canal de la réponse (§47) ;
 │                            # 0.26.0 — guard_call_urls : la garde des URL d'appel, url_guard (§47.1)
-├── webfetch.py              # main (non publié) — http_fetch_tool : lire le web PAR L'HÔTE, à une liste de
+├── webfetch.py              # 0.28.0 — http_fetch_tool : lire le web PAR L'HÔTE, à une liste de
 │                            # sites, adresses internes refusées (§49.2)
 └── providers/
     ├── __init__.py          # create_provider (fabrique par nom)
@@ -2786,10 +2786,10 @@ from autoagent.output_guard import guard_call_urls                          # 0.
 from autoagent.redteam import run_persistence_bench                         # 0.27.0 — banc de persistance (§48.3)
 from autoagent.gate import run_taint, note_untrusted_read                   # 0.27.0 — provenance des données au repos (§48)
 from autoagent.gate import delegation_taint                                 # 0.25.0 — la teinte qui descend (§46)
-from autoagent.webfetch import http_fetch_tool                             # main (non publié) — lecture web par l'hôte (§49.2)
-from autoagent.dynamic import ToolHealth                                   # main (non publié) — la fiche de qualité d'un outil créé (§11.11)
-from autoagent.dynamic import ImprovementResult                            # main (non publié) — le compte rendu de improve (§11.12)
-from autoagent.toolbench import run_tool_bench, positive_control_tools, TOOL_TASKS  # main (non publié) — le banc « outils qui cassent » (§11.13)
+from autoagent.webfetch import http_fetch_tool                             # 0.28.0 — lecture web par l'hôte (§49.2)
+from autoagent.dynamic import ToolHealth                                   # 0.28.0 — la fiche de qualité d'un outil créé (§11.11)
+from autoagent.dynamic import ImprovementResult                            # 0.28.0 — le compte rendu de improve (§11.12)
+from autoagent.toolbench import run_tool_bench, positive_control_tools, TOOL_TASKS  # 0.28.0 — le banc « outils qui cassent » (§11.13)
 ```
 
 ### Annexe C — Cheat-sheet
@@ -6363,7 +6363,7 @@ d'un run sain (la marque ne se propage pas d'un fait à l'autre). `EvolutionRunt
 
 ## 49. La frontière obligatoire et la lecture web par l'hôte
 
-*(sur `main`, non publié)* Première étape du « mode atelier » : laisser le modèle créer librement DANS un bac, sans
+*(0.28.0)* Première étape du « mode atelier » : laisser le modèle créer librement DANS un bac, sans
 rien relâcher à la frontière. Elle pose deux choses : une frontière qu'on peut EXIGER d'un seul réglage, et un
 accès au web qui ne passe pas par le réseau du bac.
 

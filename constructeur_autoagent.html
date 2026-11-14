@@ -518,8 +518,8 @@ const DEFS = {
       {grp:"Avancé", k:"tsearch_threshold", l:"tool_search : seuil (nb d'outils)", kind:"number", def:"15", w:"half"},
       {grp:"Avancé", k:"tsearch_max", l:"tool_search : résultats max", kind:"number", def:"5", w:"half"},
       {grp:"Avancé", k:"codeact", l:"code comme action (enable_code_action)", kind:"select", opts:["off","une ligne","compact"], def:"off", w:"half", hint:"0.25.0 — le modèle écrit UN programme qui appelle tes outils ; seul ce qu'il rend revient. Pour des outils à GROS résultats (−60 % de jetons mesuré sur Gemini) ; « compact » : consigne réduite, −15 % sur les petites tâches"},
-      {grp:"Avancé", k:"frontiere", l:"require_boundary (frontière obligatoire)", kind:"check", def:false, hint:"main, non publié — le code écrit par le modèle (code comme action, run_python, outils générés) ne tourne que derrière une VRAIE frontière : le noyau sous Linux, sinon Docker s'il tourne, sinon l'agent refuse de démarrer. Ses sous-agents en héritent le temps d'une délégation."},
-      {grp:"Avancé", k:"webfetch", l:"http_fetch : sites permis (virgules ; vide = pas d'outil)", kind:"text", def:"", w:"half", hint:"main, non publié — un outil qui lit une page web PAR L'HÔTE, sur ces seuls sites et leurs sous-domaines : GET seul, https, adresses internes et métadonnées refusées, taille et temps bornés. Le bac reste coupé du réseau ; le code du modèle l'appelle par call_host. Ce qui revient est teinté (non fiable)."},
+      {grp:"Avancé", k:"frontiere", l:"require_boundary (frontière obligatoire)", kind:"check", def:false, hint:"0.28.0 — le code écrit par le modèle (code comme action, run_python, outils générés) ne tourne que derrière une VRAIE frontière : le noyau sous Linux, sinon Docker s'il tourne, sinon l'agent refuse de démarrer. Ses sous-agents en héritent le temps d'une délégation."},
+      {grp:"Avancé", k:"webfetch", l:"http_fetch : sites permis (virgules ; vide = pas d'outil)", kind:"text", def:"", w:"half", hint:"0.28.0 — un outil qui lit une page web PAR L'HÔTE, sur ces seuls sites et leurs sous-domaines : GET seul, https, adresses internes et métadonnées refusées, taille et temps bornés. Le bac reste coupé du réseau ; le code du modèle l'appelle par call_host. Ce qui revient est teinté (non fiable)."},
       {grp:"Avancé", k:"parallel", l:"parallel_tool_calls (outils I/O en parallèle)", kind:"check", def:false},
       {grp:"Avancé", k:"baseurl", l:"base_url (provider avancé)", kind:"text", def:"", w:"half", hint:"ex. api.moonshot.ai/v1 (Kimi), localhost:11434/v1 (Ollama)"},
       {grp:"Avancé", k:"keyenv",  l:"api_key_env (nom de var d'env)", kind:"text", def:"", w:"half", hint:"vide = auto"},
@@ -582,7 +582,7 @@ const DEFS = {
       {k:"repairs", l:"reprises max (max_repairs)", kind:"number", def:"0", w:"half", hint:"un refus (JSON, validateur, self-test faux) est renvoyé au constructeur ; 0 = comme avant. Chaque reprise est un appel payé."},
       {k:"ceil",    l:"permissions que le modèle peut s'accorder (plafond)", kind:"text", def:"", w:"half", hint:"ex. filesystem.*, network — VIDE = aucune. Sans plafond, le modèle choisit lui-même ses droits (réseau compris)."},
       {k:"persist", l:"bibliothèque persistante (réutiliser les outils d'un run à l'autre)", kind:"check", def:false},
-      {k:"carnet",  l:"carnet d'appels : derniers appels gardés par outil (vide = aucun)", kind:"number", def:"", w:"half", hint:"main, non publié — avec la bibliothèque persistante : note ce que chaque outil créé a reçu, l'issue (ok, exception, timeout, host, sandbox, rejected), la cause, la durée ; se relit par builder.calls(nom) et se résume par builder.health(nom) — la fiche de qualité ; builder.improve(nom) en tire une nouvelle version, gardée seulement si du code le prouve. Seuls les défauts de l'outil comptent contre lui. Le carnet peut contenir des données personnelles : passe redact= dans ton code."},
+      {k:"carnet",  l:"carnet d'appels : derniers appels gardés par outil (vide = aucun)", kind:"number", def:"", w:"half", hint:"0.28.0 — avec la bibliothèque persistante : note ce que chaque outil créé a reçu, l'issue (ok, exception, timeout, host, sandbox, rejected), la cause, la durée ; se relit par builder.calls(nom) et se résume par builder.health(nom) — la fiche de qualité ; builder.improve(nom) en tire une nouvelle version, gardée seulement si du code le prouve. Seuls les défauts de l'outil comptent contre lui. Le carnet peut contenir des données personnelles : passe redact= dans ton code."},
       {k:"runpy",   l:"ajouter run_python (extrait de code éphémère, jamais gardé)", kind:"check", def:false},
       {k:"manifest", l:"manifest d'approbation (vide = pas de promotion)", kind:"text", def:"", hint:"ex. approved_tools.json — un outil généré tourne en NATIF seulement si son sha256 y est"},
     ],
@@ -862,7 +862,7 @@ const INFO = {
 const ENV = {gemini:"GEMINI_API_KEY", openai:"OPENAI_API_KEY", anthropic:"ANTHROPIC_API_KEY", deepseek:"DEEPSEEK_API_KEY", groq:"GROQ_API_KEY"};
 // Version de la lib que ce constructeur couvre. Le test headless la compare à
 // autoagent.__version__ : le constructeur ne peut plus prendre de retard en silence.
-const LIB_VERSION = "0.27.0";
+const LIB_VERSION = "0.28.0";
 // Modèle par défaut de chaque fournisseur : changer le provider sans
 // changer le modèle produisait `from_model("deepseek","gemini-…")`.
 const MODELE_DEFAUT = {gemini:"gemini-3.7-flash", openai:"gpt-4o-mini",
@@ -1602,7 +1602,7 @@ function generate(){
       L.push(`${av}.enable_tool_search(threshold=${num(agentB.f.tsearch_threshold,15)}${tsm})`);
       L.push(``);
     }
-    // lecture web par l'hôte, à une liste de sites (main, non publié)
+    // lecture web par l'hôte, à une liste de sites (0.28.0)
     if(agentB && (agentB.f.webfetch||"").trim()){
       const sites = agentB.f.webfetch.split(",").map(x => x.trim()).filter(Boolean);
       L.push(`# Lecture web PAR L'HÔTE, sur ces seuls sites : GET, https, adresses internes refusées, taille et temps`);

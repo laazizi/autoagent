@@ -1,4 +1,4 @@
-"""Le banc « outils qui cassent » (main, non publié) — ce que vaut `improve`, mesuré au lieu d'être affirmé.
+"""Le banc « outils qui cassent » (0.28.0) — ce que vaut `improve`, mesuré au lieu d'être affirmé.
 
 Un outil créé par le modèle marche sur ses premières entrées ; puis d'autres écritures arrivent, et il échoue.
 Que faire ? Le banc compare cinq réactions, À PARTIR DU MÊME premier outil :

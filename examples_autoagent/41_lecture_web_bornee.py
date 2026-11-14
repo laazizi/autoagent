@@ -1,6 +1,6 @@
 """41 - Lire le web sans ouvrir le bac, et une frontiere obligatoire pour le code du modele.
 
-Deux reglages qui vont ensemble (main, non publie) :
+Deux reglages qui vont ensemble (0.28.0) :
 
   1. `Agent(require_boundary=True)` : le code ecrit par le modele (code comme action, run_python,
      outils generes) ne tourne QUE derriere une vraie frontiere - le confinement par le noyau sous

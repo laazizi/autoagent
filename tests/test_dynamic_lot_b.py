@@ -190,7 +190,7 @@ class TestBibliotheque:
         assert e["sha256"] == hashlib.sha256((tmp_path / "doubler.py").read_bytes()).hexdigest()
         assert (e["calls"], e["errors"], e["retired"]) == (0, 0, False)
         assert e["created"].endswith("Z") and e["description"] == "double un entier"
-        assert outil.recorder is not None            # la bibliothèque compte par `recorder` (main, non publié)
+        assert outil.recorder is not None            # la bibliothèque compte par `recorder` (0.28.0)
 
     def test_les_self_tests_ne_comptent_pas_comme_des_appels(self, tmp_path: Path) -> None:
         b, _ = _construire(tmp_path)
