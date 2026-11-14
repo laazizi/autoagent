@@ -169,7 +169,9 @@ ATTENDUS = {
                # Le carnet d'appels et la fiche de qualité (main, non publié) : l'option ET la fiche après le run.
                "record_calls=20", "for _fiche in builder.health_all().values():", "print(_fiche.summary())",
                # Apprendre de l'erreur (main, non publié) : seulement pour un outil qui a des défauts.
-               "if _fiche.defects:", "print(builder.improve(_fiche.name).summary())"),
+               "if _fiche.defects:", "print(builder.improve(_fiche.name).summary())",
+               # Apprendre aussi des refus (main, non publié) : sans défaut, mais avec des refus non jugés.
+               "elif _fiche.refused_calls:", "builder.improve(_fiche.name, learn_from_refusals=True)"),
     "04": ("except TokenBudgetExceeded", "except MaxStepsExceeded", ".resume(borne.state"),
     "11": ("describe=describe", "on_refused=", "on_offtopic="),
     # Bug vu à l'écran : un outil PARTAGÉ perdait ses drapeaux. Ils doivent suivre

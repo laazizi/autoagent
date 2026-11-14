@@ -115,6 +115,6 @@ class TestLePlafondSeRegle:
         petite = dataclasses.replace(t, easy=t.easy[:2], hard=t.hard[:1], later=t.later[:1])
         fournisseur = ScriptedToolProvider([petite])
         run_tool_bench(fournisseur, tasks=[petite], max_build_tokens=24000)
-        assert [r.max_tokens for r in fournisseur.requests] == [24000] * 4
+        assert [r.max_tokens for r in fournisseur.requests] == [24000] * 5
         with pytest.raises(ValueError, match="max_build_tokens"):
             run_tool_bench(fournisseur, tasks=[petite], max_build_tokens=0)

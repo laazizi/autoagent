@@ -4,7 +4,7 @@ L'agent ecrit l'outil qui lui manque (demo 06) et la bibliotheque le garde (`per
 vaut cet outil a l'usage ? Jusqu'ici on n'avait que des compteurs. Le carnet (`record_calls=N`, main,
 non publie) note chaque appel : ce que l'outil a recu, l'issue, la cause, la duree, la version du code.
 
-Cinq choses a voir, sans cle (le « modele » qui ecrit les outils est scripte) :
+Six choses a voir, sans cle (le « modele » qui ecrit les outils est scripte) :
 
   1. un outil a defaut plante sur une entree qu'il n'attendait pas : le carnet dit SUR QUOI ;
   2. une fonction de l'hote refusee par la politique n'est pas un defaut de l'outil : elle est comptee
@@ -15,7 +15,11 @@ Cinq choses a voir, sans cle (le « modele » qui ecrit les outils est scripte) 
      ni un refus legitime : c'est l'HOTE qui juge (`builder.report(nom, id, correct=...)`), pas le modele ;
   5. APPRENDRE de l'erreur (`builder.improve(nom)`) : le modele recoit le vrai cas rate et ecrit une nouvelle
      version ; du CODE la juge - le cas rate doit etre resolu, et les cas qui marchaient, que le modele n'a
-     jamais vus, doivent donner le meme resultat. Sinon l'ancienne version reste.
+     jamais vus, doivent donner le meme resultat. Sinon l'ancienne version reste ;
+  6. APPRENDRE D'UN REFUS, sans rien demander a l'hote (`improve(nom, learn_from_refusals=True)`) : un outil
+     ecrit par un vrai modele refuse proprement ce qu'il ne sait pas lire, au lieu de planter - et un refus
+     que personne n'a juge n'est pas un defaut. Le modele decide si l'entree refusee etait valide ; le code
+     prouve que rien de ce qui marchait ne change. Ce qu'il lit en plus est dit « non verifie ».
 
     python examples_autoagent/42_outils_surveilles.py
 """
@@ -249,13 +253,66 @@ def partie_5(constructeur: DynamicToolBuilder) -> None:
 
 
 
+# Un outil comme un vrai modele l'ecrit : il REFUSE proprement ce qu'il ne sait pas lire.
+CODE_POURCENT = (
+    "def run(args, context):\n"
+    "    t = args['texte']\n"
+    "    if not t.endswith('%'):\n"
+    "        raise ValueError('invalid input: pas un pourcentage')\n"
+    "    return float(t[:-1]) / 100\n"
+)
+# La version que le modele rend quand on lui montre ce que l'outil a refuse.
+CODE_POURCENT_ETENDU = (
+    "def run(args, context):\n"
+    "    t = args['texte'].lower().replace('pour cent', '%').replace(' ', '')\n"
+    "    if not t.endswith('%'):\n"
+    "        raise ValueError('invalid input: pas un pourcentage')\n"
+    "    try:\n"
+    "        return float(t[:-1].replace(',', '.')) / 100\n"
+    "    except ValueError:\n"
+    "        raise ValueError('invalid input: pas un pourcentage')\n"
+)
+
+
+def partie_6(dossier: Path) -> None:
+    print()
+    print("=" * 78)
+    print("6) Apprendre d'un REFUS, sans rien demander a l'hote")
+    print("=" * 78)
+    demande = "Convertit un pourcentage ecrit comme 12% en fraction."
+    modele = Scripte([_outil("pourcentage", demande, CODE_POURCENT, "texte"),
+                      _outil("pourcentage", demande, CODE_POURCENT_ETENDU, "texte")])
+    constructeur = DynamicToolBuilder(modele, tools_dir=dossier, persist=True, record_calls=20)
+    outil = constructeur.build(ToolBuildRequest(capability=demande))
+    print(f"  pourcentage('12%') -> {outil(texte='12%')}")
+    for texte in ("80 pour cent", "???"):
+        try:
+            outil(texte=texte)
+        except ToolError as refus:
+            print(f"  pourcentage({texte!r}) -> REFUSE ({str(refus)[:49]})")
+    print("\n  L'outil ne plante pas : il refuse. Personne ne dit si c'etait a raison. Pour `improve`, il n'y a")
+    print("  donc rien a corriger :\n")
+    print("  " + constructeur.improve("pourcentage").summary())
+    print("\n  Avec `learn_from_refusals=True`, le modele voit les deux entrees refusees, et decide :\n")
+    resultat = constructeur.improve("pourcentage", learn_from_refusals=True)
+    print("  " + resultat.summary())
+    for cas in resultat.extended_cases:
+        print(f"      lue maintenant : {cas['args']['texte']!r} -> {cas['got']}   (a relire : personne ne l'a verifiee)")
+    print(f"      encore refusee : {resultat.still_refused} entree (« ??? »)")
+    print("\n  Ce que le code a prouve : le cas reussi rend le meme resultat, et aucun refus n'est devenu un")
+    print("  plantage. Ce qu'il n'a PAS prouve : que 0.8 est la bonne lecture de « 80 pour cent ». La fiche le dit :\n")
+    print("  " + constructeur.health("pourcentage").summary().splitlines()[0])
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         partie_1(Path(tmp) / "a")
         partie_2(Path(tmp) / "b")
         partie_3(Path(tmp) / "c")
         partie_5(partie_4(Path(tmp) / "d"))
+        partie_6(Path(tmp) / "e")
     print("\n  Limites : sans verdict de l'hote, un resultat faux reste « ok » - et il compte meme comme un cas")
     print("  REUSSI a ne pas changer. improve ne s'applique pas a un outil qui appelle des fonctions de l'hote")
     print("  (le rejouer referait des effets de bord). « Meme resultat qu'avant » prouve qu'on n'a rien casse,")
-    print("  pas que l'outil est juste partout.")
+    print("  pas que l'outil est juste partout. Et une entree lue grace a `learn_from_refusals` n'est PAS verifiee :")
+    print("  c'est le modele qui l'a jugee valide - le niveau de preuve d'une premiere construction, pas plus.")

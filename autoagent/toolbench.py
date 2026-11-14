@@ -1,17 +1,21 @@
 """Le banc « outils qui cassent » (main, non publié) — ce que vaut `improve`, mesuré au lieu d'être affirmé.
 
 Un outil créé par le modèle marche sur ses premières entrées ; puis d'autres écritures arrivent, et il échoue.
-Que faire ? Le banc compare quatre réactions, À PARTIR DU MÊME premier outil :
+Que faire ? Le banc compare cinq réactions, À PARTIR DU MÊME premier outil :
 
 * ``none``             — rien : l'outil reste comme il est ;
 * ``rebuild``          — le refaire à l'aveugle, depuis la même demande (un retrait suivi d'une recréation) ;
 * ``improve``          — `DynamicToolBuilder.improve`, quand l'hôte a dit ce qui était attendu (`report`) ;
-* ``improve_unjudged`` — `improve`, quand l'hôte n'a RIEN dit : seuls les plantages sont connus.
+* ``improve_unjudged`` — `improve`, quand l'hôte n'a RIEN dit : seuls les plantages sont connus ;
+* ``improve_refusals`` — `improve(learn_from_refusals=True)`, l'hôte n'ayant rien dit : le modèle voit aussi ce
+  que l'outil a REFUSÉ, et décide ce qui était une demande valide écrite autrement.
 
 Le juge est du CODE : chaque entrée d'une tâche porte son résultat attendu. Après la réaction, l'outil est essayé
 sur des entrées que rien n'a jamais vues (`ToolTask.later`) — ni le modèle, ni le carnet. Une UNITÉ (une tâche, un
 essai) est résolue quand toutes passent. Une entrée que le premier outil lisait et que la réaction a perdue est
-comptée à part (`regressions`).
+comptée à part (`regressions`). Chaque tâche porte aussi des entrées INVALIDES (`"???"`, puis `"abc"`, `"--"`
+jamais vues) : un outil qui se met à leur répondre est compté (`accepted_invalid`) — c'est le risque d'une
+réaction qui laisse le modèle décider de ce qui est valide.
 
 Deux niveaux, comme les autres bancs. Niveau 1 : `ScriptedToolProvider`, un « constructeur » scripté — il mesure le
 CODE du banc et de `improve`, hors ligne, sans jeton ; `positive_control_tools()` doit y voir `improve` résoudre ce
@@ -52,12 +56,13 @@ __all__ = [
     "same_result",
 ]
 
-ARMS = ("none", "rebuild", "improve", "improve_unjudged")
+ARMS = ("none", "rebuild", "improve", "improve_unjudged", "improve_refusals")
 _NOMS = {
     "none": "rien",
     "rebuild": "refait à l'aveugle",
     "improve": "improve (l'hôte dit l'attendu)",
     "improve_unjudged": "improve (l'hôte ne dit rien)",
+    "improve_refusals": "improve (rien dit, les refus servent)",
 }
 Case = tuple[str, Any]      # (l'entrée, le résultat attendu)
 
@@ -72,6 +77,9 @@ class ToolTask:
         easy: les premières entrées, celles que la demande décrit — `(entrée, attendu)`.
         hard: d'autres écritures, VALIDES, qui arrivent ensuite et que le premier outil ne lit pas forcément.
         later: ce qui arrive APRÈS la réaction — jamais montré au modèle, jamais écrit au carnet.
+        invalid: des entrées qui ne sont PAS des demandes valides, essayées avec les premières (elles entrent
+            au carnet : l'outil doit les refuser, et continuer de les refuser).
+        later_invalid: d'autres entrées invalides, jamais vues : l'outil final ne doit PAS leur répondre.
         naive_code, full_code: pour le niveau 1 seulement — la première version (elle ne lit que le cas
             facile) et la version qui lit tout ; `ScriptedToolProvider` les rend.
         param: le nom de l'unique paramètre (une chaîne).
@@ -85,6 +93,8 @@ class ToolTask:
     naive_code: str = ""
     full_code: str = ""
     param: str = "texte"
+    invalid: tuple[str, ...] = ()
+    later_invalid: tuple[str, ...] = ()
 
 
 def same_result(expected: Any, got: Any, *, rel_tol: float = 1e-9) -> bool:
@@ -104,7 +114,9 @@ def same_result(expected: Any, got: Any, *, rel_tol: float = 1e-9) -> bool:
 
 # ── Les tâches fournies ──────────────────────────────────────────────────────
 # Chaque entrée n'a qu'une lecture défendable. Les versions naïve et complète sont vérifiées par les tests :
-# la naïve lit toutes les entrées faciles et AUCUNE des dures ; la complète les lit toutes.
+# la naïve lit toutes les entrées faciles et AUCUNE des dures ; la complète les lit toutes. Les naïves cassent de
+# trois façons : la plupart PLANTENT, deux rendent une valeur FAUSSE (montant, minutes_depuis_minuit), et deux
+# REFUSENT proprement ce qu'elles ne lisent pas (metres, celsius) — ce que fait le premier outil d'un vrai modèle.
 
 _MINUTES_NAIF = r"""
 import re
@@ -198,8 +210,8 @@ def run(args, context):
 _METRES_NAIF = r"""
 def run(args, context):
     t = args['texte']
-    if not t.endswith('km'):
-        raise ValueError('invalid input: kilometres attendus')
+    if not t.endswith('km') or not t[:-2].isdigit():
+        raise ValueError('invalid input: kilometres attendus, comme 5km')
     return int(t[:-2]) * 1000
 """
 _METRES = r"""
@@ -225,10 +237,13 @@ MOIS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août
 
 def run(args, context):
     t = args['texte'].strip().lower()
-    if '-' in t:
-        return int(t.split('-')[1])
-    if '/' in t:
-        return int(t.split('/')[1])
+    try:
+        if '-' in t:
+            return int(t.split('-')[1])
+        if '/' in t:
+            return int(t.split('/')[1])
+    except (ValueError, IndexError):
+        raise ValueError('invalid input: date illisible')
     for numero, nom in enumerate(MOIS, 1):
         if nom in t.split():
             return numero
@@ -238,9 +253,12 @@ def run(args, context):
 _CELSIUS_NAIF = r"""
 def run(args, context):
     t = args['texte']
-    if not t.endswith('C'):
-        raise ValueError('invalid input: degres Celsius attendus')
-    return float(t[:-1])
+    try:
+        if t.endswith('C'):
+            return float(t[:-1])
+    except ValueError:
+        pass
+    raise ValueError('invalid input: degres Celsius attendus, comme 20C')
 """
 _CELSIUS = r"""
 def run(args, context):
@@ -254,7 +272,7 @@ def run(args, context):
     return v if t[-1] == 'C' else (v - 32) * 5 / 9 if t[-1] == 'F' else v - 273.15
 """
 
-TOOL_TASKS: tuple[ToolTask, ...] = (
+_TACHES: tuple[ToolTask, ...] = (
     ToolTask(
         "minutes_de", "Convertit une durée écrite comme 1h30 en nombre de minutes. Rend le nombre.",
         easy=(("1h30", 90), ("2h", 120), ("0h45", 45)),
@@ -305,6 +323,9 @@ TOOL_TASKS: tuple[ToolTask, ...] = (
         later=(("35C", 35), ("15C", 15), ("32 °F", 0), ("100 °C", 100), ("212F", 100)),
         naive_code=_CELSIUS_NAIF, full_code=_CELSIUS),
 )
+# Les mêmes entrées invalides pour toutes les tâches : du texte qui n'est une demande pour aucune d'elles.
+TOOL_TASKS: tuple[ToolTask, ...] = tuple(
+    dataclasses.replace(tache, invalid=("???",), later_invalid=("abc", "--")) for tache in _TACHES)
 
 
 # ── Le niveau 1 : un constructeur scripté ────────────────────────────────────
@@ -316,12 +337,13 @@ class ScriptedToolProvider(LLMProvider):
     À une demande ordinaire, il rend la version NAÏVE de la tâche (`ToolTask.naive_code`). À une demande
     d'amélioration (`improve`), selon ``fix`` : ``"full"`` la version complète ; ``"regress"`` la version complète
     qui casse la première entrée facile (une mauvaise correction : le rejeu doit la refuser) ; ``"same"`` la
-    version naïve, inchangée. Sans état : sa réponse ne dépend que de la demande. Il déclare 150 jetons par appel,
+    version naïve, inchangée ; ``"guess"`` la version complète qui, au lieu de refuser ce qu'elle ne lit pas, rend 0
+    (ce que le rejeu ne PEUT pas voir : c'est le banc qui le compte, `accepted_invalid`). Sans état : sa réponse ne dépend que de la demande. Il déclare 150 jetons par appel,
     pour que le compte des jetons se vérifie."""
 
     def __init__(self, tasks: Sequence[ToolTask] = TOOL_TASKS, *, fix: str = "full") -> None:
-        if fix not in ("full", "regress", "same"):
-            raise ValueError(f"fix must be 'full', 'regress' or 'same', got {fix!r}")
+        if fix not in ("full", "regress", "same", "guess"):
+            raise ValueError(f"fix must be 'full', 'regress', 'same' or 'guess', got {fix!r}")
         super().__init__(ModelConfig(provider="scripted", model="scripted-1"))
         self.tasks = {task.name: task for task in tasks}
         self.fix = fix
@@ -336,6 +358,10 @@ class ScriptedToolProvider(LLMProvider):
             code = tache.naive_code
         elif self.fix == "full":
             code = tache.full_code
+        elif self.fix == "guess":
+            code = (tache.full_code.replace("def run(", "def _complet(")
+                    + "\ndef run(args, context):\n    try:\n        return _complet(args, context)\n"
+                      "    except ValueError:\n        return 0\n")
         else:
             code = (tache.full_code.replace("def run(", "def _complet(")
                     + f"\ndef run(args, context):\n    if args[{tache.param!r}] == {tache.easy[0][0]!r}:\n"
@@ -367,6 +393,8 @@ class ToolBenchRow:
         first_tokens: jetons de la première construction, commune aux bras de l'unité.
         detail: pourquoi la réaction n'a rien donné — la raison d'`improve` quand il n'a pas installé de version,
             l'erreur d'une construction refusée ; vide sinon.
+        accepted_invalid, invalid_total: entrées INVALIDES jamais vues (`later_invalid`) auxquelles l'outil final
+            a répondu par une valeur, sur combien. Il devait les refuser.
     """
 
     task: str
@@ -381,6 +409,8 @@ class ToolBenchRow:
     hard_total: int
     first_tokens: int
     detail: str = ""
+    accepted_invalid: int = 0
+    invalid_total: int = 0
 
     @property
     def solved(self) -> bool:
@@ -423,7 +453,8 @@ class ToolBenchReport:
         return sum(premiers.values()) + sum(r.tokens for r in self.rows)
 
     def by_arm(self) -> dict[str, dict[str, Any]]:
-        """Par réaction : `units`, `solved`, `right`, `total`, `regressions`, `tokens`, `statuses` (par statut)."""
+        """Par réaction : `units`, `solved`, `right`, `total`, `regressions`, `accepted_invalid`, `invalid_total`,
+        `tokens`, `statuses` (par statut)."""
         rendu: dict[str, dict[str, Any]] = {}
         for arm in self.arms:
             lignes = [r for r in self.rows if r.arm == arm]
@@ -434,6 +465,8 @@ class ToolBenchReport:
                 "units": len(lignes), "solved": sum(r.solved for r in lignes),
                 "right": sum(r.right for r in lignes), "total": sum(r.total for r in lignes),
                 "regressions": sum(r.regressions for r in lignes), "tokens": sum(r.tokens for r in lignes),
+                "accepted_invalid": sum(r.accepted_invalid for r in lignes),
+                "invalid_total": sum(r.invalid_total for r in lignes),
                 "statuses": statuts,
             }
         return rendu
@@ -464,12 +497,15 @@ class ToolBenchReport:
         largeur = max(len(_NOMS[arm]) for arm in self.arms)
         for arm, c in self.by_arm().items():
             statuts = ", ".join(f"{n} {s}" for s, n in sorted(c["statuses"].items(), key=lambda p: (-p[1], p[0])))
+            invalides = (f" · {c['accepted_invalid']}/{c['invalid_total']} invalide(s) acceptée(s)"
+                         if c["invalid_total"] else "")
             lignes.append(f"  {_NOMS[arm]:<{largeur}} : {c['solved']}/{c['units']} unités résolues · {c['right']}/"
-                          f"{c['total']} entrées suivantes justes · {c['regressions']} perdue(s) · {c['tokens']} "
-                          f"jetons · {statuts}")
+                          f"{c['total']} entrées suivantes justes · {c['regressions']} perdue(s){invalides} · "
+                          f"{c['tokens']} jetons · {statuts}")
         for a, b, role in (("none", "rebuild", "contrôle — deux constructions à l'aveugle de la même demande"),
                            ("rebuild", "improve", "ce que l'erreur apporte, l'attendu dit"),
-                           ("rebuild", "improve_unjudged", "ce que l'erreur apporte, rien dit")):
+                           ("rebuild", "improve_unjudged", "ce que l'erreur apporte, rien dit"),
+                           ("rebuild", "improve_refusals", "ce que les refus apportent, sans l'hôte")):
             if a in self.arms and b in self.arms:
                 c = self.compare(a, b)
                 verdict = {"a_better": f"« {_NOMS[a]} » fait mieux", "b_better": f"« {_NOMS[b]} » fait mieux",
@@ -477,7 +513,8 @@ class ToolBenchReport:
                 lignes.append(f"  {_NOMS[a]} → {_NOMS[b]} : {_pts(c['delta'])} [{_pts(c['low'])} ; {_pts(c['high'])}], "
                               f"p = {c['p']:.3f} → {verdict}   ({role})")
         lignes.append("  Unité = une tâche, un essai ; résolue = toutes les entrées suivantes justes ; « perdue » = une "
-                      "entrée que le premier outil lisait. Le juge est du code.")
+                      "entrée que le premier outil lisait ; « invalide acceptée » = une réponse à une entrée qui "
+                      "devait être refusée. Le juge est du code.")
         return "\n".join(lignes)
 
     def to_dict(self) -> dict[str, Any]:
@@ -507,6 +544,14 @@ def _juste(outil: GeneratedPythonTool, args: dict[str, Any], attendu: Any) -> bo
     return issue == "result" and same_result(attendu, valeur)
 
 
+def _repond(outil: GeneratedPythonTool, args: dict[str, Any]) -> bool:
+    """L'outil rend-il une VALEUR pour cette entrée (au lieu de la refuser) ?"""
+    try:
+        return DynamicToolBuilder._rejouer(outil, args)[0] == "result"
+    except Exception:
+        return False
+
+
 def _unite(provider: LLMProvider, task: ToolTask, essai: int, arms: tuple[str, ...],
            sandbox: SubprocessSandbox | DockerSandbox | None, max_repairs: int,
            max_build_tokens: int) -> list[ToolBenchRow]:
@@ -517,14 +562,17 @@ def _unite(provider: LLMProvider, task: ToolTask, essai: int, arms: tuple[str, .
         # `retire_after_errors=0` : c'est le banc qui décide de la réaction, pas le retrait automatique.
         # `allowed_permissions=set()` : des outils de calcul pur — le modèle ne peut rien s'accorder.
         return DynamicToolBuilder(provider, tools_dir=dossier, sandbox=sandbox, persist=True,
-                                  record_calls=4 * len(premiers) if carnet else 0, retire_after_errors=0,
+                                  record_calls=4 * (len(premiers) + len(task.invalid)) if carnet else 0,
+                                  retire_after_errors=0,
                                   allowed_permissions=set(), max_repairs=max_repairs,
                                   max_build_tokens=max_build_tokens)
 
-    def noter(outil: GeneratedPythonTool) -> list[bool]:
+    def noter(outil: GeneratedPythonTool) -> tuple[list[bool], int]:
+        """L'outil final sur ce qui arrive ensuite : les entrées valides (justes ?) et les invalides (acceptées ?)."""
         # Ces entrées ne doivent JAMAIS entrer au carnet : `improve` les verrait. L'outil ne sert plus qu'à être jugé.
         outil.recorder = None
-        return [_juste(outil, {task.param: texte}, attendu) for texte, attendu in task.later]
+        justes = [_juste(outil, {task.param: texte}, attendu) for texte, attendu in task.later]
+        return justes, sum(_repond(outil, {task.param: texte}) for texte in task.later_invalid)
 
     with tempfile.TemporaryDirectory(prefix="autoagent_toolbench_", ignore_cleanup_errors=True) as tmp:
         racine = Path(tmp)
@@ -534,12 +582,13 @@ def _unite(provider: LLMProvider, task: ToolTask, essai: int, arms: tuple[str, .
         except (ToolValidationError, ToolError) as exc:
             # Pas de premier outil : aucune réaction n'a rien à sauver. L'unité compte, ratée pour tous les bras.
             return [ToolBenchRow(task.name, essai, arm, "first_build_failed", 0, len(task.later), 0, 0, 0,
-                                 len(task.hard), _jetons(atelier.last_build_usage), _pourquoi(exc)) for arm in arms]
+                                 len(task.hard), _jetons(atelier.last_build_usage), _pourquoi(exc), 0,
+                                 len(task.later_invalid)) for arm in arms]
         jetons_du_premier = _jetons(atelier.last_build_usage)
 
-        # 1. Les premiers usages — faciles, puis durs — notés au carnet comme n'importe quel appel.
-        for texte, _attendu in premiers:
-            _juste(premier, {task.param: texte}, None)
+        # 1. Les premiers usages — faciles, durs, puis invalides — notés au carnet comme n'importe quel appel.
+        for texte in (*(texte for texte, _attendu in premiers), *task.invalid):
+            _repond(premier, {task.param: texte})
         appels = {a["args"].get(task.param): a for a in atelier.calls(task.name) if isinstance(a.get("args"), dict)}
 
         def bien_lu(texte: str, attendu: Any) -> bool:
@@ -549,24 +598,26 @@ def _unite(provider: LLMProvider, task: ToolTask, essai: int, arms: tuple[str, .
         durs_lus = sum(bien_lu(texte, attendu) for texte, attendu in task.hard)
         reference = noter(premier)          # ce que le premier outil lit des entrées suivantes : le bras `none`
 
-        def ligne(arm: str, statut: str, justes: list[bool], jetons: int, detail: str = "") -> ToolBenchRow:
-            perdues = sum(1 for avant, apres in zip(reference, justes, strict=True) if avant and not apres)
+        def ligne(arm: str, statut: str, note: tuple[list[bool], int], jetons: int, detail: str = "") -> ToolBenchRow:
+            justes, acceptees = note
+            perdues = sum(1 for avant, apres in zip(reference[0], justes, strict=True) if avant and not apres)
             return ToolBenchRow(task.name, essai, arm, statut, sum(justes), len(justes), perdues, jetons, durs_lus,
-                                len(task.hard), jetons_du_premier, detail)
+                                len(task.hard), jetons_du_premier, detail, acceptees, len(task.later_invalid))
 
-        def ameliorer(b: DynamicToolBuilder, arm: str) -> ToolBenchRow:
-            resultat = b.improve(task.name)
+        def ameliorer(b: DynamicToolBuilder, arm: str, *, refus: bool = False) -> ToolBenchRow:
+            resultat = b.improve(task.name, learn_from_refusals=refus)
             # Refusée, ou rien à corriger : l'ancienne version reste — elle lit ce qu'elle lisait.
-            justes = noter(resultat.tool) if resultat.tool is not None else reference
-            return ligne(arm, resultat.status, justes, _jetons(resultat.usage),
+            note = noter(resultat.tool) if resultat.tool is not None else reference
+            return ligne(arm, resultat.status, note, _jetons(resultat.usage),
                          "" if resultat.status == "improved" else resultat.reason[:300])
 
         lignes: dict[str, ToolBenchRow] = {}
         if "none" in arms:
             lignes["none"] = ligne("none", "kept", reference, 0)
-        if "improve_unjudged" in arms:
-            # La même bibliothèque, AVANT tout verdict : l'hôte n'a rien dit, seuls les plantages sont connus.
-            shutil.copytree(racine / "a", racine / "c")
+        # La même bibliothèque, copiée AVANT tout verdict, pour chaque réaction où l'hôte n'a rien dit.
+        for arm, dossier in (("improve_unjudged", "c"), ("improve_refusals", "d")):
+            if arm in arms:
+                shutil.copytree(racine / "a", racine / dossier)
         if "improve" in arms:
             # L'hôte (ici : le juge) signale ce qui n'allait pas, avec l'attendu DANS LA FORME que l'outil rend.
             forme = next((appels[t]["result"] for t, attendu in premiers if bien_lu(t, attendu)), None)
@@ -575,15 +626,25 @@ def _unite(provider: LLMProvider, task: ToolTask, essai: int, arms: tuple[str, .
                 if appel is not None and not bien_lu(texte, attendu):
                     emballe = {next(iter(forme)): attendu} if isinstance(forme, dict) and len(forme) == 1 else attendu
                     atelier.report(task.name, str(appel["id"]), correct=False, expected=emballe)
+            for texte in task.invalid:
+                appel = appels.get(texte)
+                if appel is None:
+                    continue
+                if appel.get("kind") == "ok":       # il a RÉPONDU à une entrée invalide : il fallait la refuser
+                    atelier.report(task.name, str(appel["id"]), correct=False, expected_refusal=True)
+                else:                               # son échec était la bonne réponse : elle doit le rester
+                    atelier.report(task.name, str(appel["id"]), correct=True, reason="this input is invalid")
             lignes["improve"] = ameliorer(atelier, "improve")
         if "improve_unjudged" in arms:
             lignes["improve_unjudged"] = ameliorer(constructeur(racine / "c"), "improve_unjudged")
+        if "improve_refusals" in arms:
+            lignes["improve_refusals"] = ameliorer(constructeur(racine / "d"), "improve_refusals", refus=True)
         if "rebuild" in arms:
             autre = constructeur(racine / "b", carnet=False)
             try:
                 refait = autre.build(demande)
             except (ToolValidationError, ToolError) as exc:
-                lignes["rebuild"] = ligne("rebuild", "build_failed", [False] * len(task.later),
+                lignes["rebuild"] = ligne("rebuild", "build_failed", ([False] * len(task.later), 0),
                                           _jetons(autre.last_build_usage), _pourquoi(exc))
             else:
                 lignes["rebuild"] = ligne("rebuild", "rebuilt", noter(refait), _jetons(autre.last_build_usage))
@@ -632,5 +693,7 @@ def positive_control_tools(*, tasks: Sequence[ToolTask] = TOOL_TASKS,
                            sandbox: SubprocessSandbox | DockerSandbox | None = None) -> ToolBenchReport:
     """Le contrôle positif (niveau 1, hors ligne) : avec un constructeur scripté qui rend d'abord la version
     naïve puis, à `improve`, la version complète, ``improve`` DOIT résoudre des unités que ``none`` et ``rebuild``
-    ne résolvent pas. Sinon le banc est aveugle, et ses chiffres sur un vrai modèle ne valent rien."""
+    ne résolvent pas — et ``improve_refusals`` des unités que ``improve_unjudged`` ne résout pas (celles où la
+    version naïve refuse au lieu de planter). Sinon le banc est aveugle, et ses chiffres sur un vrai modèle ne
+    valent rien."""
     return run_tool_bench(ScriptedToolProvider(tasks), tasks=tasks, sandbox=sandbox)

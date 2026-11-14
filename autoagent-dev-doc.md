@@ -2006,6 +2006,8 @@ constructeur.reinstate("moyenne")                           # remettre un outil 
   modèle. `correct=False` : un résultat faux, un échec sur une entrée valide, un refus du schéma à tort ;
   `expected` peut donner ce qu'il fallait rendre. `correct=True` : le résultat est juste, ou l'échec était
   légitime. Le verdict est écrit sur l'appel, PRIME sur l'issue dans la fiche, et un nouveau remplace l'ancien.
+  `expected_refusal=True` (avec `correct=False`) dit que l'outil a RÉPONDU à une entrée qu'il fallait refuser
+  (§11.14).
   `reason` et `expected` passent par `redact` et sont bornés. Il ne change ni les compteurs ni le statut.
 - **La fiche** (`ToolHealth`) : `status`, `version`, `verified_by` ; `outcomes` (les appels par issue) ;
   `judged` / `defects` / `defect_rate` et son intervalle de Wilson à 95 % — un appel est JUGÉ s'il dit quelque
@@ -2132,7 +2134,7 @@ constructeur appelle `improve` pour un outil qui a des défauts.
 ce qui se faisait avant ? `autoagent.toolbench` le mesure.
 
 Un outil créé marche sur ses premières entrées ; puis d'autres écritures arrivent, et il échoue. Le banc compare
-quatre réactions, À PARTIR DU MÊME premier outil :
+cinq réactions, À PARTIR DU MÊME premier outil :
 
 | réaction | ce qu'elle fait |
 |---|---|
@@ -2140,6 +2142,7 @@ quatre réactions, À PARTIR DU MÊME premier outil :
 | `rebuild` | le refaire à l'aveugle, depuis la même demande (un retrait suivi d'une recréation) |
 | `improve` | `builder.improve`, quand l'hôte a dit ce qui était attendu (`report(correct=False, expected=…)`) |
 | `improve_unjudged` | `builder.improve`, quand l'hôte n'a RIEN dit : seuls les plantages sont connus |
+| `improve_refusals` | `builder.improve(learn_from_refusals=True)`, l'hôte n'ayant rien dit : le modèle voit aussi ce que l'outil a REFUSÉ (§11.14) |
 
 ```python
 from autoagent.sandbox import make_sandbox
@@ -2160,15 +2163,19 @@ premières), `hard` (d'autres écritures VALIDES qui arrivent ensuite : `"90 min
 arrive APRÈS la réaction : jamais montré au modèle, jamais écrit au carnet). Le juge est du code (`same_result` :
 la valeur nue ou un objet à une clé, les nombres à 1e-9 près). Une UNITÉ (une tâche, un essai) est résolue quand
 TOUTES ses entrées `later` sont justes ; une entrée que le premier outil lisait et que la réaction a perdue est
-comptée à part (`regressions`). Deux réactions se comparent par la règle de `compare_configs` (§38), appariée par
+comptée à part (`regressions`). Chaque tâche porte aussi des entrées INVALIDES (`"???"` avec les premières,
+puis `"abc"` et `"--"`, jamais vues) : un outil qui leur répond par une valeur est compté
+(`accepted_invalid`). Deux réactions se comparent par la règle de `compare_configs` (§38), appariée par
 tâche. Tout le code écrit par le modèle tourne dans le bac donné (`sandbox=`), le modèle ne peut s'accorder aucune
 permission, et rien ne reste sur le disque.
 
 **Deux niveaux.** Niveau 1 : `ScriptedToolProvider`, un constructeur scripté (une version naïve, puis à `improve`
 la version complète). Il mesure le CODE du banc et d'`improve`, jamais un modèle. `positive_control_tools()` doit y
 voir `improve` résoudre ce que `none` ne résout pas, sinon le banc est aveugle : 8 unités sur 8 contre 0 sur 8
-(p = 0,008) ; et sans verdict, 6 sur 8 — les deux manquantes sont celles où la version naïve rendait une valeur
-FAUSSE sans planter. Niveau 2 : un vrai fournisseur.
+(p = 0,008). Sans verdict : 4 sur 8 — deux versions naïves rendent une valeur FAUSSE sans planter (la bonne
+correction est refusée), deux autres REFUSENT proprement ce qu'elles ne lisent pas, comme l'outil d'un vrai
+modèle (rien à corriger). En apprenant des refus : 6 sur 8 (p = 0,031) — les deux valeurs fausses restent hors
+de portée. Aucune entrée invalide acceptée. Niveau 2 : un vrai fournisseur.
 
 **Mesuré sur deux modèles** (13 nov. 2026, dans Docker, 8 tâches × 1 essai, `max_repairs=0`). Unités résolues
 sur 8 ; entre parenthèses, les entrées suivantes justes sur 40 :
@@ -2196,7 +2203,8 @@ Ce que ça dit :
    connaît pas au lieu de planter, et un refus que personne n'a jugé n'est pas un défaut. Compté sur DeepSeek
    (un passage de plus, 8 332 jetons) : face aux 24 entrées dures, les premiers outils en ont lu 10 et REFUSÉ
    14 — aucun plantage, aucune valeur fausse. Le niveau 1 ne le montrait pas — ses versions naïves plantent. C'est la limite la plus importante de cette version : apprendre
-   demande aujourd'hui que l'HÔTE signale (`report`).
+   demande aujourd'hui que l'HÔTE signale (`report`). Elle est levée, en option, par `learn_from_refusals`
+   (§11.14).
 5. **Un défaut trouvé, et corrigé.** Sur Gemini, 2 améliorations sur 4 échouaient avec « did not contain JSON ».
    Cause vérifiée sur une réponse : 7 861 jetons de RÉFLEXION sur un plafond de sortie de 8 192, réponse coupée
    (`finish_reason == "length"`). Depuis : `DynamicToolBuilder(max_build_tokens=8192)` — l'hôte relève le plafond,
@@ -2210,8 +2218,85 @@ la preuve, et huit, c'est peu. Deux modèles. « Résolu » est strict ; la part
 Sur DeepSeek, `improve` coûte environ deux fois une reconstruction (≈ 2 040 jetons contre ≈ 1 060) : il porte le
 code et les cas.
 
-**Preuves.** `tests/test_banc_outils.py` (83 tests), `tests/test_plafond_du_constructeur.py` (15 tests) ;
+**Preuves.** `tests/test_banc_outils.py` (96 tests), `tests/test_plafond_du_constructeur.py` (15 tests) ;
 53 mutations du code, toutes attrapées. Démo 43 — dans la galerie du constructeur, avec sa sortie réelle.
+
+### 11.14 Apprendre des refus — sans rien demander à l'hôte *(sur `main`, non publié)*
+
+Le banc (§11.13) a montré la limite : l'outil d'un vrai modèle REFUSE proprement l'écriture qu'il ne connaît pas
+(« 1:30 ») au lieu de planter ; un refus que personne n'a jugé n'est pas un défaut ; sans l'hôte, `improve` n'avait
+donc rien à corriger — 24 unités sur 24. Or l'hôte ne peut pas toujours juger.
+
+```python
+resultat = constructeur.improve("pourcentage", learn_from_refusals=True)
+print(resultat.summary())                        # ci-dessous : la sortie réelle de la démo 42 (partie 6)
+#   pourcentage — amélioré : version eccd24698a87 remplacée par 43814c7811a5 · 1 cas réussi rejoué à l'identique, 1 entrée auparavant refusée maintenant lue (non vérifiée). L'ancienne est gardée (rollback).
+resultat.extended_cases                           # [{"args": {"texte": "80 pour cent"}, "got": 0.8}] — à relire
+resultat.still_refused                            # 1 : « ??? » reste refusé
+```
+
+**Ce que fait l'option.** Le modèle constructeur reçoit, en plus des cas ratés, les entrées REFUSÉES — par l'outil
+ou par son schéma — que personne n'a jugées, avec la consigne : une demande valide écrite autrement se traite ; une
+entrée invalide, ou qu'on ne lit pas avec certitude, reste refusée (« never guess a value »). Sans refus à montrer,
+la demande au modèle est mot pour mot celle d'avant (testé).
+
+**Ce que le code prouve — et ce qu'il ne prouve pas.** Il prouve : chaque cas réussi rend le même résultat ; un
+refus propre ne devient pas un plantage (`broken_refusals`) ; un échec que l'hôte a jugé LÉGITIME reste un échec —
+cela, avec ou sans l'option ; une version qui ne lit rien de plus n'est pas installée (`"nothing_gained"`). Il ne
+prouve PAS que la nouvelle lecture est juste : c'est le modèle qui a jugé l'entrée valide. Elle est donc comptée à
+part (`extended`), listée avec ce que l'outil en rend (`extended_cases`, à relire), écrite dans la preuve
+(`verified_by["extended"]`) et dite dans la fiche : « 1 entrée auparavant refusée maintenant lue (non vérifiée) ».
+C'est le niveau de preuve d'une première construction, pas plus.
+
+**Ce qui reste fermé.** Un refus venu d'un run teinté n'est jamais montré au modèle (il est rejoué). Un refus masqué
+par `redact` n'est ni montré ni rejoué. `improve` reste refusé depuis un run teinté. La nouvelle version ne peut pas
+demander plus de permissions.
+
+**Une entrée déjà examinée n'est pas reproposée.** Quand le modèle a vu une entrée refusée et l'a laissée refusée,
+le catalogue le retient (`refusals_examined`, 200 au plus, transmis à la version suivante) : l'appel suivant ne la
+remontre pas, et s'il n'y a rien d'autre il ne coûte rien (`"nothing_to_fix"`, sans appel au modèle). Mesuré avant
+cette mémoire : sur Gemini, 4 appels sur 8 payés — 26 136 jetons sur 62 508 — pour une seule entrée, « ??? », que le
+modèle laissait refusée, à raison. Un essai refusé ou raté n'est pas un examen. L'hôte garde le dernier mot :
+`report(correct=False)` en fait un cas raté.
+
+**L'hôte peut dire « il fallait refuser ».** `report(nom, id, correct=False, expected_refusal=True)` : l'outil a
+RÉPONDU à une entrée invalide. Dire « résultat faux » réclamait un autre résultat ; ici `improve` exige que la
+nouvelle version refuse l'entrée, et c'est vérifié (`checked`). Trouvé par une mutation du banc que les tests
+n'attrapaient pas : l'hôte n'avait pas de mot pour le dire.
+
+**Mesuré** (le banc du §11.13 avec sa cinquième réaction, dans Docker, 8 tâches × 1 essai — l'hôte ne dit RIEN).
+Unités résolues sur 8 ; entre parenthèses, les entrées suivantes justes sur 40 :
+
+| modèle | `none` | `improve_unjudged` | `improve_refusals` | entrées perdues | invalides acceptées | jetons de la réaction |
+|---|---|---|---|---|---|---|
+| `deepseek-chat` (13 nov. 2026) | 1 (25) | 1 (25) | **7** (39) | 0 | 0 sur 16 | 17 389 |
+| `gemini-3.7-flash`, plafond 24 000 (14 nov. 2026) | 4 (32) | 4 (31), mesuré la veille | **8** (40) | 0 | 0 sur 16 | 62 508 |
+
+Sans rien demander à l'hôte, l'option résout 15 unités sur 16, contre 5 sans rien faire ; elle n'a perdu aucune
+entrée et n'a accepté aucune entrée invalide (0 sur 32). Sur DeepSeek, l'écart avec « ne rien faire » est établi
+(+75 points [+38 ; +89], p = 0,031) ; contre « refaire à l'aveugle » il ne l'est pas tout à fait (+62 points [+27 ; +80], p = 0,062 — la reconstruction
+avait résolu 2 unités ce jour-là, en perdant 4 entrées). Sur Gemini, quatre unités à apprendre ne permettent pas de
+trancher (+50 points [+16 ; +70], p = 0,125). Dans le même passage DeepSeek, `improve` avec l'attendu de l'hôte résout 8 unités sur 8 :
+une unité de plus, ce qui ne tranche rien — mais là, chaque correction est vérifiée contre l'attendu de l'hôte.
+Quand l'hôte peut juger, c'est ce niveau de preuve qu'il faut préférer.
+
+**Revérifié avec le code final** (DeepSeek, 14 nov. 2026, dans Docker — la mémoire des refus examinés et « il
+fallait refuser » ont été ajoutés APRÈS les mesures ci-dessus). Le banc redonne le même résultat : 7 unités sur 8,
+39 entrées sur 40, aucune entrée perdue, 0 invalide acceptée sur 16, p = 0,031 contre « ne rien faire » (26 670
+jetons). La mémoire, sur un outil écrit par le modèle dont le seul refus était « ??? » : premier appel
+`nothing_gained` (2 785 jetons), second appel `nothing_to_fix` — 0 jeton, aucun appel au modèle. « Il fallait
+refuser », sur un outil à qui la demande disait de rendre 0 pour un texte illisible : l'hôte signale la réponse à
+« ??? », la version suivante refuse « ??? » et « abc », et rend toujours 0.12 pour « 12% ».
+
+**Ce que ça ne dit pas.** Huit tâches de conversion de texte, deux modèles, un essai par tâche. Les entrées
+invalides du banc sont grossières (« ??? », « abc », « -- ») : une entrée invalide qui RESSEMBLE à une demande
+valide n'est pas mesurée. La justesse de ce que l'outil lit en plus n'est mesurée qu'au banc (39 et 40 sur 40) : en
+production, personne ne la vérifie tant que l'hôte ne relit pas `extended_cases`. Un appel est payé la première
+fois même si les seuls refus étaient légitimes. Rien n'appelle `improve` tout seul.
+
+**Preuves.** `tests/test_apprendre_des_refus.py` (33 tests), `tests/test_banc_outils.py` (96 tests) ;
+54 mutations du code, toutes attrapées. Démo 42 (partie 6) ; le preset « Outils dynamiques, version pro » du
+constructeur apprend des refus quand un outil n'a pas de défaut mais des entrées refusées.
 
 ---
 

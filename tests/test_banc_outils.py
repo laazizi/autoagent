@@ -1,9 +1,10 @@
 """Le banc « outils qui cassent » (`autoagent.toolbench`) : ce que vaut `improve`, mesuré.
 
 Un outil créé par le modèle marche sur ses premières entrées, puis d'autres écritures arrivent et il échoue. Le
-banc compare quatre réactions À PARTIR DU MÊME premier outil — ne rien faire, le refaire à l'aveugle, `improve`
-quand l'hôte dit l'attendu, `improve` quand l'hôte ne dit rien — et les juge PAR DU CODE sur des entrées que rien
-n'a jamais vues.
+banc compare cinq réactions À PARTIR DU MÊME premier outil — ne rien faire, le refaire à l'aveugle, `improve`
+quand l'hôte dit l'attendu, `improve` quand l'hôte ne dit rien, `improve` qui apprend aussi des refus — et les juge
+PAR DU CODE sur des entrées que rien n'a jamais vues. Des entrées INVALIDES mesurent le risque : un outil qui se
+met à répondre à ce qu'il devait refuser.
 
 Ces tests sont le niveau 1 : un constructeur scripté (`ScriptedToolProvider`), hors ligne. Ils vérifient le CODE
 du banc — jamais un modèle. Les trois sortes de casse sont couvertes : le premier outil PLANTE, rend une valeur
@@ -77,14 +78,23 @@ class TestLesTachesFournies:
 
     @pytest.mark.parametrize("t", TOOL_TASKS, ids=lambda t: t.name)
     def test_une_entree_n_apparait_qu_une_fois(self, t: ToolTask) -> None:
-        entrees = [texte for texte, _ in (*t.easy, *t.hard, *t.later)]
+        entrees = [texte for texte, _ in (*t.easy, *t.hard, *t.later)] + [*t.invalid, *t.later_invalid]
         assert len(set(entrees)) == len(entrees)                       # « suivantes » = jamais vues avant
         assert len(t.easy) >= 3 and len(t.hard) >= 3 and len(t.later) >= 5
+        assert t.invalid == ("???",) and t.later_invalid == ("abc", "--")
 
     @pytest.mark.parametrize("t", TOOL_TASKS, ids=lambda t: t.name)
     def test_la_demande_ne_decrit_que_le_cas_facile(self, t: ToolTask) -> None:
         assert t.easy[0][0] in t.capability
         assert not any(texte in t.capability for texte, _ in (*t.hard, *t.later))
+        assert not any(texte in t.capability for texte in (*t.invalid, *t.later_invalid))
+
+    @pytest.mark.parametrize("t", TOOL_TASKS, ids=lambda t: t.name)
+    def test_une_entree_invalide_n_obtient_jamais_de_valeur(self, t: ToolTask) -> None:
+        for texte in (*t.invalid, *t.later_invalid):
+            issue, erreur = _lance(t.full_code, t.param, texte)
+            assert issue == "error" and erreur.startswith("ValueError: invalid input"), (texte, erreur)   # refusée
+            assert _lance(t.naive_code, t.param, texte)[0] == "error", texte        # la naïve plante ou refuse
 
     @pytest.mark.parametrize("t", TOOL_TASKS, ids=lambda t: t.name)
     def test_la_version_naive_lit_le_facile_et_rien_du_dur(self, t: ToolTask) -> None:
@@ -155,18 +165,28 @@ class TestLeControlePositif:
         assert statuts == {"minutes_de": ("improved", 2), "montant": ("rejected", 1), "pourcentage": ("nothing_to_fix", 1)}
         assert rapport.by_arm()["improve_unjudged"]["solved"] == 1
 
-    def test_rien_n_est_perdu(self, controle: Any) -> None:
+    def test_les_refus_ne_remplacent_pas_un_verdict(self, controle: Any) -> None:
+        # Apprendre des refus n'apprend rien d'une valeur FAUSSE que personne n'a signalée (montant) ; il apprend
+        # du refus que l'outil opposait à une écriture valide (pourcentage), là où `improve_unjudged` n'avait rien.
+        rapport, _ = controle
+        statuts = {r.task: (r.status, r.right) for r in rapport.rows if r.arm == "improve_refusals"}
+        assert statuts == {"minutes_de": ("improved", 2), "montant": ("rejected", 1), "pourcentage": ("improved", 2)}
+        assert rapport.by_arm()["improve_refusals"]["solved"] == 2
+
+    def test_rien_n_est_perdu_et_aucune_entree_invalide_n_est_acceptee(self, controle: Any) -> None:
         rapport, _ = controle
         assert all(r.regressions == 0 for r in rapport.rows)
+        assert all((r.accepted_invalid, r.invalid_total) == (0, 2) for r in rapport.rows)
+        assert all((c["accepted_invalid"], c["invalid_total"]) == (0, 6) for c in rapport.by_arm().values())
 
     def test_les_jetons_sont_comptes_par_reaction(self, controle: Any) -> None:
         rapport, fournisseur = controle
         c = rapport.by_arm()
         # 150 jetons déclarés par appel. `nothing_to_fix` n'appelle pas le modèle : 2 appels sur 3 sans verdict.
         assert (c["none"]["tokens"], c["rebuild"]["tokens"], c["improve"]["tokens"]) == (0, 450, 450)
-        assert c["improve_unjudged"]["tokens"] == 300
+        assert (c["improve_unjudged"]["tokens"], c["improve_refusals"]["tokens"]) == (300, 450)
         assert all(r.first_tokens == 150 for r in rapport.rows)
-        assert rapport.tokens == 450 + 450 + 450 + 300 == 150 * len(fournisseur.requests)
+        assert rapport.tokens == 450 + 450 + 450 + 300 + 450 == 150 * len(fournisseur.requests)
 
     def test_le_premier_outil_a_casse_partout(self, controle: Any) -> None:
         rapport, _ = controle
@@ -180,29 +200,35 @@ class TestLeControlePositif:
         _, fournisseur = controle
         demandes = ["\n".join(m.content or "" for m in d.messages) for d in fournisseur.requests]
         for tache in (MINUTES, MONTANT, POURCENT):
-            for texte, _ in tache.later:
+            for texte in (*(texte for texte, _ in tache.later), *tache.later_invalid):
                 assert not any(json.dumps(texte, ensure_ascii=False) in d for d in demandes), texte
         ameliorations = [d for d in demandes if "IMPROVE AN EXISTING TOOL" in d]
-        assert len(ameliorations) == 5                                 # 3 avec verdict + 2 sans (1 n'a rien à corriger)
-        assert sum("90 min" in d for d in ameliorations) == 2          # le plantage : montré dans les deux cas
+        assert len(ameliorations) == 8                 # 3 avec verdict + 2 sans (1 n'a rien à corriger) + 3 avec les refus
+        assert sum("90 min" in d for d in ameliorations) == 3          # le plantage : montré dans les trois cas
         assert sum("12,5" in d for d in ameliorations) == 1            # la valeur fausse : seulement si l'hôte l'a dite
-        assert sum("0.5 pour cent" in d for d in ameliorations) == 1   # le refus : seulement si l'hôte l'a jugé
+        assert sum("0.5 pour cent" in d for d in ameliorations) == 2   # le refus : si l'hôte l'a jugé, ou si les refus servent
+        assert sum("It REFUSED these REAL inputs" in d for d in ameliorations) == 1     # pourcentage, et lui seul
 
     def test_le_resume_se_lit(self, controle: Any) -> None:
         resume = controle[0].summary()
-        assert "scripted-1 · 3 tâches x 1 essai = 3 unités · le premier outil a cassé sur 3 · 1650 jetons" in resume
-        assert "improve (l'hôte dit l'attendu) : 3/3 unités résolues · 6/6 entrées suivantes justes" in resume
-        assert "improve (l'hôte ne dit rien)   : 1/3 unités résolues" in resume
+        assert "scripted-1 · 3 tâches x 1 essai = 3 unités · le premier outil a cassé sur 3 · 2100 jetons" in resume
+        par_bras = {ligne.split(" : ")[0].strip(): ligne.split(" : ", 1)[1] for ligne in resume.splitlines()[1:6]}
+        assert par_bras["improve (l'hôte dit l'attendu)"] == (
+            "3/3 unités résolues · 6/6 entrées suivantes justes · 0 perdue(s) · 0/6 invalide(s) acceptée(s) · "
+            "450 jetons · 3 improved")
+        assert par_bras["improve (l'hôte ne dit rien)"].startswith("1/3 unités résolues")
+        assert par_bras["improve (rien dit, les refus servent)"].startswith("2/3 unités résolues · 5/6 entrées")
         assert "1 improved, 1 nothing_to_fix, 1 rejected" in resume and "Le juge est du code." in resume
+        assert "refait à l'aveugle → improve (rien dit, les refus servent)" in resume
         assert "rien → refait à l'aveugle : +0 pt" in resume and "indistinguables" in resume
 
     def test_le_rapport_s_ecrit_en_json(self, controle: Any) -> None:
         d = json.loads(json.dumps(controle[0].to_dict()))
-        assert (d["units"], d["broke"], d["tokens"], d["arms"]) == (3, 3, 1650, list(ARMS))
-        assert d["by_arm"]["improve"]["solved"] == 3 and len(d["rows"]) == 12
+        assert (d["units"], d["broke"], d["tokens"], d["arms"]) == (3, 3, 2100, list(ARMS))
+        assert d["by_arm"]["improve"]["solved"] == 3 and len(d["rows"]) == 15
         assert d["rows"][2] == {"task": "minutes_de", "trial": 1, "arm": "improve", "status": "improved", "right": 2,
                                 "total": 2, "regressions": 0, "tokens": 150, "first_hard_right": 0, "hard_total": 1,
-                                "first_tokens": 150, "detail": "", "solved": True}
+                                "first_tokens": 150, "detail": "", "accepted_invalid": 0, "invalid_total": 2, "solved": True}
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -261,7 +287,7 @@ class TestLesReactions:
     def test_sans_premier_outil_l_unite_est_ratee_pour_tous(self) -> None:
         rapport = run_tool_bench(_Illisible([MINUTES], rang=1), tasks=[MINUTES])
         assert [(r.status, r.right, r.total, r.solved, r.tokens) for r in rapport.rows] == [
-            ("first_build_failed", 0, 2, False, 0)] * 4
+            ("first_build_failed", 0, 2, False, 0)] * 5
         assert all(r.detail.startswith("ToolValidationError: ") for r in rapport.rows)      # pourquoi, mot pour mot
         assert rapport.broke == 0 and rapport.units == 1 and rapport.by_arm()["improve"]["solved"] == 0
         assert rapport.compare("rebuild", "improve")["verdict"] == "indistinguishable"
@@ -319,10 +345,12 @@ class TestLesReactions:
         fournisseur = ScriptedToolProvider([deja])
         rapport = run_tool_bench(fournisseur, tasks=[deja])
         assert rapport.broke == 0 and all(r.solved and r.first_hard_right == 1 for r in rapport.rows)
+        # ... et avec les refus : le « ??? » refusé est montré, le modèle le laisse refusé — rien n'est installé.
         assert {r.arm: r.status for r in rapport.rows} == {
-            "none": "kept", "rebuild": "rebuilt", "improve": "nothing_to_fix", "improve_unjudged": "nothing_to_fix"}
+            "none": "kept", "rebuild": "rebuilt", "improve": "nothing_to_fix", "improve_unjudged": "nothing_to_fix",
+            "improve_refusals": "nothing_gained"}
         assert {r.arm: r.detail for r in rapport.rows}["improve"] == "no failing call of the current version in the call log"
-        assert len(fournisseur.requests) == 2                           # `improve` n'a pas appelé le modèle
+        assert len(fournisseur.requests) == 3           # sans refus à lire, `improve` n'appelle pas le modèle
         assert rapport.compare("rebuild", "improve")["verdict"] == "indistinguishable"
 
     def test_tout_le_code_ecrit_par_le_modele_tourne_dans_le_bac_de_l_hote(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -330,9 +358,9 @@ class TestLesReactions:
         monkeypatch.setattr("autoagent.dynamic._bac_par_defaut", lambda *a, **k: pytest.fail("un autre bac a été créé"))
         rapport = run_tool_bench(ScriptedToolProvider([MINUTES]), tasks=[MINUTES], sandbox=bac)
         assert rapport.by_arm()["improve"]["solved"] == 1
-        # 3 premiers usages + 2 entrées suivantes par outil final (rien, improve, improve sans verdict, refait)
-        # + 3 cas rejoués par chaque `improve` (1 raté, 2 réussis)
-        assert len(bac.vus) == 3 + 2 * 4 + 3 * 2
+        # 4 premiers usages (2 faciles, 1 dur, 1 invalide) + 4 entrées suivantes (2 valides, 2 invalides) par outil
+        # final (rien, les trois `improve`, refait) + 4 cas rejoués par chaque `improve`
+        assert len(bac.vus) == 4 + 4 * 5 + 4 * 3
 
     def test_les_entrees_suivantes_n_entrent_jamais_au_carnet(self, monkeypatch: pytest.MonkeyPatch) -> None:
         notes: list[dict[str, Any]] = []
@@ -345,7 +373,41 @@ class TestLesReactions:
         monkeypatch.setattr(DynamicToolBuilder, "_noter_appel", espion)
         run_tool_bench(ScriptedToolProvider([MINUTES]), tasks=[MINUTES])
         vues = [a["args"]["texte"] for a in notes]
-        assert vues == ["1h30", "2h", "90 min"]                         # les premiers usages, et rien d'autre
+        assert vues == ["1h30", "2h", "90 min", "???"]                  # les premiers usages, et rien d'autre
+
+    def test_les_refus_servent_la_ou_l_hote_ne_dit_rien(self) -> None:
+        rapport = run_tool_bench(ScriptedToolProvider([POURCENT]), tasks=[POURCENT],
+                                 arms=("improve_unjudged", "improve_refusals"))
+        sans, avec = rapport.rows
+        assert (sans.status, sans.right, sans.tokens) == ("nothing_to_fix", 1, 0)
+        assert (avec.status, avec.right, avec.solved, avec.accepted_invalid, avec.tokens) == ("improved", 2, True, 0, 150)
+
+    def test_une_version_qui_devine_se_voit_au_banc(self) -> None:
+        # Ce que le rejeu ne PEUT pas voir : la version « améliorée » ne refuse plus rien. Le banc, lui, le compte.
+        rapport = run_tool_bench(ScriptedToolProvider([POURCENT], fix="guess"), tasks=[POURCENT],
+                                 arms=("none", "improve_refusals"))
+        rien, devine = rapport.rows
+        assert (rien.accepted_invalid, rien.invalid_total) == (0, 2)
+        assert (devine.status, devine.right, devine.accepted_invalid, devine.invalid_total) == ("improved", 2, 2, 2)
+        assert rapport.by_arm()["improve_refusals"]["accepted_invalid"] == 2
+        assert "2/2 invalide(s) acceptée(s)" in rapport.summary() and "0/2 invalide(s) acceptée(s)" in rapport.summary()
+
+    def test_quand_l_hote_a_dit_invalide_la_version_qui_devine_est_refusee(self) -> None:
+        rapport = run_tool_bench(ScriptedToolProvider([POURCENT], fix="guess"), tasks=[POURCENT], arms=("improve",))
+        (improve,) = rapport.rows
+        assert (improve.status, improve.accepted_invalid) == ("rejected", 0)
+        assert improve.detail == "0 failing case(s) not fixed, 0 passing case(s) changed, 1 refusal(s) broken"
+
+    def test_un_premier_outil_qui_repond_a_n_importe_quoi_se_corrige_si_l_hote_le_dit(self) -> None:
+        # Le premier outil rend 0 pour ce qu'il ne lit pas — y compris pour « ??? ». Le banc le compte ; et l'hôte
+        # dit qu'il fallait REFUSER (`expected_refusal`) : `improve` rend une version qui refuse.
+        devine = dataclasses.replace(POURCENT, naive_code=POURCENT.naive_code.replace(
+            "        raise ValueError('invalid input: pas un pourcentage')", "        return 0.0"))
+        assert "return 0.0" in devine.naive_code
+        rapport = run_tool_bench(ScriptedToolProvider([devine]), tasks=[devine], arms=("none", "improve"))
+        rien, improve = rapport.rows
+        assert (rien.accepted_invalid, rien.right) == (2, 1)
+        assert (improve.status, improve.solved, improve.accepted_invalid) == ("improved", True, 0)
 
     def test_rien_ne_reste_sur_le_disque(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("tempfile.tempdir", str(tmp_path))

@@ -1,14 +1,16 @@
 """43 - Le banc « outils qui cassent » : ce que vaut `improve`, mesure au lieu d'etre affirme.
 
 Un outil cree par le modele marche sur ses premieres entrees ; puis d'autres ecritures arrivent,
-et il echoue. Que faire ? Le banc (`autoagent/toolbench.py`) compare quatre reactions, A PARTIR DU
+et il echoue. Que faire ? Le banc (`autoagent/toolbench.py`) compare cinq reactions, A PARTIR DU
 MEME premier outil :
 
     rien · refait a l'aveugle · improve (l'hote dit l'attendu) · improve (l'hote ne dit rien)
+    · improve qui apprend aussi des REFUS (l'hote ne dit toujours rien)
 
 Le juge est du CODE : chaque entree d'une tache porte son resultat attendu. Apres la reaction,
 l'outil est essaye sur des entrees que rien n'a jamais vues - ni le modele, ni le carnet. Une unite
-(une tache, un essai) est RESOLUE quand toutes passent.
+(une tache, un essai) est RESOLUE quand toutes passent. Chaque tache porte aussi des entrees INVALIDES
+(« ??? », puis « abc » et « -- », jamais vues) : un outil qui se met a leur repondre est compte.
 
 Sans cle (niveau 1) : un constructeur SCRIPTE rend d'abord une version naive puis, a `improve`, la
 version complete. Il mesure le code du banc et de `improve` - jamais un modele. C'est le CONTROLE
@@ -54,7 +56,7 @@ from autoagent.toolbench import (  # noqa: E402
 )
 
 # Une tache par sorte de casse : le premier outil PLANTE, rend une valeur FAUSSE, REFUSE une entree valide.
-TROIS = ("minutes_de", "montant", "pourcentage")
+TROIS = ("minutes_de", "montant", "celsius")
 
 
 def ligne(titre: str) -> None:
@@ -62,13 +64,13 @@ def ligne(titre: str) -> None:
 
 
 def detail(rapport: ToolBenchReport) -> None:
-    print(f"\n  {'tache':<22} " + " ".join(f"{arm:<17}" for arm in rapport.arms))
+    print(f"\n  {'tache':<22} " + " ".join(f"{arm:<18}" for arm in rapport.arms))
     for tache in rapport.tasks:
         cellules = []
         for arm in rapport.arms:
             r = next(x for x in rapport.rows if x.task == tache and x.arm == arm and x.trial == 1)
-            cellules.append(f"{r.right}/{r.total} {r.status}"[:17])
-        print(f"  {tache:<22} " + " ".join(f"{c:<17}" for c in cellules))
+            cellules.append(f"{r.right}/{r.total} {r.status}"[:18])
+        print(f"  {tache:<22} " + " ".join(f"{c:<18}" for c in cellules))
     print("  (premier essai de chaque tache : entrees suivantes justes, puis ce que la reaction a fait)")
 
 
@@ -99,6 +101,13 @@ def niveau_1(tout: bool) -> None:
         print(f"  Sans verdict de l'hote, seul le PLANTAGE s'apprend. Ici : {', '.join(restes)}. Le premier outil y")
         print("  rendait une valeur FAUSSE sans planter ; personne ne l'a signalee, elle compte donc comme un cas")
         print("  reussi, et la bonne correction, qui la change, est refusee (« rejected »). C'est la limite, mesuree.")
+    appris = [r.task for r in rapport.rows if r.arm == "improve_refusals" and r.solved and not next(
+        x for x in rapport.rows if (x.task, x.trial, x.arm) == (r.task, r.trial, "improve_unjudged")).solved]
+    if appris:
+        print(f"  Avec les refus (derniere colonne) : {', '.join(appris)}. Le premier outil y REFUSAIT proprement ce")
+        print("  qu'il ne lisait pas - comme le fait l'outil d'un vrai modele. Sans l'hote il n'y avait rien a")
+        print("  corriger ; en lisant ses refus, le modele decide lesquels etaient des demandes valides. Ce que")
+        print("  l'outil lit en plus n'est PAS verifie : le banc compte donc les entrees invalides acceptees.")
 
 
 def niveau_2(essais: int, plafond: int) -> None:

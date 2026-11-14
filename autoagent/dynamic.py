@@ -90,18 +90,23 @@ def _origine_des_tests(verified_by: dict[str, Any]) -> str:
         return f"{montres + caches} exemples de l'hôte, dont {caches} cachés au modèle"
     if sorte == "replay":
         return _preuve_par_rejeu(int(verified_by.get("fixed") or 0), int(verified_by.get("checked") or 0),
-                                 int(verified_by.get("kept") or 0))
+                                 int(verified_by.get("kept") or 0), int(verified_by.get("extended") or 0))
     return "vérification inconnue"
 
 
-def _preuve_par_rejeu(corriges: int, verifies: int, gardes: int) -> str:
-    """Ce qu'une version améliorée a prouvé, en clair (`improve`)."""
+def _preuve_par_rejeu(corriges: int, verifies: int, gardes: int, etendus: int = 0) -> str:
+    """Ce qu'une version améliorée a prouvé, en clair (`improve`) — et ce qu'elle n'a PAS prouvé : une entrée
+    auparavant refusée qu'elle lit maintenant est dite « non vérifiée »."""
     rates = f"{corriges} cas raté corrigé" if corriges == 1 else f"{corriges} cas ratés corrigés"
     if verifies:
         rates += f" (dont {verifies} contre le résultat attendu)"
     reussis = (f"{gardes} cas réussi rejoué à l'identique" if gardes == 1
                else f"{gardes} cas réussis rejoués à l'identique")
-    return f"{rates}, {reussis}"
+    if not etendus:
+        return f"{rates}, {reussis}"
+    lues = (f"{etendus} entrée auparavant refusée maintenant lue (non vérifiée)" if etendus == 1
+            else f"{etendus} entrées auparavant refusées maintenant lues (non vérifiées)")
+    return f"{reussis}, {lues}" if not corriges else f"{rates}, {reussis}, {lues}"
 
 
 def _empreinte(valeur: Any) -> str:
@@ -138,6 +143,8 @@ def _decrire_le_cas(numero: int, appel: dict[str, Any]) -> str:
     verdict = _verdict_de(appel)
     attendu = (f" The right result is {json.dumps(verdict['expected'], ensure_ascii=False)[:400]}."
                if "expected" in verdict else "")
+    if verdict.get("expected_refusal") is True:
+        attendu = ' This input is INVALID: the tool must REFUSE it (raise ValueError("invalid input: <why>")).'
     raison = f" The host says: {str(verdict['reason'])[:200]}." if verdict.get("reason") else ""
     issue = appel.get("kind")
     if issue == "ok":
@@ -149,12 +156,31 @@ def _decrire_le_cas(numero: int, appel: dict[str, Any]) -> str:
     return f"{numero}. args = {args} -> error: {str(appel.get('error'))[:300]}.{valide}{attendu}{raison}"
 
 
-def _demande_d_amelioration(description: str, code: str, montres: list[dict[str, Any]]) -> str:
+def _decrire_le_refus(numero: int, appel: dict[str, Any]) -> str:
+    args = json.dumps(appel.get("args"), ensure_ascii=False)[:600]
+    par = "refused by the input_schema" if appel.get("kind") == "rejected" else "refused"
+    return f"{numero}. args = {args} -> {par}: {str(appel.get('error'))[:300]}"
+
+
+def _demande_d_amelioration(description: str, code: str, montres: list[dict[str, Any]],
+                            refus: list[dict[str, Any]]) -> str:
+    """Ce que le modèle constructeur reçoit. Sans refus à montrer, le texte est MOT POUR MOT celui qui a été
+    mesuré sur un vrai modèle : la rubrique des refus ne s'ajoute que si `learn_from_refusals` en donne."""
     cas = "\n".join(_decrire_le_cas(i, appel) for i, appel in enumerate(montres, 1))
+    rates = f"It failed on these REAL calls:\n{cas}\n\n" if montres else ""
+    refuses = ""
+    if refus:
+        lignes = "\n".join(_decrire_le_refus(i, appel) for i, appel in enumerate(refus, 1))
+        refuses = (
+            f"It REFUSED these REAL inputs, and nobody has said whether it was right to:\n{lignes}\n"
+            "Decide for each one. If it is a valid request for this tool's purpose, only written another way, "
+            "handle it and return the right result. If it is truly invalid, or if you cannot read it with "
+            "certainty, keep refusing it: never guess a value.\n\n"
+        )
     return (
         f"IMPROVE AN EXISTING TOOL - keep its name and its purpose: {description}\n\n"
         f"Its current code:\n{code[:20000]}\n\n"
-        f"It failed on these REAL calls:\n{cas}\n\n"
+        f"{rates}{refuses}"
         "Fix the CAUSE, not only these inputs. Other real calls that succeed today will be replayed against your "
         "new version, and you are not shown them: their results must not change.\n"
         "If an input is truly invalid for this tool, REFUSE it: let input_schema reject it (pattern, enum, minimum, "
@@ -165,10 +191,13 @@ def _demande_d_amelioration(description: str, code: str, montres: list[dict[str,
 def _cas_resolu(appel: dict[str, Any], issue: str, valeur: Any, tolerance: float) -> tuple[bool, bool]:
     """Un cas RATÉ est-il résolu par la nouvelle version ? Rend (résolu, vérifié contre l'attendu de l'hôte).
 
-    L'hôte a donné l'attendu : il faut CE résultat (prouvé). L'hôte a jugé l'appel fautif sans donner l'attendu :
+    L'hôte a dit qu'il fallait refuser l'entrée : il faut un refus (prouvé). L'hôte a donné l'attendu : il faut
+    CE résultat (prouvé). L'hôte a jugé l'appel fautif sans donner l'attendu :
     l'entrée était valide, il faut UN résultat — et un autre que le résultat faux. Un plantage que personne n'a
     jugé : un résultat, un refus du schéma ou un refus déclaré le résolvent (l'outil ne plante plus)."""
     verdict = _verdict_de(appel)
+    if verdict.get("expected_refusal") is True:
+        return issue in _REFUS_NON_JUGEABLES, True           # l'hôte a dit : cette entrée devait être refusée
     if "expected" in verdict:
         return issue == "result" and _egal(verdict["expected"], valeur, tolerance), True
     if "expected_sha256" in verdict:
@@ -178,6 +207,29 @@ def _cas_resolu(appel: dict[str, Any], issue: str, valeur: Any, tolerance: float
             return False, False
         return not (appel.get("kind") == "ok" and appel.get("result_sha256") == _empreinte(valeur)), False
     return issue in ("result", "rejected", "refused"), False
+
+
+# Les issues qui sont un REFUS de l'entrée — par l'outil (`ValueError("invalid input: …")`) ou par son schéma.
+_REFUS_NON_JUGEABLES = ("refused", "rejected")
+# Combien d'entrées refusées « déjà examinées » le catalogue retient par outil (`learn_from_refusals`).
+_MAX_REFUS_EXAMINES = 200
+
+
+def _cle_du_refus(appel: dict[str, Any]) -> str:
+    """L'entrée d'un appel refusé, par son empreinte (le début suffit) : ce que le catalogue retient."""
+    return str(appel.get("args_sha256") or "")[:16]
+
+
+@dataclass
+class _Cas:
+    """Les appels de la version courante d'un outil, triés pour `improve` (`_cas_du_carnet`)."""
+
+    rates: list[dict[str, Any]] = field(default_factory=list)          # des défauts : à résoudre
+    reussis: list[dict[str, Any]] = field(default_factory=list)        # à rejouer à l'identique
+    refuses: list[dict[str, Any]] = field(default_factory=list)        # des refus que personne n'a jugés
+    legitimes: list[dict[str, Any]] = field(default_factory=list)      # des échecs que l'hôte a jugés légitimes
+    rates_inutilisables: int = 0
+    refus_inutilisables: int = 0
 
 
 @dataclass
@@ -190,11 +242,19 @@ class ImprovementResult:
             qu'il fallait : l'ancienne reste) ; `"build_failed"` (le modèle n'a pas rendu un outil valide) ;
             `"nothing_to_fix"` (aucun cas raté au carnet pour la version courante) ; `"no_usable_case"` (des cas
             ratés, mais aucun qu'on puisse montrer ou rejouer) ; `"not_replayable"` (l'outil appelle des fonctions
-            de l'hôte) ; `"quarantined"` ; `"tainted_run"` (appelé depuis un run qui a lu du contenu non fiable).
+            de l'hôte) ; `"quarantined"` ; `"tainted_run"` (appelé depuis un run qui a lu du contenu non fiable) ;
+            `"nothing_gained"` (`learn_from_refusals` : la nouvelle version ne corrige rien et refuse toujours les
+            mêmes entrées — l'ancienne reste).
         reason: pourquoi, en une phrase.
         old_version, new_version: le début du sha256 du code avant, et après (`None` si rien n'a été installé).
         fixed, checked: cas ratés résolus ; dont vérifiés contre le résultat que l'hôte attendait.
         kept: cas réussis du carnet rejoués à l'identique — jamais montrés au modèle.
+        extended, still_refused (`learn_from_refusals`) : entrées refusées que la nouvelle version LIT — ce qu'elle
+            en rend n'est PAS vérifié, c'est le modèle qui a jugé l'entrée valide ; et celles qu'elle refuse toujours.
+        extended_cases: les 20 premières entrées nouvellement lues, avec ce que l'outil en rend — `{"args", "got"}` :
+            à relire par l'hôte, puisque personne ne les a vérifiées.
+        broken_refusals: refus cassés — un refus propre devenu un plantage, ou une entrée que l'hôte avait jugée
+            invalide et que la nouvelle version accepte — `{"args", "got" | "error", "why"}`.
         still_failing: cas ratés non résolus — `{"args", "got" | "error", "expected"?}`.
         regressions: cas réussis qui ne donnent plus le même résultat — `{"args", "expected", "got"}`.
         skipped: cas ratés inutilisables (masqués par `redact`, ou trop gros pour avoir été gardés).
@@ -215,16 +275,23 @@ class ImprovementResult:
     skipped: int = 0
     usage: TokenUsage | None = None
     tool: GeneratedPythonTool | None = None
+    extended: int = 0
+    still_refused: int = 0
+    extended_cases: list[dict[str, Any]] = field(default_factory=list)
+    broken_refusals: list[dict[str, Any]] = field(default_factory=list)
 
     def summary(self) -> str:
         if self.status == "improved":
             return (f"{self.name} — amélioré : version {self.old_version} remplacée par {self.new_version} · "
-                    f"{_preuve_par_rejeu(self.fixed, self.checked, self.kept)}. L'ancienne est gardée (rollback).")
+                    f"{_preuve_par_rejeu(self.fixed, self.checked, self.kept, self.extended)}. "
+                    "L'ancienne est gardée (rollback).")
         if self.status == "rejected":
             rates, changes = len(self.still_failing), len(self.regressions)
             pourquoi = [f"{rates} cas raté non résolu" if rates == 1 else f"{rates} cas ratés non résolus"] if rates else []
             if changes:
                 pourquoi.append(f"{changes} cas réussi changé" if changes == 1 else f"{changes} cas réussis changés")
+            if self.broken_refusals:
+                pourquoi.append(f"{len(self.broken_refusals)} refus cassé" + ("" if len(self.broken_refusals) == 1 else "s"))
             # Sans cas en cause (des permissions en plus), c'est `reason` qui dit pourquoi.
             return (f"{self.name} — nouvelle version REFUSÉE, l'ancienne reste : "
                     + (", ".join(pourquoi) + "." if pourquoi else self.reason))
@@ -235,6 +302,8 @@ class ImprovementResult:
             "quarantined": "l'outil est en quarantaine : le libérer d'abord (release)",
             "tainted_run": "refusé : appelé depuis un run qui a lu du contenu non fiable",
             "build_failed": "le modèle n'a pas rendu un outil valide ; l'ancienne version reste",
+            "nothing_gained": "aucun gain : la nouvelle version ne corrige rien et refuse toujours les mêmes entrées ; "
+                              "l'ancienne reste",
         }.get(self.status, self.status)
         return f"{self.name} — {quoi}." + (f" {self.reason}" if self.reason and self.status == "build_failed" else "")
 
@@ -1178,11 +1247,12 @@ class DynamicToolBuilder:
 
     # ── Apprendre des erreurs ───────────────────────────────────────────────
 
-    def _cas_du_carnet(self, name: str, version: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
-        """Les appels de la VERSION COURANTE, le dernier par entrée : (ratés utilisables, réussis rejouables,
-        nombre de ratés inutilisables). Raté : `_jugement` dit défaut. Réussi : un appel `ok` que personne n'a
-        jugé faux, avec son résultat (ou son empreinte). Inutilisable : sans ses arguments (trop gros) ou passé
-        par `redact` (les arguments gardés ne sont plus ceux que l'outil a reçus)."""
+    def _cas_du_carnet(self, name: str, version: str) -> _Cas:
+        """Les appels de la VERSION COURANTE, le dernier par entrée, triés (`_Cas`). Raté : `_jugement` dit
+        défaut. Réussi : un appel `ok` que personne n'a jugé faux, avec son résultat (ou son empreinte). Refusé :
+        un refus (de l'outil ou de son schéma) que PERSONNE n'a jugé. Légitime : un échec que l'hôte a jugé
+        légitime (`report(correct=True)`) — l'entrée est invalide. Inutilisable : sans ses arguments (trop gros)
+        ou passé par `redact` (les arguments gardés ne sont plus ceux que l'outil a reçus)."""
         par_entree: dict[str, dict[str, Any]] = {}
         for appel in self.calls(name):
             if appel.get("version") != version:
@@ -1190,21 +1260,28 @@ class DynamicToolBuilder:
             cle = str(appel.get("args_sha256") or appel.get("id"))
             par_entree.pop(cle, None)                       # le dernier appel sur cette entrée prend sa place
             par_entree[cle] = appel
-        rates: list[dict[str, Any]] = []
-        reussis: list[dict[str, Any]] = []
-        inutilisables = 0
+        cas = _Cas()
         for appel in par_entree.values():
             jugement = _jugement(appel)
             utilisable = "args" in appel and not appel.get("redacted")
+            refus = appel.get("kind") in _REFUS_NON_JUGEABLES
             if jugement is True:
                 if utilisable:
-                    rates.append(appel)
+                    cas.rates.append(appel)
                 else:
-                    inutilisables += 1
-            elif (jugement is False and appel.get("kind") == "ok" and utilisable
-                    and ("result" in appel or "result_sha256" in appel)):
-                reussis.append(appel)
-        return rates, reussis, inutilisables
+                    cas.rates_inutilisables += 1
+            elif jugement is None and refus:
+                if utilisable:
+                    cas.refuses.append(appel)
+                else:
+                    cas.refus_inutilisables += 1
+            elif not utilisable or jugement is None:
+                continue
+            elif appel.get("kind") != "ok":
+                cas.legitimes.append(appel)             # un échec, et l'hôte a dit : c'était la bonne réponse
+            elif "result" in appel or "result_sha256" in appel:
+                cas.reussis.append(appel)
+        return cas
 
     @staticmethod
     def _rejouer(outil: GeneratedPythonTool, args: dict[str, Any]) -> tuple[str, Any]:
@@ -1220,7 +1297,7 @@ class DynamicToolBuilder:
             texte = str(exc)
             return ("refused" if texte.lower().startswith(_REFUS_DECLARE) else "error"), texte
 
-    def _noter_l_essai(self, name: str, statut: str, raison: str) -> None:
+    def _noter_l_essai(self, name: str, statut: str, raison: str, examines: list[str] | None = None) -> None:
         with self._verrou:
             outils = self._lire_catalogue()
             entree = outils.get(name)
@@ -1229,9 +1306,11 @@ class DynamicToolBuilder:
             entree["improvement_attempts"] = int(entree.get("improvement_attempts") or 0) + 1
             entree["last_improvement"] = {"status": statut, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                                           "reason": raison[:200]}
+            if examines is not None:
+                entree["refusals_examined"] = examines
             self._ecrire_catalogue(outils)
 
-    def improve(self, name: str, *, max_cases: int = 5) -> ImprovementResult:
+    def improve(self, name: str, *, max_cases: int = 5, learn_from_refusals: bool = False) -> ImprovementResult:
         """APPRENDRE des erreurs d'un outil de la bibliothèque : une nouvelle version, gardée seulement si du CODE
         le prouve (`ImprovementResult`, `.summary()`).
 
@@ -1251,7 +1330,22 @@ class DynamicToolBuilder:
         quand l'outil appelle des fonctions de l'hôte (les rejouer referait des effets de bord), quand l'outil est
         en quarantaine, ou depuis un run qui a lu du contenu non fiable. Un seul appel au modèle par `improve`
         (plus les reprises de `max_repairs`) ; sa dépense est dans `.usage` et dans `last_build_usage`.
-        ``KeyError`` si l'outil est inconnu."""
+        ``KeyError`` si l'outil est inconnu.
+
+        ``learn_from_refusals=True`` — apprendre aussi des REFUS, sans rien demander à l'hôte. Mesuré au banc :
+        l'outil d'un vrai modèle refuse proprement l'écriture qu'il ne connaît pas (« 1:30 ») au lieu de planter,
+        et un refus que personne n'a jugé n'est pas un défaut — sans l'hôte, il n'y avait donc rien à corriger.
+        Avec l'option, le modèle voit aussi les entrées refusées que personne n'a jugées, et décide : une demande
+        valide écrite autrement se traite, une entrée invalide reste refusée. Le code prouve que chaque cas réussi
+        donne le même résultat et qu'un refus propre ne devient pas un plantage. Il ne prouve PAS que la nouvelle
+        lecture est juste : elle est comptée à part (`.extended`, `.extended_cases` à relire) et dite « non
+        vérifiée » dans la fiche — le niveau de preuve d'une première construction, pas plus. Une version qui ne
+        lit rien de plus n'est pas installée (`"nothing_gained"`).
+
+        Toujours, option ou pas : un échec que l'hôte a jugé LÉGITIME (`report(correct=True)`) doit rester un
+        échec — une version qui se met à répondre à une entrée que l'hôte a dite invalide est refusée."""
+        if not isinstance(learn_from_refusals, bool):
+            raise TypeError(f"learn_from_refusals must be True or False, got {learn_from_refusals!r}")
         with self._verrou:
             entree = self._lire_catalogue().get(name)
         if entree is None:
@@ -1276,20 +1370,34 @@ class DynamicToolBuilder:
             return fin("build_failed", f"the tool file cannot be read: {exc}")
         if hashlib.sha256(octets).hexdigest() != ancienne:
             return fin("build_failed", "the tool file changed on disk since it was validated")
-        rates, reussis, rendu.skipped = self._cas_du_carnet(name, ancienne[:12])
-        if not rates:
+        cas = self._cas_du_carnet(name, ancienne[:12])
+        rates, reussis = cas.rates, cas.reussis
+        refuses = cas.refuses if learn_from_refusals else []
+        # Une entrée refusée que le modèle a DÉJÀ examinée et laissée refusée n'est pas reproposée : la question
+        # a eu sa réponse, et la reposer se paierait à chaque appel (mesuré : 4 appels sur 8 payés pour un « ??? »).
+        deja = {str(cle) for cle in (entree.get("refusals_examined") or [])}
+        nouveaux = [appel for appel in refuses if _cle_du_refus(appel) not in deja]
+        rendu.skipped = cas.rates_inutilisables + (cas.refus_inutilisables if learn_from_refusals else 0)
+        if not rates and not nouveaux:
             if rendu.skipped:
                 return fin("no_usable_case", "failing calls exist, but their arguments were redacted or too large to keep")
+            if refuses:
+                return fin("nothing_to_fix", "every refused input has already been examined and kept refused")
             return fin("nothing_to_fix", "no failing call of the current version in the call log")
         code = octets.decode("utf-8")
         if "call_host" in code:
             return fin("not_replayable", "the tool calls host functions: replaying its calls would repeat side effects")
+        # Un cas venu d'un run teinté n'est JAMAIS montré au modèle (ses arguments pourraient porter un ordre) ;
+        # il est tout de même rejoué. Même règle pour un refus.
         montrables = [appel for appel in rates if appel.get("tainted") is not True]
-        if not montrables:
+        refus_montrables = [appel for appel in nouveaux if appel.get("tainted") is not True]
+        if not montrables and not refus_montrables:
             return fin("no_usable_case", "every failing call comes from a run that had ingested untrusted content")
         permissions = [str(p) for p in (entree.get("permissions") or [])]
+        combien = max(1, int(max_cases))
+        refus_montres = _choisir_les_cas(refus_montrables, combien)
         demande = _demande_d_amelioration(str(entree.get("description") or name), code,
-                                          _choisir_les_cas(montrables, max(1, int(max_cases))))
+                                          _choisir_les_cas(montrables, combien), refus_montres)
 
         with tempfile.TemporaryDirectory(prefix="autoagent_improve_", ignore_cleanup_errors=True) as brouillon:
             # La candidate se construit À CÔTÉ : tant qu'elle n'a rien prouvé, la bibliothèque ne bouge pas.
@@ -1334,19 +1442,56 @@ class DynamicToolBuilder:
                 rendu.regressions.append({"args": appel["args"], "got": obtenu,
                                           "expected": appel["result"] if "result" in appel
                                           else {"sha256": appel.get("result_sha256")}})
-            if rendu.still_failing or rendu.regressions:
+            for appel in cas.legitimes:
+                # L'hôte a dit : cette entrée est invalide, l'échec était la bonne réponse. Elle doit le rester.
+                issue, valeur = self._rejouer(candidat, appel["args"])
+                if issue == "result":
+                    rendu.broken_refusals.append({
+                        "args": appel["args"], "got": valeur,
+                        "why": "the host judged this failure legitimate: the input is invalid"})
+            encore_refuses: set[str] = set()
+            for appel in refuses:
+                # Un refus que personne n'a jugé : la nouvelle version le LIT (compté à part, non vérifié), le
+                # refuse toujours, ou — ce qui n'est pas permis — plante là où l'ancienne refusait proprement.
+                issue, valeur = self._rejouer(candidat, appel["args"])
+                if issue == "result":
+                    rendu.extended += 1
+                    if len(rendu.extended_cases) < 20:
+                        rendu.extended_cases.append({"args": appel["args"], "got": valeur})
+                elif issue in _REFUS_NON_JUGEABLES:
+                    rendu.still_refused += 1
+                    encore_refuses.add(_cle_du_refus(appel))
+                else:
+                    rendu.broken_refusals.append({
+                        "args": appel["args"], "error": str(valeur)[:300],
+                        "why": "the old version refused this input cleanly; the new one crashes on it"})
+            if rendu.still_failing or rendu.regressions or rendu.broken_refusals:
                 return fin("rejected", f"{len(rendu.still_failing)} failing case(s) not fixed, {len(rendu.regressions)} "
-                                       "passing case(s) changed", noter=True)
+                                       "passing case(s) changed"
+                                       + (f", {len(rendu.broken_refusals)} refusal(s) broken" if rendu.broken_refusals else ""),
+                           noter=True)
+            # Ce que le modèle a VU et laissé refusé : examiné, donc plus reproposé (borné).
+            examines = sorted(deja | ({_cle_du_refus(appel) for appel in refus_montres} & encore_refuses) - {""})
+            examines = examines[-_MAX_REFUS_EXAMINES:]
+            if not rendu.fixed and not rendu.extended:
+                raison = "the new version fixes no failing case and still refuses every refused input"
+                self._noter_l_essai(name, "nothing_gained", raison, examines)
+                return fin("nothing_gained", raison)
             verified = {"kind": "replay", "fixed": rendu.fixed, "checked": rendu.checked, "kept": rendu.kept,
                         "from": ancienne[:12]}
-            rendu.tool = self._installer(name, entree, octets, candidat, verified)
+            if rendu.extended:
+                verified["extended"] = rendu.extended      # lues, PAS vérifiées : dit dans la fiche
+            rendu.tool = self._installer(name, entree, octets, candidat, verified, examines)
         rendu.new_version = hashlib.sha256(chemin.read_bytes()).hexdigest()[:12]
-        return fin("improved", "every failing case is fixed and every passing case still gives the same result")
+        return fin("improved", "every failing case is fixed and every passing case still gives the same result"
+                               + (f"; {rendu.extended} refused input(s) are now accepted, unverified" if rendu.extended else ""))
 
     def _installer(self, name: str, ancienne_entree: dict[str, Any], anciens_octets: bytes,
-                   candidat: GeneratedPythonTool, verified: dict[str, Any]) -> GeneratedPythonTool:
+                   candidat: GeneratedPythonTool, verified: dict[str, Any],
+                   examines: list[str] | None = None) -> GeneratedPythonTool:
         """La candidate a prouvé ce qu'il fallait : l'ancienne version est ARCHIVÉE (`.versions/<nom>/<sha>.py`),
-        la nouvelle prend sa place, et le catalogue repart pour elle — avec son histoire."""
+        la nouvelle prend sa place, et le catalogue repart pour elle — avec son histoire, et avec les entrées
+        refusées déjà examinées (`examines`) : la version suivante ne les repropose pas non plus."""
         maintenant = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         ancienne = str(ancienne_entree.get("sha256") or "")
         nouveau_texte = candidat.file_path.read_bytes().decode("utf-8")
@@ -1375,6 +1520,7 @@ class DynamicToolBuilder:
                              "replaced": maintenant}],
                 "improvement_attempts": int(ancienne_entree.get("improvement_attempts") or 0) + 1,
                 "last_improvement": {"status": "improved", "ts": maintenant, "reason": ""},
+                **({"refusals_examined": list(examines)} if examines else {}),
             }
             self._ecrire_catalogue(outils)
             self._visibles.add(name)
@@ -1433,7 +1579,7 @@ class DynamicToolBuilder:
                 self._ecrire_catalogue(outils)
 
     def report(self, name: str, call_id: str, *, correct: bool, reason: str | None = None,
-               expected: Any = _ABSENT) -> bool:
+               expected: Any = _ABSENT, expected_refusal: bool = False) -> bool:
         """Le VERDICT DE L'HÔTE sur un appel du carnet : l'outil a-t-il bien fait ?
 
         C'est l'hôte qui juge, pas le modèle. ``correct=False`` : un résultat faux qui n'avait pas planté, un
@@ -1442,10 +1588,21 @@ class DynamicToolBuilder:
         à raison). Le verdict est écrit sur l'appel (``verdict``), prime sur l'issue dans la fiche (`health`),
         et un nouveau verdict remplace l'ancien. Il ne change ni les compteurs ni le statut de l'outil : voir
         `reinstate` et `retire`. ``reason`` et ``expected`` passent par ``redact`` et sont bornés comme le reste
-        du carnet. ``False`` si l'outil ou l'appel est inconnu (déjà sorti du carnet)."""
+        du carnet. ``False`` si l'outil ou l'appel est inconnu (déjà sorti du carnet).
+
+        ``expected_refusal=True`` (avec ``correct=False``) : l'outil a RÉPONDU à une entrée invalide — il fallait
+        la refuser. Dire seulement « résultat faux » réclamerait un autre résultat ; ici `improve` exige que la
+        nouvelle version refuse l'entrée (son schéma, ou `ValueError("invalid input: …")`), et c'est vérifié."""
         if not isinstance(correct, bool):
             raise TypeError(f"correct must be True or False, got {correct!r}")
+        if not isinstance(expected_refusal, bool):
+            raise TypeError(f"expected_refusal must be True or False, got {expected_refusal!r}")
+        if expected_refusal and (correct or expected is not _ABSENT):
+            raise ValueError("expected_refusal=True says the tool should have REFUSED the input: it goes with "
+                             "correct=False and without expected=")
         verdict: dict[str, Any] = {"correct": correct, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        if expected_refusal:
+            verdict["expected_refusal"] = True
         try:
             details: dict[str, Any] = {}
             if reason is not None:

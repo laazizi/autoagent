@@ -109,7 +109,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tried on inputs nothing has ever seen (never shown to the model, never written to the call log). A unit (a task,
   a trial) is solved when all of them are right; an input the first tool read and the reaction lost is counted
   apart. Verdict rule of `compare_configs`, paired by task. Level 1 (`ScriptedToolProvider`, offline): 8/8 units
-  for `improve` against 0/8, and 6/8 without a verdict. Level 2, measured on 13 Nov 2026 inside Docker (8 tasks x
+  for `improve` against 0/8; 4/8 without a verdict; 6/8 when learning from refusals. Level 2, measured on 13 Nov 2026 inside Docker (8 tasks x
   1 trial): on `deepseek-chat`, `none` 1/8, `rebuild` 1/8, `improve` 7/8 (+75 points [+38; +89], p = 0.031),
   31,192 tokens; on `gemini-3.7-flash` with `max_build_tokens=24000`, 4/8, 4/8 and 8/8 (p = 0.125: four units to
   fix cannot settle it), 77,639 tokens. A blind rebuild gained no unit out of 24; no input was lost in any arm.
@@ -124,6 +124,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cut (`finish_reason == "length"`) and 2 improvements out of 4 failed. The host can now raise the cap; `improve`
   and the bench keep it. With 24,000 the same bench gave 4 improvements out of 4 (one took 17,793 tokens).
   15 tests (`tests/test_plafond_du_constructeur.py`).
+- **Learning from refusals, without the host: `builder.improve(name, learn_from_refusals=True)`.** The bench showed
+  the limit: a real model's tool REFUSES an unknown spelling ("1:30") instead of crashing, a refusal nobody judged
+  is not a defect, so without a host verdict `improve` had nothing to fix — and a host cannot always judge. With the
+  option the builder model also sees the inputs the tool REFUSED (itself or its schema) that nobody judged, and
+  decides: a valid request written another way is handled, an invalid one stays refused ("never guess a value").
+  What code proves: every passing call gives the same result; a clean refusal never becomes a crash
+  (`broken_refusals`); a failure the host judged legitimate stays a failure (checked with or without the option); a
+  version that reads nothing more is not installed (`"nothing_gained"`). What it does NOT prove: that the new
+  reading is right — it is counted apart (`extended`), listed with what the tool returns (`extended_cases`),
+  written in `verified_by` and said in the sheet ("... now read (unverified)"). A refused input the model examined
+  and kept refused is remembered (`refusals_examined`) and never shown again, so a repeated call costs nothing.
+  Measured with the bench's fifth reaction, the host saying NOTHING (Docker, 8 tasks x 1 trial): on
+  `deepseek-chat` 7/8 units against 1/8 doing nothing (+75 points, p = 0.031; against a blind
+  rebuild p = 0.062, not settled), 39/40 later inputs right; on `gemini-3.7-flash` 8/8 against 4/8
+  (p = 0.125: four units to learn cannot settle it). No input lost, no invalid input accepted (0 of 32). Eight
+  text-conversion tasks, two models, crude invalid inputs ("???", "abc", "--"). 33 tests
+  (`tests/test_apprendre_des_refus.py`), 54 code mutations all caught. Demo 42 (part 6); the builder's
+  « dynpro » preset. Dev-doc §11.14.
+- **The host can say "this input should have been refused": `report(..., correct=False, expected_refusal=True)`.**
+  A tool that ANSWERS an invalid input could only be told "wrong result", which asks for another result. `improve`
+  now requires the new version to refuse that input, and checks it. Found by a bench mutation the tests did not
+  catch.
+- **The generated-tools bench gains a fifth reaction and invalid inputs.** `improve_refusals`
+  (`improve(learn_from_refusals=True)`, the host saying nothing), and in every task inputs that are NOT valid
+  requests: a tool that answers one is counted (`accepted_invalid`). Two naive versions of level 1 now refuse
+  cleanly instead of crashing, as a real model's first tool does. 96 tests.
 
 - **`Agent(require_boundary=True)` — model-written code runs only behind a real boundary.** Requiring a boundary
   used to be said sandbox by sandbox (`make_sandbox(require_boundary=True)`), in three places. Without a sandbox
