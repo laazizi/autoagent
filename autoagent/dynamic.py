@@ -213,6 +213,13 @@ def _cas_resolu(appel: dict[str, Any], issue: str, valeur: Any, tolerance: float
 _REFUS_NON_JUGEABLES = ("refused", "rejected")
 # Combien d'entrées refusées « déjà examinées » le catalogue retient par outil (`learn_from_refusals`).
 _MAX_REFUS_EXAMINES = 200
+# La correction AUTOMATIQUE (`Agent.enable_dynamic_tools(auto_improve=…)`) : ce qui la déclenche, selon le mode, et
+# combien d'essais payants une même version d'outil reçoit au plus — au-delà, elle attend l'hôte.
+_DECLENCHEURS_AUTO = {"defects": ("exception", "timeout"),
+                      "refusals": ("exception", "timeout", "refused", "rejected")}
+_MAX_ESSAIS_AUTO = 2
+# Les statuts d'`improve` qui ont APPELÉ le modèle (les autres sont gratuits) : eux seuls comptent dans les plafonds.
+_A_APPELE_LE_MODELE = frozenset({"improved", "rejected", "build_failed", "nothing_gained"})
 
 
 def _cle_du_refus(appel: dict[str, Any]) -> str:
@@ -751,6 +758,7 @@ class DynamicToolBuilder:
         # THREAD (comme `_CanalDepense`) : deux créations en `parallel_tool_calls`
         # ne s'écrasent pas leur dépense.
         self._local = threading.local()
+        self._ameliorations_en_cours: set[str] = set()          # un seul `improve` automatique à la fois par outil
         if not _a_une_frontiere(self.sandbox):
             # Le SubprocessSandbox est un validateur AST + un `-I -S` : une liste
             # d'interdits, PAS une frontière d'isolation (son propre code le dit).
@@ -1054,6 +1062,9 @@ class DynamicToolBuilder:
         et peut le faire retirer : avant, une fonction de l'hôte refusée par la politique ou un bac en panne
         (un démon Docker arrêté) retiraient un outil sain au bout de `retire_after_errors` appels."""
         nom, ok, issue = str(appel.get("name")), bool(appel.get("ok")), str(appel.get("kind"))
+        # L'issue du dernier appel DE CE THREAD : la boucle de l'agent la lit juste après l'appel pour décider d'une
+        # correction automatique (`_ameliorer_apres_echec`). Par thread : deux appels en parallèle ne se mélangent pas.
+        self._local.derniere_issue = (nom, issue)
         masque = self._masquer(appel)
         with self._verrou:
             outils = self._lire_catalogue()
@@ -1530,6 +1541,45 @@ class DynamicToolBuilder:
         outil.host_functions = self.host_functions
         outil.verified_by = dict(verified)
         return outil
+
+    def _ameliorer_apres_echec(self, name: str, mode: str) -> tuple[str, ImprovementResult] | None:
+        """La correction AUTOMATIQUE, appelée par la boucle de l'agent juste après un appel raté de ``name``
+        (`Agent.enable_dynamic_tools(auto_improve=mode)`). Rend ``(issue, compte rendu)``, ou ``None`` si rien n'est
+        tenté : l'issue de l'appel (lue sur CE thread) n'est pas un déclencheur du mode, la version courante a déjà
+        reçu ses `_MAX_ESSAIS_AUTO` essais payants, ou un `improve` automatique tourne déjà sur cet outil. Toutes les
+        gardes d'`improve` restent : rien dans un run teinté, ni pour un outil en quarantaine ou qui appelle l'hôte."""
+        derniere = getattr(self._local, "derniere_issue", None)
+        self._local.derniere_issue = None
+        if derniere is None or derniere[0] != name or derniere[1] not in _DECLENCHEURS_AUTO[mode]:
+            return None
+        with self._verrou:
+            entree = self._lire_catalogue().get(name)
+            if entree is None or name in self._ameliorations_en_cours:
+                return None
+            version = str(entree.get("sha256") or "")[:12]
+            brut = entree.get("auto_improve")
+            essais: dict[str, Any] = brut if isinstance(brut, dict) else {}
+            if essais.get("version") == version and int(essais.get("attempts") or 0) >= _MAX_ESSAIS_AUTO:
+                return None
+            self._ameliorations_en_cours.add(name)
+        try:
+            rendu = self.improve(name, learn_from_refusals=(mode == "refusals"))
+        finally:
+            with self._verrou:
+                self._ameliorations_en_cours.discard(name)
+        if rendu.status in _A_APPELE_LE_MODELE and rendu.status != "improved":
+            # Un essai payé qui n'a rien installé : compté pour CETTE version. Une version installée par `improve`
+            # repart d'une entrée neuve du catalogue, donc de zéro.
+            with self._verrou:
+                outils = self._lire_catalogue()
+                courante = outils.get(name)
+                if courante is not None and str(courante.get("sha256") or "")[:12] == version:
+                    brut = courante.get("auto_improve")
+                    deja: dict[str, Any] = brut if isinstance(brut, dict) else {}
+                    n = int(deja.get("attempts") or 0) if deja.get("version") == version else 0
+                    courante["auto_improve"] = {"version": version, "attempts": n + 1}
+                    self._ecrire_catalogue(outils)
+        return derniere[1], rendu
 
     def rollback(self, name: str) -> bool:
         """Revient à la version d'AVANT la dernière amélioration (`improve`). ``True`` si c'est fait.

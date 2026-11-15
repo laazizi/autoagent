@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Automatic improvement during the run: `agent.enable_dynamic_tools(builder, auto_improve="defects" | "refusals")`.**
+  `improve` waited for the host to call it: a library tool that failed mid-run stayed as it was. Now the loop calls
+  `improve` right after the failure, under the same gate as the call (so with the run's taint). A proven new version
+  replaces the old one in the agent's registry and the failed call's result says so ("[autoagent] This tool has just
+  been improved…"), so the model can call it again. `"defects"`: after a crash or a timeout; `"refusals"`: also after
+  an unjudged refusal (`learn_from_refusals=True`, unverified reading). Never on a host or sandbox failure, never for
+  a host tool (a host tool is never replaced, even when a library tool has its name), never in a tainted run.
+  Bounds: `max_auto_improvements_per_run` paid attempts per run (1; a free `improve` does not count), two paid
+  attempts per tool version, one automatic `improve` at a time per tool; the spending enters `token_budget`. Trace
+  event `dynamic_tool_auto_improve`. Needs `DynamicToolBuilder(persist=True, record_calls=N)`; default `False`.
+  Measured on `deepseek-chat` (15 Nov 2026, Docker, the 8 bench tasks, an agent told to answer with the tool only):
+  8/8 with it, already 5/8 without — the agent often rewrites the input into the form the tool knows and calls it
+  again; the 3 others it answered "ECHEC". +38 points [+5; +60], p = 0.250: not settled (three tasks separate the
+  arms). About two thousand tokens per improvement. 39 tests (`tests/test_amelioration_auto.py`), 25 code
+  mutations all caught. Demo 42 (part 7); the builder's dynamic-tools block. Dev-doc §11.15.
+
 ## [0.28.0] - 2026-11-14
 
 ### Added

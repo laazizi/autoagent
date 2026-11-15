@@ -11,7 +11,14 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, NoReturn
 
 from .bounds import Bounds
-from .dynamic import DynamicToolBuilder, PythonRunner, ToolBuildRequest, _safe_tool_name
+from .dynamic import (
+    _A_APPELE_LE_MODELE,
+    DynamicToolBuilder,
+    PythonRunner,
+    ToolBuildRequest,
+    _safe_tool_name,
+    _somme,
+)
 from .errors import (
     AgentCancelled,
     ApprovalRequired,
@@ -749,6 +756,12 @@ class Agent:
         self.dynamic_builder: DynamicToolBuilder | None = None
         self._dynamic_tools_built_this_run = 0
         self._python_runs_this_run = 0
+        # La correction automatique des outils créés (`enable_dynamic_tools(auto_improve=…)`) : le mode, le plafond
+        # d'essais payants par run, et leur compte — sous verrou, car les appels peuvent tourner en parallèle.
+        self._auto_improve: str | None = None
+        self._max_auto_improvements = 1
+        self._auto_improvements_this_run = 0
+        self._verrou_auto = threading.Lock()
         self._consigne_code: str | None = None          # `enable_code_action(hint=True)` : voir render_system_prompt
         # Noms des outils ÉCRITS PAR LE MODÈLE : eux seuls peuvent être remplacés
         # par un nouvel outil généré (re-créer pour corriger). Un outil de l'hôte,
@@ -894,6 +907,8 @@ class Agent:
         builder: DynamicToolBuilder,
         *,
         host_functions: dict[str, Callable[..., Any]] | None = None,
+        auto_improve: str | bool = False,
+        max_auto_improvements_per_run: int = 1,
     ) -> None:
         """Active le méta-outil `create_python_tool`.
 
@@ -901,12 +916,31 @@ class Agent:
         générés via ``context["call_host"]`` (pont du bac à sable). Raccourci pour
         ``builder.host_functions`` — voir `DynamicToolBuilder`. Liste blanche, et
         chaque fonction tourne chez l'hôte sur des arguments choisis par le modèle.
+
+        ``auto_improve`` (main, non publié) : la correction AUTOMATIQUE d'un outil de la bibliothèque qui échoue
+        EN PLEIN RUN — la boucle lance `builder.improve` aussitôt, au lieu d'attendre que l'hôte le fasse.
+        ``"defects"`` : après un défaut de l'outil (plantage, délai dépassé). ``"refusals"`` : aussi après un refus
+        que personne n'a jugé (`improve(learn_from_refusals=True)` : ce que l'outil lit en plus n'est PAS vérifié).
+        Une version prouvée remplace l'ancienne dans le registre, et le résultat de l'appel raté le dit au modèle,
+        qui peut rappeler l'outil. Bornes : ``max_auto_improvements_per_run`` essais PAYANTS par run (1), deux par
+        version d'outil, rien dans un run teinté ; la dépense entre dans `token_budget`. Demande
+        ``DynamicToolBuilder(persist=True, record_calls=N)``. ``False`` (défaut) : rien ne change.
         """
+        if auto_improve is not False and auto_improve not in ("defects", "refusals"):
+            raise ValueError(f"auto_improve must be False, 'defects' or 'refusals', got {auto_improve!r}")
+        if auto_improve and not (getattr(builder, "persist", False) and getattr(builder, "record_calls", 0)):
+            raise ValueError("auto_improve needs DynamicToolBuilder(persist=True, record_calls=N): improve() learns "
+                             "from the call log")
+        if (isinstance(max_auto_improvements_per_run, bool) or not isinstance(max_auto_improvements_per_run, int)
+                or max_auto_improvements_per_run < 1):
+            raise ValueError(f"max_auto_improvements_per_run must be an integer >= 1, got {max_auto_improvements_per_run!r}")
         if self.require_boundary:
             builder._imposer_la_frontiere()              # avant tout : rien n'est à moitié configuré
         if host_functions is not None:
             builder.host_functions = dict(host_functions) or None
         self.dynamic_builder = builder
+        self._auto_improve = auto_improve if isinstance(auto_improve, str) else None
+        self._max_auto_improvements = max_auto_improvements_per_run
         canal = _CanalDepense()
 
         def create_python_tool(
@@ -1094,6 +1128,46 @@ class Agent:
                 continue                        # un sous-agent, nu ou enveloppé par l'hôte : sa dépense ne serait pas comptée
             fonctions[nom] = _par_le_registre(self.registry, spec)
         return fonctions
+
+    def _amelioration_auto(self, call: ToolCall, result: ToolResult, depense: dict[str, TokenUsage]) -> ToolResult:
+        """Après UN appel : si c'est un outil de la bibliothèque qui vient d'échouer et que `auto_improve` le
+        demande, `improve` tout de suite (`DynamicToolBuilder._ameliorer_apres_echec`). Une version installée
+        remplace l'ancienne dans le registre, et le résultat de l'appel raté le DIT au modèle. Rend le résultat
+        (inchangé, ou complété de cette note) ; la dépense va dans ``depense`` sous l'id de l'appel."""
+        builder = self.dynamic_builder
+        if self._auto_improve is None or builder is None or result.ok:
+            return result
+        if getattr(self.registry.handler_for(call.name), "recorder", None) != builder._noter_appel:
+            return result                                   # pas un outil de CETTE bibliothèque
+        with self._verrou_auto:                             # une place réservée dans le plafond du run
+            if self._auto_improvements_this_run >= self._max_auto_improvements:
+                return result
+            self._auto_improvements_this_run += 1
+        tentative = None
+        try:
+            tentative = builder._ameliorer_apres_echec(call.name, self._auto_improve)
+        finally:
+            if tentative is None or tentative[1].status not in _A_APPELE_LE_MODELE:
+                with self._verrou_auto:                     # gratuit, ou rien tenté : la place est rendue
+                    self._auto_improvements_this_run -= 1
+        if tentative is None:
+            return result
+        issue, rendu = tentative
+        if rendu.usage is not None:
+            depense[call.id] = rendu.usage
+        if rendu.status in _A_APPELE_LE_MODELE:
+            self._emit("dynamic_tool_auto_improve", {
+                "name": call.name, "trigger": issue, "status": rendu.status, "old_version": rendu.old_version,
+                "new_version": rendu.new_version, "fixed": rendu.fixed, "extended": rendu.extended,
+                "tokens": rendu.usage.total_tokens if rendu.usage is not None else None, "reason": rendu.reason[:200],
+            })
+        if rendu.status != "improved" or rendu.tool is None:
+            return result
+        self.registry.replace(rendu.tool.spec, rendu.tool)
+        self._dynamic_tool_names.add(rendu.tool.spec.name)
+        note = (f" [autoagent] This tool has just been improved after this failure (version {rendu.old_version} -> "
+                f"{rendu.new_version}); you can call it again.")
+        return ToolResult(ok=False, result=result.result, error=(result.error or "") + note)
 
     def _charger_bibliotheque(self, builder: DynamicToolBuilder) -> None:
         """Remet dans le registre les outils générés ACCEPTÉS lors de runs précédents
@@ -1806,6 +1880,7 @@ class Agent:
                            {"count": non_verifies, "mode": getattr(self.memory, "tainted_facts", "label")})
         self._dynamic_tools_built_this_run = 0
         self._python_runs_this_run = 0
+        self._auto_improvements_this_run = 0
         # Divulgation progressive : les outils déjà révélés sont RE-DÉRIVÉS du
         # transcript, pas gardés en mémoire d'instance. Un `resume` après une
         # pause d'approbation retrouve donc ce que le modèle avait chargé, sans
@@ -1957,6 +2032,9 @@ class Agent:
         # qu'elles lisaient en fermeture (transcript, teinte, témoin, snapshot).
         guards = TurnGuards(self, working_messages, context, taint, temoin, _snapshot)
         _policy_overrides = guards.policy
+        # Dépense des corrections automatiques d'outils, par appel : relevée dans `_timed` avec celle des sous-agents
+        # (une clé par appel : sans conflit entre threads en `parallel_tool_calls`).
+        depense_auto: dict[str, TokenUsage] = {}
 
         def _executer(call: ToolCall, step: int) -> Any:
             """L'UNIQUE chemin par lequel la boucle lance un outil (D1, `gate.py`).
@@ -1977,10 +2055,13 @@ class Agent:
                                             idempotent=bool(spec is not None and spec.idempotent))
                 with key_scope(cle), gate_scope(gate), _jeton_scope(cancel_token):
                     result = self.registry.execute(call, context=context)
+                    result = self._amelioration_auto(call, result, depense_auto)
                 journal.record_result(journal_run[0], call, result, tainted=gate.tainted_by_host)
             else:
                 with gate_scope(gate), _jeton_scope(cancel_token):
                     result = self.registry.execute(call, context=context)
+                    # Sous la MÊME porte : `improve` y lit la teinte du run (rien dans un run teinté).
+                    result = self._amelioration_auto(call, result, depense_auto)
             if gate.tainted_by_host:
                 guards.bridge_tainted.add(call.id)
             return result
@@ -2092,6 +2173,9 @@ class Agent:
                 # sur la fonction qui ENVELOPPE une délégation. Ne plus le lire rendait `token_budget`
                 # aveugle à ces délégations, sans erreur (constat du 12 nov. 2026).
                 delegue = canal.prendre() if canal is not None else _depense_par_l_ancien_canal(outil)
+                corrige = depense_auto.pop(call.id, None)
+                if corrige is not None:
+                    delegue = _somme([delegue, corrige])
                 return result, duration_ms, delegue
 
             if self.parallel_tool_calls and len(calls) > 1:

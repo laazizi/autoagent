@@ -4,7 +4,7 @@ L'agent ecrit l'outil qui lui manque (demo 06) et la bibliotheque le garde (`per
 vaut cet outil a l'usage ? Jusqu'ici on n'avait que des compteurs. Le carnet (`record_calls=N`, 0.28.0)
 note chaque appel : ce que l'outil a recu, l'issue, la cause, la duree, la version du code.
 
-Six choses a voir, sans cle (le « modele » qui ecrit les outils est scripte) :
+Sept choses a voir, sans cle (le « modele » qui ecrit les outils est scripte) :
 
   1. un outil a defaut plante sur une entree qu'il n'attendait pas : le carnet dit SUR QUOI ;
   2. une fonction de l'hote refusee par la politique n'est pas un defaut de l'outil : elle est comptee
@@ -19,7 +19,10 @@ Six choses a voir, sans cle (le « modele » qui ecrit les outils est scripte) :
   6. APPRENDRE D'UN REFUS, sans rien demander a l'hote (`improve(nom, learn_from_refusals=True)`) : un outil
      ecrit par un vrai modele refuse proprement ce qu'il ne sait pas lire, au lieu de planter - et un refus
      que personne n'a juge n'est pas un defaut. Le modele decide si l'entree refusee etait valide ; le code
-     prouve que rien de ce qui marchait ne change. Ce qu'il lit en plus est dit « non verifie ».
+     prouve que rien de ce qui marchait ne change. Ce qu'il lit en plus est dit « non verifie » ;
+  7. la correction AUTOMATIQUE, pendant le run (`enable_dynamic_tools(builder, auto_improve="refusals")`,
+     main, non publie) : l'outil refuse, la boucle lance `improve` aussitot, le resultat le dit au modele,
+     qui rappelle l'outil - et cette fois il repond. Plus besoin que l'application pense a le faire.
 
     python examples_autoagent/42_outils_surveilles.py
 """
@@ -304,6 +307,41 @@ def partie_6(dossier: Path) -> None:
     print("  " + constructeur.health("pourcentage").summary().splitlines()[0])
 
 
+def partie_7(dossier: Path) -> None:
+    print()
+    print("=" * 78)
+    print("7) La correction AUTOMATIQUE : l'agent n'attend plus l'application")
+    print("=" * 78)
+    demande = "Convertit un pourcentage ecrit comme 12% en fraction."
+    constructeur = DynamicToolBuilder(Scripte([_outil("pourcentage", demande, CODE_POURCENT, "texte"),
+                                               _outil("pourcentage", demande, CODE_POURCENT_ETENDU, "texte")]),
+                                      tools_dir=dossier, persist=True, record_calls=20)
+    outil = constructeur.build(ToolBuildRequest(capability=demande))
+    print(f"  Un outil de la bibliotheque : pourcentage('12%') -> {outil(texte='12%')}")
+    # Le modele de l'AGENT : il appelle l'outil, voit l'echec, le rappelle, puis repond.
+    agent = Agent(Scripte([_appel(1, "pourcentage", texte="80 pour cent"),
+                           _appel(2, "pourcentage", texte="80 pour cent"),
+                           LLMResponse(content="80 pour cent font 0.8.")]), max_steps=5)
+    agent.enable_dynamic_tools(constructeur, auto_improve="refusals")
+    resultat = agent.run("Que vaut 80 pour cent en fraction ?")
+    for message in resultat.messages:
+        if message.role == "tool":
+            contenu = json.loads(message.content)
+            if contenu["ok"]:
+                print(f"  appel {message.tool_call_id} -> {contenu['result']}")
+            else:
+                erreur, _, note = contenu["error"].partition(" [autoagent] ")
+                print(f"  appel {message.tool_call_id} -> REFUSE ({erreur[:50]})")
+                if note:
+                    print(f"      et la boucle a ajoute : « {note[:96]}... »")
+    print(f"  reponse de l'agent : {resultat.output}")
+    print("\n  Entre les deux appels, la boucle a lance improve(learn_from_refusals=True) : nouvelle version")
+    print("  installee dans le registre de l'agent, l'ancienne archivee. Bornes : un essai payant par run")
+    print("  (max_auto_improvements_per_run), deux par version d'outil, rien dans un run teinte ; la depense")
+    print("  compte dans token_budget. Ce que l'outil lit en plus reste « non verifie » :")
+    print("  " + constructeur.health("pourcentage").summary().splitlines()[0])
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         partie_1(Path(tmp) / "a")
@@ -311,6 +349,7 @@ if __name__ == "__main__":
         partie_3(Path(tmp) / "c")
         partie_5(partie_4(Path(tmp) / "d"))
         partie_6(Path(tmp) / "e")
+        partie_7(Path(tmp) / "f")
     print("\n  Limites : sans verdict de l'hote, un resultat faux reste « ok » - et il compte meme comme un cas")
     print("  REUSSI a ne pas changer. improve ne s'applique pas a un outil qui appelle des fonctions de l'hote")
     print("  (le rejouer referait des effets de bord). « Meme resultat qu'avant » prouve qu'on n'a rien casse,")

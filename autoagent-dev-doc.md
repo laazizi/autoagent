@@ -2298,6 +2298,55 @@ fois même si les seuls refus étaient légitimes. Rien n'appelle `improve` tout
 54 mutations du code, toutes attrapées. Démo 42 (partie 6) ; le preset « Outils dynamiques, version pro » du
 constructeur apprend des refus quand un outil n'a pas de défaut mais des entrées refusées.
 
+### 11.15 La correction automatique, pendant le run *(sur `main`, non publié)*
+
+Jusqu'ici `improve` attendait que l'application l'appelle : un outil de la bibliothèque qui échouait en plein run
+restait tel quel, et l'agent faisait avec. Maintenant la boucle peut corriger l'outil AUSSITÔT.
+
+```python
+constructeur = DynamicToolBuilder(provider, tools_dir="outils", persist=True, record_calls=50)
+agent.enable_dynamic_tools(constructeur, auto_improve="refusals")      # ou "defects" ; False par défaut
+```
+
+**Ce qui se passe.** Un outil de la bibliothèque échoue → la boucle lance `improve` tout de suite, sous la même
+porte que l'appel (donc avec la teinte du run). Si la nouvelle version est prouvée (§11.12, §11.14), elle remplace
+l'ancienne dans le registre de l'agent, et le résultat de l'appel raté se termine par : « [autoagent] This tool has
+just been improved after this failure (version … -> …); you can call it again. » Le modèle rappelle l'outil.
+
+- ``"defects"`` : après un défaut de l'outil (plantage, délai dépassé). Le seul niveau de preuve est celui
+  d'`improve` (cas ratés résolus, cas réussis inchangés).
+- ``"refusals"`` : aussi après un refus que personne n'a jugé (son propre refus, ou celui de son schéma) —
+  `improve(learn_from_refusals=True)` : ce que l'outil lit en plus n'est PAS vérifié (§11.14).
+- Une panne de l'hôte ou du bac, un outil de l'hôte, un appel réussi : rien. Un outil de l'hôte n'est JAMAIS
+  remplacé par un outil écrit par le modèle, même s'il porte le nom d'un outil de la bibliothèque (testé).
+
+**Les bornes.** ``max_auto_improvements_per_run`` essais PAYANTS par run (1 par défaut ; un `improve` gratuit — rien
+à corriger, entrée déjà examinée — ne compte pas) ; deux essais payants par version d'outil (`auto_improve` au
+catalogue ; une nouvelle version repart de zéro) ; un seul `improve` automatique à la fois sur un même outil (appels
+en parallèle) ; rien dans un run teinté ; la dépense entre dans `token_budget` et dans `resultat.usage`. Événement
+de trace `dynamic_tool_auto_improve` (`name`, `trigger`, `status`, versions, `fixed`, `extended`, `tokens`).
+Demande `DynamicToolBuilder(persist=True, record_calls=N)` : `improve` apprend du carnet.
+
+**Mesuré sur un vrai modèle** (`deepseek-chat`, 15 nov. 2026, dans Docker, 55 620 jetons). Pour chacune des 8
+tâches du banc (§11.13) : le modèle écrit le premier outil ; une écriture valide qu'il ne lit pas est choisie ; un
+agent (`deepseek-chat`, consigne : « réponds avec l'outil et lui seul, aucun calcul toi-même ») doit répondre avec
+CE même outil — sans puis avec `auto_improve="refusals"`. Juge en code : l'outil a rendu le bon résultat pendant le
+run.
+
+- **Avec la correction automatique : 8 tâches sur 8.** Les 8 fois, un essai, une version installée, et l'agent a
+  rappelé l'outil.
+- **Sans : déjà 5 sur 8.** L'agent contourne souvent le refus de lui-même : il RÉÉCRIT l'entrée sous la forme que
+  l'outil connaît (« 12,5 % » devient « 12.5% ») et rappelle l'outil. Les 3 autres fois (durée « 1:30 », montant
+  « 1.234,50 € », température « 68F »), il répond ECHEC.
+- La différence (+38 points [+5 ; +60]) n'est pas tranchée : p = 0,250 — trois tâches seulement séparent les
+  deux bras. Coût : 32 162 jetons pour les 8 runs avec, 15 275 sans — environ deux mille jetons par correction.
+- Ce que la mesure ne dit pas, et qui est une lecture : le contournement vaut pour UN appel, l'outil corrigé reste
+  corrigé pour les suivants. Huit tâches, un modèle, un essai par tâche.
+
+**Preuves.** `tests/test_amelioration_auto.py` (39 tests) ; 25 mutations du code, toutes attrapées. Démo 42
+(partie 7) ; option « correction automatique » du bloc Outils dynamiques du constructeur (preset « Outils
+dynamiques, version pro »).
+
 ---
 
 ## 12. Tests
