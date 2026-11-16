@@ -2249,6 +2249,13 @@ Ce que ça dit :
    c'est le prix, mesuré, de laisser le modèle décider de ce qui est valide. Avec l'attendu de l'hôte, aucune
    entrée invalide AJOUTÉE (au plafond de 24 000 comme sur DeepSeek), et des acceptations fautives RETIRÉES
    (« -3/20 », « LL » sur DeepSeek).
+   **Essayé, mesuré, retiré** (16 nov. 2026) : une phrase de plus dans la consigne des refus — « garde chaque
+   contrôle sur la VALEUR (plage, limite, ce qui est physiquement possible) et applique-le à la nouvelle écriture,
+   après conversion ». Rejouée sur le banc (rien et `improve_refusals`, 16 tâches) : Gemini a ENCORE accepté
+   « -500F » après correction ; sur DeepSeek c'est cette fois le premier outil qui l'acceptait, avant toute
+   réaction — la consigne n'a rien eu à empêcher. Aucun gain montré, donc la consigne n'est pas gardée (une limite
+   est du code, et une consigne ne reste que validée en réel). Ce qui protège vraiment : que l'hôte dise « il
+   fallait refuser » (`report(expected_refusal=True)`), ou qu'il valide lui-même les valeurs qui comptent.
 3. **Les premiers outils acceptaient déjà de l'invalide**, avant toute réaction : 8 entrées sur 64 sur DeepSeek,
    7 sur Gemini — un `telephone` qui répond à « abc » et à « -- », des dates impossibles (« 15/13/2026 »), une
    note de « -3/20 ». Rien de ce qui apprend tout seul ne les retire : il faut que l'hôte dise « il fallait
