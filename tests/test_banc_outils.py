@@ -39,10 +39,13 @@ PAR_NOM = {t.name: t for t in TOOL_TASKS}
 
 
 def _petite(nom: str, durs: set[str], suite: set[str]) -> ToolTask:
-    """Une tâche fournie, réduite : deux entrées faciles, les dures et les suivantes nommées (des tests rapides)."""
+    """Une tâche fournie, réduite : deux entrées faciles, les dures et les suivantes nommées (des tests rapides).
+    Les invalides communes seulement : la MÉCANIQUE du banc se vérifie sur elles ; les « presque justes » ont leurs
+    propres tests (`TestLesInvalidesPresqueJustes`)."""
     t = PAR_NOM[nom]
     return dataclasses.replace(t, easy=t.easy[:2], hard=tuple(c for c in t.hard if c[0] in durs),
-                               later=tuple(c for c in t.later if c[0] in suite))
+                               later=tuple(c for c in t.later if c[0] in suite),
+                               invalid=t.invalid[:1], later_invalid=t.later_invalid[:2])
 
 
 MINUTES = _petite("minutes_de", {"90 min"}, {"3h15", "45 min"})                 # le premier outil PLANTE
@@ -73,15 +76,21 @@ def _ligne(tache: str, arm: str, resolu: bool, *, essai: int = 1, statut: str = 
 # ---------------------------------------------------------------------------------------------------------
 
 class TestLesTachesFournies:
-    def test_huit_taches_aux_noms_distincts(self) -> None:
-        assert len(TOOL_TASKS) == 8 and len(PAR_NOM) == 8
+    def test_seize_taches_aux_noms_distincts(self) -> None:
+        assert len(TOOL_TASKS) == 16 and len(PAR_NOM) == 16
 
     @pytest.mark.parametrize("t", TOOL_TASKS, ids=lambda t: t.name)
     def test_une_entree_n_apparait_qu_une_fois(self, t: ToolTask) -> None:
         entrees = [texte for texte, _ in (*t.easy, *t.hard, *t.later)] + [*t.invalid, *t.later_invalid]
         assert len(set(entrees)) == len(entrees)                       # « suivantes » = jamais vues avant
         assert len(t.easy) >= 3 and len(t.hard) >= 3 and len(t.later) >= 5
-        assert t.invalid == ("???",) and t.later_invalid == ("abc", "--")
+        # Les invalides communes, puis celles « presque justes » de la tâche : une vue au carnet, deux jamais vues.
+        assert t.invalid[0] == "???" and len(t.invalid) == 2
+        assert t.later_invalid[:2] == ("abc", "--") and len(t.later_invalid) == 4
+
+    def test_les_resultats_ne_sont_pas_que_des_nombres(self) -> None:
+        formes = {type(attendu).__name__ for t in TOOL_TASKS for _texte, attendu in (*t.easy, *t.hard, *t.later)}
+        assert {"bool", "str", "list", "int", "float"} <= formes
 
     @pytest.mark.parametrize("t", TOOL_TASKS, ids=lambda t: t.name)
     def test_la_demande_ne_decrit_que_le_cas_facile(self, t: ToolTask) -> None:
@@ -228,7 +237,8 @@ class TestLeControlePositif:
         assert d["by_arm"]["improve"]["solved"] == 3 and len(d["rows"]) == 15
         assert d["rows"][2] == {"task": "minutes_de", "trial": 1, "arm": "improve", "status": "improved", "right": 2,
                                 "total": 2, "regressions": 0, "tokens": 150, "first_hard_right": 0, "hard_total": 1,
-                                "first_tokens": 150, "detail": "", "accepted_invalid": 0, "invalid_total": 2, "solved": True}
+                                "first_tokens": 150, "detail": "", "accepted_invalid": 0, "invalid_total": 2, "accepted_inputs": [],
+                                "solved": True}
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -389,6 +399,7 @@ class TestLesReactions:
         rien, devine = rapport.rows
         assert (rien.accepted_invalid, rien.invalid_total) == (0, 2)
         assert (devine.status, devine.right, devine.accepted_invalid, devine.invalid_total) == ("improved", 2, 2, 2)
+        assert (rien.accepted_inputs, devine.accepted_inputs) == ((), ("abc", "--"))
         assert rapport.by_arm()["improve_refusals"]["accepted_invalid"] == 2
         assert "2/2 invalide(s) acceptée(s)" in rapport.summary() and "0/2 invalide(s) acceptée(s)" in rapport.summary()
 
@@ -408,6 +419,24 @@ class TestLesReactions:
         rien, improve = rapport.rows
         assert (rien.accepted_invalid, rien.right) == (2, 1)
         assert (improve.status, improve.solved, improve.accepted_invalid) == ("improved", True, 0)
+
+    def test_les_invalides_presque_justes_voient_ce_que_les_communes_ne_voient_pas(self) -> None:
+        # Une correction LAXISTE : elle lit les nouvelles écritures, refuse le charabia… mais accepte « 14:75 ».
+        # Avec les seules invalides communes, le banc ne voit rien ; avec celles « presque justes », il la compte.
+        heure = PAR_NOM["minutes_depuis_minuit"]
+        laxiste = heure.full_code.replace(
+            "    if h > 23 or minutes > 59:\n        raise ValueError('invalid input: heure impossible')\n", "")
+        assert laxiste != heure.full_code
+        tache = dataclasses.replace(heure, easy=heure.easy[:2], hard=heure.hard[:1] + heure.hard[2:],
+                                    later=(heure.later[0], heure.later[2]), full_code=laxiste)
+        assert tache.invalid == ("???", "25:00") and tache.later_invalid == ("abc", "--", "14:75", "ab:cd")
+        communes = dataclasses.replace(tache, invalid=tache.invalid[:1], later_invalid=tache.later_invalid[:2])
+        for t, attendu, lesquelles in ((communes, (0, 2), ()), (tache, (1, 4), ("14:75",))):
+            (ligne,) = run_tool_bench(ScriptedToolProvider([t]), tasks=[t], arms=("improve_refusals",)).rows
+            assert (ligne.status, ligne.solved) == ("improved", True), ligne
+            assert (ligne.accepted_invalid, ligne.invalid_total) == attendu
+            assert ligne.accepted_inputs == lesquelles                  # LESQUELLES, pas seulement combien
+            assert ligne.to_dict()["accepted_inputs"] == lesquelles
 
     def test_rien_ne_reste_sur_le_disque(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("tempfile.tempdir", str(tmp_path))

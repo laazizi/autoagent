@@ -22,8 +22,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Measured on `deepseek-chat` (15 Nov 2026, Docker, the 8 bench tasks, an agent told to answer with the tool only):
   8/8 with it, already 5/8 without — the agent often rewrites the input into the form the tool knows and calls it
   again; the 3 others it answered "ECHEC". +38 points [+5; +60], p = 0.250: not settled (three tasks separate the
-  arms). About two thousand tokens per improvement. 39 tests (`tests/test_amelioration_auto.py`), 25 code
+  arms). About two thousand tokens per improvement. Re-measured on 16 Nov 2026 on the 16 bench tasks and two models,
+  with a FOLLOW-UP question (a new run, no automatic improvement on either side, on an input the first tool cannot
+  read): `deepseek-chat` 12/12 with vs 9/12 without, and at the follow-up the same scores but a third fewer tokens
+  (15 220 vs 22 570) and half the tool calls (12 vs 22); `gemini-3.7-flash` (24 000 output tokens) 7/8 with vs
+  0/8 without (it never rewrites the input), 7/8 vs 0/8 at the follow-up. Both together: +50 points [+28; +63],
+  p = 0.002 — established. Not tested: Anthropic (no key). 39 tests (`tests/test_amelioration_auto.py`), 25 code
   mutations all caught. Demo 42 (part 7); the builder's dynamic-tools block. Dev-doc §11.15.
+
+### Changed
+
+- **The generated-tools bench: sixteen tasks, and "almost right" invalid inputs.** `TOOL_TASKS` gains eight tasks
+  (speeds, yes/no, phone numbers, dates, Roman numerals, grades, fractions, colours) whose results are not only
+  numbers (a boolean, a string, a list). Each task now carries its own invalid inputs that LOOK like a request but
+  have no defensible reading ("25:00", "31/02/2026", "-300C", "3/0"), next to the common gibberish; the report says
+  WHICH ones got an answer (`ToolBenchRow.accepted_inputs`). Three naive level-1 versions gained a range check
+  (hour, month, temperature) so that these inputs are invalid for them too. Measured on 16 Nov 2026 (Docker, 16
+  tasks x 1 trial): `improve` with the host's expected result 15/16 on `deepseek-chat` and on `gemini-3.7-flash`
+  (24 000 output tokens); learning from refusals 14/16 and 15/16 against 3 and 7 doing nothing (p = 0.001 and
+  0.008); no input lost. The new inputs found a real, repeatable risk: in all three runs, learning from refusals
+  made the tool accept ONE invalid input the first tool refused — always "-500F" (below absolute zero), never seen
+  by the common gibberish. With the host's expected result, no invalid input added. The models' first tools
+  already accepted 8 and 7 invalid inputs out of 64 (a phone tool answering "abc"): only the host's "it should
+  have refused" removes those. Level 1: 16/16 vs 0, 0 invalid accepted. 146 tests. Dev-doc §11.13.
 
 ## [0.28.0] - 2026-11-14
 

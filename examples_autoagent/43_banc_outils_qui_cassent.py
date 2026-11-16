@@ -17,7 +17,7 @@ version complete. Il mesure le code du banc et de `improve` - jamais un modele. 
 POSITIF : `improve` doit y resoudre ce que « rien » ne resout pas, sinon le banc est aveugle.
 
     python examples_autoagent/43_banc_outils_qui_cassent.py           # 3 taches, une par sorte de casse
-    python examples_autoagent/43_banc_outils_qui_cassent.py --tout    # les 8 taches (plus long)
+    python examples_autoagent/43_banc_outils_qui_cassent.py --tout    # les 16 taches (plus long)
 
 Avec un vrai modele (niveau 2) : il ecrit vraiment les outils, derriere une vraie frontiere
 (le noyau sous Linux, sinon Docker) - un appel au modele par unite, plus un par reaction :
@@ -28,7 +28,7 @@ Avec un vrai modele (niveau 2) : il ecrit vraiment les outils, derriere une vrai
 `--plafond` : le plafond de sortie du constructeur (`max_build_tokens`). Un modele qui reflechit le depense
 avant d'ecrire l'outil - mesure sur Gemini : 7 861 jetons de reflexion sur 8 192, reponse coupee.
 
-Ce que ca ne dit pas : huit taches de conversion de texte, pas les outils en general. A
+Ce que ca ne dit pas : seize taches de conversion de texte, pas les outils en general. A
 temperature 0 les essais d'un meme modele se ressemblent : c'est le nombre de TACHES qui porte
 la preuve, pas le nombre d'essais.
 """
@@ -95,7 +95,7 @@ def niveau_1(tout: bool) -> None:
     comparaison = rapport.compare("rebuild", "improve")
     if comparaison["verdict"] == "indistinguishable":
         print(f"  Mais {len(taches)} taches ne suffisent pas a TRANCHER (p = {comparaison['p']:.3f} : « indistinguables ») :")
-        print("  c'est le nombre de taches qui porte la preuve. Lance --tout pour les huit.")
+        print("  c'est le nombre de taches qui porte la preuve. Lance --tout pour les seize.")
     restes = [r.task for r in rapport.rows if r.arm == "improve_unjudged" and r.status == "rejected"]
     if restes:
         print(f"  Sans verdict de l'hote, seul le PLANTAGE s'apprend. Ici : {', '.join(restes)}. Le premier outil y")
@@ -122,7 +122,7 @@ def niveau_2(essais: int, plafond: int) -> None:
     for r in rapport.rows:
         if r.detail and r.status in ("build_failed", "first_build_failed", "rejected"):
             print(f"  {r.task} / {r.arm} : {r.status} - {r.detail[:150]}")
-    print("\n  A lire avec ses limites : huit taches de conversion de texte, un seul modele, et des essais")
+    print("\n  A lire avec ses limites : seize taches de conversion de texte, un seul modele, et des essais")
     print("  qui se ressemblent a temperature 0. « Indistinguables » veut dire « pas tranche », pas « egaux ».")
 
 

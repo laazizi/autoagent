@@ -2156,16 +2156,18 @@ rapport.compare("rebuild", "improve")              # delta, low, high, p, verdic
 [r.detail for r in rapport.rows if r.detail]       # pourquoi une réaction n'a rien donné
 ```
 
-**Comment il juge.** Huit tâches fournies (`TOOL_TASKS` : durées, montants, pourcentages, tailles, heures,
-distances, mois, températures). Chacune est décrite par son cas facile — « Convertit une durée écrite comme 1h30
+**Comment il juge.** Seize tâches fournies (`TOOL_TASKS` : durées, montants, pourcentages, tailles, heures,
+distances, mois, températures — et, sur `main`, vitesses, oui/non, téléphones, dates, chiffres romains, notes,
+fractions, couleurs). Chacune est décrite par son cas facile — « Convertit une durée écrite comme 1h30
 en nombre de minutes » — et porte trois listes d'entrées, chacune avec son résultat attendu : `easy` (les
 premières), `hard` (d'autres écritures VALIDES qui arrivent ensuite : `"90 min"`, `"1:30"`), `later` (ce qui
 arrive APRÈS la réaction : jamais montré au modèle, jamais écrit au carnet). Le juge est du code (`same_result` :
 la valeur nue ou un objet à une clé, les nombres à 1e-9 près). Une UNITÉ (une tâche, un essai) est résolue quand
 TOUTES ses entrées `later` sont justes ; une entrée que le premier outil lisait et que la réaction a perdue est
-comptée à part (`regressions`). Chaque tâche porte aussi des entrées INVALIDES (`"???"` avec les premières,
-puis `"abc"` et `"--"`, jamais vues) : un outil qui leur répond par une valeur est compté
-(`accepted_invalid`). Deux réactions se comparent par la règle de `compare_configs` (§38), appariée par
+comptée à part (`regressions`). Chaque tâche porte aussi des entrées INVALIDES : du charabia commun (`"???"` avec
+les premières, puis `"abc"` et `"--"`, jamais vues) et, sur `main`, des entrées « presque justes » propres à la
+tâche (`"25:00"`, `"-300C"`…). Un outil qui leur répond par une valeur est compté (`accepted_invalid`, et
+lesquelles : `accepted_inputs`). Deux réactions se comparent par la règle de `compare_configs` (§38), appariée par
 tâche. Tout le code écrit par le modèle tourne dans le bac donné (`sandbox=`), le modèle ne peut s'accorder aucune
 permission, et rien ne reste sur le disque.
 
@@ -2212,13 +2214,61 @@ Ce que ça dit :
    `max_repairs` (au même plafond, la reprise rendrait la même réponse coupée). Avec 24 000 : 4 améliorations sur
    4, dont une a pris 17 793 jetons.
 
-**Ce que le banc ne dit pas.** Huit tâches de conversion de texte à un paramètre : pas les outils en général. Un
+**Seize tâches, et des entrées invalides « presque justes »** *(sur `main`, non publié — mesuré le 16 nov. 2026)*.
+Huit tâches de plus — vitesses, oui/non, téléphones, dates, chiffres romains, notes, fractions, couleurs — dont les
+résultats ne sont pas que des nombres (un booléen, un texte, une liste). Et, propres à chaque tâche, des entrées
+invalides qui ont la FORME d'une demande sans lecture défendable : « 25:00 », « 31/02/2026 », « -300C », « 3/0 »,
+« LL » en chiffres romains — une entrée vue au carnet, deux jamais vues, à côté du charabia commun. Le rapport dit
+désormais LESQUELLES ont reçu une réponse (`ToolBenchRow.accepted_inputs`), pas seulement combien. Un test le montre
+au niveau 1 : une correction LAXISTE (elle lit « 14h30 » mais accepte aussi « 14:75 ») passe inaperçue avec les
+seules invalides communes, et se voit avec les « presque justes ».
+
+Niveau 1 (le constructeur scripté) sur les seize tâches : `improve` 16 unités sur 16 contre 0 ; sans verdict 10 ; en
+apprenant des refus 14 (les deux valeurs fausses restent hors de portée) ; 0 entrée perdue, 0 invalide acceptée sur 64.
+
+Niveau 2, dans Docker, 16 tâches × 1 essai. Unités résolues sur 16 ; entre parenthèses, les entrées suivantes justes
+sur 80 :
+
+| modèle | le premier outil a cassé | `none` | `rebuild` | `improve` | `improve_unjudged` | `improve_refusals` | jetons |
+|---|---|---|---|---|---|---|---|
+| `deepseek-chat` | 13 unités sur 16 | 3 (54) | 5 (51) | **15** (79) | 3 (54) | **14** (77) | 98 667 |
+| `gemini-3.7-flash`, plafond de sortie 24 000 | 9 sur 16 | 7 (60) | 5 (55) | **15** (76) | 7 (60) | **15** (76) | 329 618 |
+| `gemini-3.7-flash`, plafond de sortie 8 192 | 8 sur 16 | 8 (61) | 5 (51) | 11 (67) | 8 (61) | 14 (74) | 263 109 |
+
+Ce que ça dit :
+
+1. **Les deux façons de corriger tiennent sur seize tâches.** Avec l'attendu de l'hôte : 15 unités sur 16 sur les
+   deux modèles. En apprenant des refus, sans rien de l'hôte : 14 et 15 — contre 3 et 7 sans rien faire. L'écart
+   avec « ne rien faire » est établi : +69 points [+43 ; +80], p = 0,001 sur DeepSeek ; +50 points [+26 ; +64],
+   p = 0,008 sur Gemini. Aucune entrée perdue par une correction. Refaire à l'aveugle reste inutile et risqué :
+   5 unités, et 7 et 6 entrées perdues.
+2. **Les « presque justes » ont trouvé un vrai risque, toujours le même.** Dans les trois passages, apprendre des
+   refus a fait accepter UNE entrée invalide que le premier outil refusait, et c'est la même : « -500F » pour
+   `celsius` — le modèle a appris à lire les degrés Fahrenheit sans vérifier qu'une température ne descend pas sous
+   le zéro absolu. Les invalides communes (« ??? », « abc ») ne l'auraient jamais vu. Une sur 64 par passage :
+   c'est le prix, mesuré, de laisser le modèle décider de ce qui est valide. Avec l'attendu de l'hôte, aucune
+   entrée invalide AJOUTÉE (au plafond de 24 000 comme sur DeepSeek), et des acceptations fautives RETIRÉES
+   (« -3/20 », « LL » sur DeepSeek).
+3. **Les premiers outils acceptaient déjà de l'invalide**, avant toute réaction : 8 entrées sur 64 sur DeepSeek,
+   7 sur Gemini — un `telephone` qui répond à « abc » et à « -- », des dates impossibles (« 15/13/2026 »), une
+   note de « -3/20 ». Rien de ce qui apprend tout seul ne les retire : il faut que l'hôte dise « il fallait
+   refuser » (`report(expected_refusal=True)`).
+4. **Le plafond de sortie compte encore.** À 8 192 jetons, 6 améliorations sur 16 de Gemini échouent, réponse
+   coupée par sa réflexion — le message le dit (« ran out of output tokens… Raise max_build_tokens ») ; à 24 000,
+   15 unités sur 16.
+
+Une réserve sur le banc lui-même : pour `couleur`, l'entrée commune « abc » peut se lire comme la couleur courte
+« #abc » sans son dièse. Elle est comptée invalide, et c'est la seule acceptation relevée pour `couleur` (le
+premier outil de DeepSeek et de Gemini à 24 000, une reconstruction et une amélioration de Gemini à 8 192).
+Corrigée après coup, elle changerait le banc après avoir vu le résultat : elle est laissée, et dite.
+
+**Ce que le banc ne dit pas.** Seize tâches de conversion de texte à un paramètre : pas les outils en général. Un
 essai par tâche — à température 0 les essais d'un même modèle se ressemblent, c'est le nombre de TÂCHES qui porte
-la preuve, et huit, c'est peu. Deux modèles. « Résolu » est strict ; la part d'entrées justes est donnée à côté.
+la preuve, et seize, c'est encore peu. Deux modèles (Anthropic non testé : pas de clé). « Résolu » est strict ; la part d'entrées justes est donnée à côté.
 Sur DeepSeek, `improve` coûte environ deux fois une reconstruction (≈ 2 040 jetons contre ≈ 1 060) : il porte le
 code et les cas.
 
-**Preuves.** `tests/test_banc_outils.py` (96 tests), `tests/test_plafond_du_constructeur.py` (15 tests) ;
+**Preuves.** `tests/test_banc_outils.py` (146 tests), `tests/test_plafond_du_constructeur.py` (15 tests) ;
 53 mutations du code, toutes attrapées. Démo 43 — dans la galerie du constructeur, avec sa sortie réelle.
 
 ### 11.14 Apprendre des refus — sans rien demander à l'hôte *(0.28.0)*
@@ -2290,11 +2340,11 @@ refuser », sur un outil à qui la demande disait de rendre 0 pour un texte illi
 
 **Ce que ça ne dit pas.** Huit tâches de conversion de texte, deux modèles, un essai par tâche. Les entrées
 invalides du banc sont grossières (« ??? », « abc », « -- ») : une entrée invalide qui RESSEMBLE à une demande
-valide n'est pas mesurée. La justesse de ce que l'outil lit en plus n'est mesurée qu'au banc (39 et 40 sur 40) : en
+valide n'était pas mesurée ici ; elle l'est depuis (§11.13, seize tâches : « -500F » accepté, une fois sur 64). La justesse de ce que l'outil lit en plus n'est mesurée qu'au banc (39 et 40 sur 40) : en
 production, personne ne la vérifie tant que l'hôte ne relit pas `extended_cases`. Un appel est payé la première
 fois même si les seuls refus étaient légitimes. Rien n'appelle `improve` tout seul.
 
-**Preuves.** `tests/test_apprendre_des_refus.py` (33 tests), `tests/test_banc_outils.py` (96 tests) ;
+**Preuves.** `tests/test_apprendre_des_refus.py` (33 tests), `tests/test_banc_outils.py` (146 tests) ;
 54 mutations du code, toutes attrapées. Démo 42 (partie 6) ; le preset « Outils dynamiques, version pro » du
 constructeur apprend des refus quand un outil n'a pas de défaut mais des entrées refusées.
 
@@ -2340,8 +2390,26 @@ run.
   « 1.234,50 € », température « 68F »), il répond ECHEC.
 - La différence (+38 points [+5 ; +60]) n'est pas tranchée : p = 0,250 — trois tâches seulement séparent les
   deux bras. Coût : 32 162 jetons pour les 8 runs avec, 15 275 sans — environ deux mille jetons par correction.
-- Ce que la mesure ne dit pas, et qui est une lecture : le contournement vaut pour UN appel, l'outil corrigé reste
-  corrigé pour les suivants. Huit tâches, un modèle, un essai par tâche.
+- Huit tâches, un modèle, un essai par tâche : la mesure suivante l'élargit.
+
+**Remesuré sur seize tâches et deux modèles** (16 nov. 2026, dans Docker), avec une question de plus : dans chaque
+bras, un NOUVEAU run, sans correction automatique des deux côtés, sur une entrée « suivante » que le premier outil
+ne lit pas — l'outil corrigé sert-il encore après le run qui l'a corrigé ?
+
+- **`deepseek-chat`** (12 tâches où le premier outil ratait une entrée dure) : 12 sur 12 avec, 9 sur 12 sans —
+  l'agent contourne encore souvent tout seul (p = 0,250). À la question suivante, même score, mais l'outil corrigé
+  coûte un tiers de jetons en moins (15 220 contre 22 570) et deux fois moins d'appels (12 contre 22) : sans lui,
+  l'agent refait le contournement à chaque fois.
+- **`gemini-3.7-flash`** (plafond 24 000, 8 tâches) : 7 sur 8 avec, **0 sur 8** sans — Gemini ne réécrit jamais
+  l'entrée ; quand l'outil refuse, il répond ECHEC (p = 0,016, établi). À la question suivante : 7 sur 8 contre 0.
+- **Les deux réunis** (20 tâches × modèle) : +50 points [+28 ; +63], p = 0,002 — établi. Ce que vaut l'option
+  dépend du modèle : utile pour un agent qui contourne, décisive pour un agent qui ne contourne pas.
+- **Le coût** : 48 691 jetons pour les 12 runs avec sur DeepSeek (23 331 sans), 59 879 pour les 8 de Gemini (9 956
+  sans) — la correction se paie une fois. Au plafond de 8 192, deux corrections de Gemini ont échoué faute de jetons
+  (environ dix mille jetons perdus chacune) : relever `max_build_tokens` pour un modèle qui réfléchit.
+- **Ce qui ne se déclenche pas, et c'est voulu** : un premier outil qui rend une valeur FAUSSE sans erreur (Gemini,
+  « 1 1/2 » → 5.5 au premier passage) n'est pas un échec pour la boucle. Seul l'hôte peut le dire (`report`).
+- Non testé : Anthropic (pas de clé) ; Kimi (compte suspendu faute de solde, réponse du fournisseur).
 
 **Preuves.** `tests/test_amelioration_auto.py` (39 tests) ; 25 mutations du code, toutes attrapées. Démo 42
 (partie 7) ; option « correction automatique » du bloc Outils dynamiques du constructeur (preset « Outils

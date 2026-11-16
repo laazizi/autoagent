@@ -13,15 +13,18 @@ Que faire ? Le banc compare cinq réactions, À PARTIR DU MÊME premier outil :
 Le juge est du CODE : chaque entrée d'une tâche porte son résultat attendu. Après la réaction, l'outil est essayé
 sur des entrées que rien n'a jamais vues (`ToolTask.later`) — ni le modèle, ni le carnet. Une UNITÉ (une tâche, un
 essai) est résolue quand toutes passent. Une entrée que le premier outil lisait et que la réaction a perdue est
-comptée à part (`regressions`). Chaque tâche porte aussi des entrées INVALIDES (`"???"`, puis `"abc"`, `"--"`
-jamais vues) : un outil qui se met à leur répondre est compté (`accepted_invalid`) — c'est le risque d'une
-réaction qui laisse le modèle décider de ce qui est valide.
+comptée à part (`regressions`). Chaque tâche porte aussi des entrées INVALIDES de deux sortes : du charabia
+commun à toutes (`"???"`, puis `"abc"`, `"--"` jamais vues), et des entrées « presque justes », propres à la tâche,
+qui ont la forme d'une demande sans lecture défendable (« 25:00 », « 2026-13-05 », « -300C », « 3/0 »). Un outil
+qui se met à leur répondre est compté (`accepted_invalid`) — c'est le risque d'une réaction qui laisse le modèle
+décider de ce qui est valide, et seules les « presque justes » voient une correction LAXISTE (testé).
 
 Deux niveaux, comme les autres bancs. Niveau 1 : `ScriptedToolProvider`, un « constructeur » scripté — il mesure le
 CODE du banc et de `improve`, hors ligne, sans jeton ; `positive_control_tools()` doit y voir `improve` résoudre ce
 que `none` ne résout pas, ou le banc est aveugle. Niveau 2 : un vrai fournisseur.
 
-Ce que le banc ne dit pas. Huit tâches de conversion de texte, à un paramètre : pas les outils en général. Les
+Ce que le banc ne dit pas. Seize tâches de conversion de texte, à un paramètre (résultats : nombres, booléen,
+texte, liste) : pas les outils en général. Les
 essais d'un même modèle à température 0 se ressemblent : c'est le nombre de TÂCHES qui porte la preuve, pas le
 nombre d'essais. « Résolu » est strict (toutes les entrées suivantes) ; la part d'entrées justes est donnée à côté.
 """
@@ -115,8 +118,9 @@ def same_result(expected: Any, got: Any, *, rel_tol: float = 1e-9) -> bool:
 # ── Les tâches fournies ──────────────────────────────────────────────────────
 # Chaque entrée n'a qu'une lecture défendable. Les versions naïve et complète sont vérifiées par les tests :
 # la naïve lit toutes les entrées faciles et AUCUNE des dures ; la complète les lit toutes. Les naïves cassent de
-# trois façons : la plupart PLANTENT, deux rendent une valeur FAUSSE (montant, minutes_depuis_minuit), et deux
-# REFUSENT proprement ce qu'elles ne lisent pas (metres, celsius) — ce que fait le premier outil d'un vrai modèle.
+# trois façons : la plupart PLANTENT, deux rendent une valeur FAUSSE (montant, minutes_depuis_minuit), et cinq
+# REFUSENT proprement ce qu'elles ne lisent pas (metres, celsius, telephone, note_sur_20, couleur) — ce que fait le
+# premier outil d'un vrai modèle.
 
 _MINUTES_NAIF = r"""
 import re
@@ -190,7 +194,10 @@ def run(args, context):
 _HEURE_NAIF = r"""
 def run(args, context):
     h, m = args['texte'].split(':')
-    return int(h) * 60 + int(m[:2])
+    h, m = int(h), int(m[:2])
+    if h > 23 or m > 59:
+        raise ValueError('invalid input: heure impossible')
+    return h * 60 + m
 """
 _HEURE = r"""
 import re
@@ -229,7 +236,10 @@ def run(args, context):
 
 _MOIS_NAIF = r"""
 def run(args, context):
-    return int(args['texte'].split('-')[1])
+    m = int(args['texte'].split('-')[1])
+    if not 1 <= m <= 12:
+        raise ValueError('invalid input: mois impossible')
+    return m
 """
 _MOIS = r"""
 MOIS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre',
@@ -237,24 +247,28 @@ MOIS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août
 
 def run(args, context):
     t = args['texte'].strip().lower()
+    numero = None
     try:
         if '-' in t:
-            return int(t.split('-')[1])
-        if '/' in t:
-            return int(t.split('/')[1])
+            numero = int(t.split('-')[1])
+        elif '/' in t:
+            numero = int(t.split('/')[1])
     except (ValueError, IndexError):
         raise ValueError('invalid input: date illisible')
-    for numero, nom in enumerate(MOIS, 1):
-        if nom in t.split():
-            return numero
-    raise ValueError('invalid input: date illisible')
+    if numero is None:
+        for i, nom in enumerate(MOIS, 1):
+            if nom in t.split():
+                numero = i
+    if numero is None or not 1 <= numero <= 12:
+        raise ValueError('invalid input: date illisible')
+    return numero
 """
 
 _CELSIUS_NAIF = r"""
 def run(args, context):
     t = args['texte']
     try:
-        if t.endswith('C'):
+        if t.endswith('C') and float(t[:-1]) >= -273.15:
             return float(t[:-1])
     except ValueError:
         pass
@@ -269,7 +283,190 @@ def run(args, context):
         v = float(t[:-1])
     except ValueError:
         raise ValueError('invalid input: temperature illisible')
-    return v if t[-1] == 'C' else (v - 32) * 5 / 9 if t[-1] == 'F' else v - 273.15
+    c = v if t[-1] == 'C' else (v - 32) * 5 / 9 if t[-1] == 'F' else v - 273.15
+    if c < -273.15 - 1e-9:
+        raise ValueError('invalid input: sous le zero absolu')
+    return c
+"""
+
+_VITESSE_NAIF = r"""
+def run(args, context):
+    return float(args['texte'].replace('km/h', ''))
+"""
+_VITESSE = r"""
+import re
+
+def run(args, context):
+    t = args['texte'].strip().lower().replace(',', '.')
+    m = re.fullmatch(r'(\d+(?:\.\d+)?)\s*(km/h|m/s|mph)', t)
+    if not m:
+        raise ValueError('invalid input: vitesse illisible')
+    v = float(m.group(1))
+    return v if m.group(2) == 'km/h' else v * 3.6 if m.group(2) == 'm/s' else v * 1.609344
+"""
+
+_OUI_NON_NAIF = r"""
+def run(args, context):
+    return {'oui': True, 'non': False}[args['texte'].strip().lower()]
+"""
+_OUI_NON = r"""
+import re
+
+def run(args, context):
+    t = re.sub(r'[\s!.?]+$', '', args['texte'].strip().lower())
+    if t in ('oui', 'yes'):
+        return True
+    if t in ('non', 'no'):
+        return False
+    raise ValueError('invalid input: ni oui ni non')
+"""
+
+_TELEPHONE_NAIF = r"""
+def run(args, context):
+    t = args['texte']
+    if len(t) != 10 or not t.isdigit() or t[0] != '0':
+        raise ValueError('invalid input: dix chiffres attendus, comme 0639981234')
+    return '+33' + t[1:]
+"""
+_TELEPHONE = r"""
+import re
+
+def run(args, context):
+    t = re.sub(r'[\s.\-]', '', args['texte'])
+    if t.startswith('+33'):
+        t = '0' + t[3:]
+    elif t.startswith('0033'):
+        t = '0' + t[4:]
+    if not re.fullmatch(r'0[1-9]\d{8}', t):
+        raise ValueError('invalid input: numero illisible')
+    return '+33' + t[1:]
+"""
+
+_DATE_NAIF = r"""
+import datetime
+
+def run(args, context):
+    j, m, a = args['texte'].split('/')
+    return datetime.date(int(a), int(m), int(j)).isoformat()
+"""
+_DATE = r"""
+import datetime
+import re
+
+MOIS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre',
+        'novembre', 'décembre']
+
+def run(args, context):
+    t = args['texte'].strip().lower()
+    m = re.fullmatch(r'(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{4})', t)
+    if m:
+        j, mois, a = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    else:
+        m = re.fullmatch(r'(\d{1,2})(?:er)?\s+(\S+)\s+(\d{4})', t)
+        if not m or m.group(2) not in MOIS:
+            raise ValueError('invalid input: date illisible')
+        j, mois, a = int(m.group(1)), MOIS.index(m.group(2)) + 1, int(m.group(3))
+    try:
+        return datetime.date(a, mois, j).isoformat()
+    except ValueError:
+        raise ValueError('invalid input: date impossible')
+"""
+
+_ROMAIN_COMMUN = r"""
+V = {'I': 1, 'V': 5, 'X': 10, 'L': 50, 'C': 100, 'D': 500, 'M': 1000}
+R = [(1000, 'M'), (900, 'CM'), (500, 'D'), (400, 'CD'), (100, 'C'), (90, 'XC'), (50, 'L'), (40, 'XL'), (10, 'X'),
+     (9, 'IX'), (5, 'V'), (4, 'IV'), (1, 'I')]
+
+def ecrire(n):
+    s = ''
+    for valeur, lettres in R:
+        while n >= valeur:
+            s += lettres
+            n -= valeur
+    return s
+"""
+_ROMAIN_NAIF = _ROMAIN_COMMUN + r"""
+def run(args, context):
+    t = args['texte']
+    total = sum(-V[a] if V[a] < V[b] else V[a] for a, b in zip(t, t[1:])) + V[t[-1]]
+    if ecrire(total) != t:
+        raise ValueError('invalid input: nombre romain non canonique')
+    return total
+"""
+_ROMAIN = _ROMAIN_COMMUN + r"""
+def run(args, context):
+    t = args['texte'].strip().upper()
+    if not t or any(c not in V for c in t):
+        raise ValueError('invalid input: pas un nombre romain')
+    total = sum(-V[a] if V[a] < V[b] else V[a] for a, b in zip(t, t[1:])) + V[t[-1]]
+    if ecrire(total) != t:
+        raise ValueError('invalid input: nombre romain non canonique')
+    return total
+"""
+
+_NOTE_NAIF = r"""
+def run(args, context):
+    t = args['texte']
+    if t.endswith('/20') and 0 <= float(t[:-3]) <= 20:
+        return float(t[:-3])
+    raise ValueError('invalid input: note sur 20 attendue, comme 15/20')
+"""
+_NOTE = r"""
+import re
+
+def run(args, context):
+    t = args['texte'].strip().replace(',', '.').replace(' ', '')
+    m = re.fullmatch(r'(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)', t)
+    if m and float(m.group(2)) > 0 and 0 <= float(m.group(1)) <= float(m.group(2)):
+        return float(m.group(1)) / float(m.group(2)) * 20
+    m = re.fullmatch(r'(\d+(?:\.\d+)?)%', t)
+    if m and float(m.group(1)) <= 100:
+        return float(m.group(1)) / 5
+    raise ValueError('invalid input: note illisible')
+"""
+
+_FRACTION_NAIF = r"""
+def run(args, context):
+    a, b = args['texte'].split('/')
+    return int(a) / int(b)
+"""
+_FRACTION = r"""
+import re
+
+UNICODE = {'½': 0.5, '¼': 0.25, '¾': 0.75, '⅓': 1 / 3, '⅔': 2 / 3, '⅛': 0.125}
+
+def run(args, context):
+    t = args['texte'].strip().replace('\u2044', '/')
+    if t in UNICODE:
+        return UNICODE[t]
+    m = re.fullmatch(r'(?:(\d+)\s+)?(\d+)\s*/\s*(\d+)', t)
+    if not m or int(m.group(3)) == 0:
+        raise ValueError('invalid input: fraction illisible')
+    return int(m.group(1) or 0) + int(m.group(2)) / int(m.group(3))
+"""
+
+_COULEUR_NAIF = r"""
+def run(args, context):
+    h = args['texte'].lstrip('#')
+    if len(h) != 6:
+        raise ValueError('invalid input: six chiffres hexadecimaux attendus, comme #FF8000')
+    return [int(h[i:i + 2], 16) for i in (0, 2, 4)]
+"""
+_COULEUR = r"""
+import re
+
+def run(args, context):
+    t = args['texte'].strip().lower()
+    m = re.fullmatch(r'#([0-9a-f]{3}|[0-9a-f]{6})', t)
+    if m:
+        h = m.group(1)
+        if len(h) == 3:
+            h = ''.join(c * 2 for c in h)
+        return [int(h[i:i + 2], 16) for i in (0, 2, 4)]
+    m = re.fullmatch(r'(?:rgb\()?\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)?', t)
+    if m and all(int(v) <= 255 for v in m.groups()):
+        return [int(v) for v in m.groups()]
+    raise ValueError('invalid input: couleur illisible')
 """
 
 _TACHES: tuple[ToolTask, ...] = (
@@ -278,54 +475,128 @@ _TACHES: tuple[ToolTask, ...] = (
         easy=(("1h30", 90), ("2h", 120), ("0h45", 45)),
         hard=(("90 min", 90), ("1 h 30", 90), ("1:30", 90)),
         later=(("3h15", 195), ("4h", 240), ("45 min", 45), ("2 h 05", 125), ("0:20", 20)),
-        naive_code=_MINUTES_NAIF, full_code=_MINUTES),
+        naive_code=_MINUTES_NAIF, full_code=_MINUTES,
+        invalid=("h45",), later_invalid=("1h30h", "1h30 2h")),
     ToolTask(
         "montant", "Convertit un montant écrit comme 1234.50 en nombre. Rend le nombre.",
         easy=(("1234.50", 1234.5), ("12", 12), ("0.99", 0.99)),
         hard=(("1 234,50", 1234.5), ("12,5", 12.5), ("1.234,50 €", 1234.5)),
         later=(("99.90", 99.9), ("7", 7), ("2 000,00", 2000), ("3,75 €", 3.75), ("10 000", 10000)),
-        naive_code=_MONTANT_NAIF, full_code=_MONTANT),
+        naive_code=_MONTANT_NAIF, full_code=_MONTANT,
+        invalid=("12.34.56",), later_invalid=("12..5", "12-50")),
     ToolTask(
         "pourcentage", "Convertit un pourcentage écrit comme 12% en fraction (12% donne 0.12). Rend le nombre.",
         easy=(("12%", 0.12), ("50%", 0.5), ("100%", 1.0)),
         hard=(("12,5 %", 0.125), ("0.5 pour cent", 0.005), ("7,5%", 0.075)),
         later=(("25%", 0.25), ("3%", 0.03), ("2,5 %", 0.025), ("80 pour cent", 0.8), ("0,5%", 0.005)),
-        naive_code=_POURCENT_NAIF, full_code=_POURCENT),
+        naive_code=_POURCENT_NAIF, full_code=_POURCENT,
+        invalid=("%%",), later_invalid=("12% de 50", "pour cent")),
     ToolTask(
         "octets", "Convertit une taille écrite comme 10MB en octets (1 KB = 1024 octets). Rend le nombre entier.",
         easy=(("10MB", 10485760), ("1KB", 1024), ("2GB", 2147483648)),
         hard=(("1.5 GB", 1610612736), ("512 kb", 524288), ("10 Mo", 10485760)),
         later=(("4MB", 4194304), ("3KB", 3072), ("0.5 MB", 524288), ("64 ko", 65536), ("2 Go", 2147483648)),
-        naive_code=_OCTETS_NAIF, full_code=_OCTETS),
+        naive_code=_OCTETS_NAIF, full_code=_OCTETS,
+        invalid=("GB",), later_invalid=("10XB", "10MBB")),
     ToolTask(
         "minutes_depuis_minuit",
         "Convertit une heure écrite comme 14:30 en minutes depuis minuit. Rend le nombre entier.",
         easy=(("14:30", 870), ("08:05", 485), ("00:00", 0)),
         hard=(("14h30", 870), ("2:30 PM", 870), ("9h", 540)),
         later=(("23:59", 1439), ("07:15", 435), ("7h45", 465), ("11:15 AM", 675), ("12:30 AM", 30)),
-        naive_code=_HEURE_NAIF, full_code=_HEURE),
+        naive_code=_HEURE_NAIF, full_code=_HEURE,
+        invalid=("25:00",), later_invalid=("14:75", "ab:cd")),
     ToolTask(
         "metres", "Convertit une distance écrite comme 5km en mètres. Rend le nombre.",
         easy=(("5km", 5000), ("12km", 12000), ("1km", 1000)),
         hard=(("2,5 km", 2500), ("800 m", 800), ("3 KM", 3000)),
         later=(("7km", 7000), ("20km", 20000), ("1,2 km", 1200), ("350 m", 350), ("0.5 Km", 500)),
-        naive_code=_METRES_NAIF, full_code=_METRES),
+        naive_code=_METRES_NAIF, full_code=_METRES,
+        invalid=("5km5km",), later_invalid=("5..2 km", "5 kmh")),
     ToolTask(
         "mois_de", "Rend le numéro du mois (1 à 12) d'une date écrite comme 2026-03-15.",
         easy=(("2026-03-15", 3), ("2025-12-01", 12), ("2026-07-31", 7)),
         hard=(("15/03/2026", 3), ("15 mars 2026", 3), ("mars 2026", 3)),
         later=(("2026-11-02", 11), ("2025-01-31", 1), ("25/12/2026", 12), ("1er août 2026", 8), ("février 2027", 2)),
-        naive_code=_MOIS_NAIF, full_code=_MOIS),
+        naive_code=_MOIS_NAIF, full_code=_MOIS,
+        invalid=("2026-13-05",), later_invalid=("2026-00-10", "32/13/2026")),
     ToolTask(
         "celsius", "Convertit une température écrite comme 20C en degrés Celsius. Rend le nombre.",
         easy=(("20C", 20), ("-5C", -5), ("36.6C", 36.6)),
         hard=(("68F", 20), ("20 °C", 20), ("273.15K", 0)),
         later=(("35C", 35), ("15C", 15), ("32 °F", 0), ("100 °C", 100), ("212F", 100)),
-        naive_code=_CELSIUS_NAIF, full_code=_CELSIUS),
+        naive_code=_CELSIUS_NAIF, full_code=_CELSIUS,
+        invalid=("-300C",), later_invalid=("-500F", "20X")),
+    # ── Huit tâches de plus, d'autres formes de résultat (booléen, texte, liste) ──
+    ToolTask(
+        "vitesse", "Lit une vitesse écrite comme 50km/h et la rend en km/h. Rend le nombre.",
+        easy=(("50km/h", 50), ("130km/h", 130), ("7.5km/h", 7.5)),
+        hard=(("10 m/s", 36), ("30 mph", 48.28032), ("13,5 km/h", 13.5)),
+        later=(("90km/h", 90), ("110km/h", 110), ("5 m/s", 18), ("60 mph", 96.56064), ("7,5 km/h", 7.5)),
+        naive_code=_VITESSE_NAIF, full_code=_VITESSE,
+        invalid=("80km",), later_invalid=("km/h/h", "50 km/h/h")),
+    ToolTask(
+        "oui_non", "Rend true pour une réponse écrite comme oui (et false pour non).",
+        easy=(("oui", True), ("non", False), ("Non", False)),
+        hard=(("yes", True), ("No", False), ("oui !", True)),
+        later=(("OUI", True), (" non ", False), ("Yes", True), ("NO", False), ("non.", False)),
+        naive_code=_OUI_NON_NAIF, full_code=_OUI_NON,
+        invalid=("peut-être",), later_invalid=("oui non", "nono")),
+    ToolTask(
+        "telephone",
+        "Normalise un numéro de téléphone français écrit comme 0639981234 au format +33639981234. Rend le texte.",
+        easy=(("0639981234", "+33639981234"), ("0199001234", "+33199001234"), ("0639985678", "+33639985678")),
+        hard=(("06 39 98 12 34", "+33639981234"), ("+33 6 39 98 12 34", "+33639981234"),
+              ("06.39.98.12.34", "+33639981234")),
+        later=(("0639981111", "+33639981111"), ("0199005678", "+33199005678"), ("01 99 00 12 34", "+33199001234"),
+               ("0033 6 39 98 56 78", "+33639985678"), ("06-39-98-11-11", "+33639981111")),
+        naive_code=_TELEPHONE_NAIF, full_code=_TELEPHONE,
+        invalid=("063998 123",), later_invalid=("1639981234", "06399812345")),
+    ToolTask(
+        "date_iso", "Convertit une date écrite comme 15/03/2026 au format 2026-03-15. Rend le texte.",
+        easy=(("15/03/2026", "2026-03-15"), ("01/12/2025", "2025-12-01"), ("31/07/2026", "2026-07-31")),
+        hard=(("15.03.2026", "2026-03-15"), ("15 mars 2026", "2026-03-15"), ("15-03-2026", "2026-03-15")),
+        later=(("25/12/2026", "2026-12-25"), ("1/2/2027", "2027-02-01"), ("2 avril 2026", "2026-04-02"),
+               ("7.7.2026", "2026-07-07"), ("1er mai 2026", "2026-05-01")),
+        naive_code=_DATE_NAIF, full_code=_DATE,
+        invalid=("31/02/2026",), later_invalid=("15/13/2026", "00/01/2026")),
+    ToolTask(
+        "romain", "Convertit un nombre romain écrit comme XIV en entier. Rend le nombre.",
+        easy=(("XIV", 14), ("III", 3), ("XX", 20)),
+        hard=(("xiv", 14), ("Mmxxvi", 2026), (" xii ", 12)),
+        later=(("XL", 40), ("MCMXCIV", 1994), ("ix", 9), ("cdxliv", 444), (" VII", 7)),
+        naive_code=_ROMAIN_NAIF, full_code=_ROMAIN,
+        invalid=("VX",), later_invalid=("LL", "IVI")),
+    ToolTask(
+        "note_sur_20", "Convertit une note écrite comme 15/20 en note sur 20. Rend le nombre.",
+        easy=(("15/20", 15), ("8/20", 8), ("12.5/20", 12.5)),
+        hard=(("7,5/10", 15), ("75%", 15), ("3/5", 12)),
+        later=(("18/20", 18), ("10/20", 10), ("4/5", 16), ("90%", 18), ("16,5/20", 16.5)),
+        naive_code=_NOTE_NAIF, full_code=_NOTE,
+        invalid=("25/20",), later_invalid=("15/0", "-3/20")),
+    ToolTask(
+        "fraction", "Convertit une fraction écrite comme 3/4 en nombre décimal. Rend le nombre.",
+        easy=(("3/4", 0.75), ("1/2", 0.5), ("5/8", 0.625)),
+        hard=(("1 1/2", 1.5), ("½", 0.5), ("3\u20444", 0.75)),
+        later=(("7/8", 0.875), ("9/10", 0.9), ("2 1/4", 2.25), ("¼", 0.25), ("1\u20443", 1 / 3)),
+        naive_code=_FRACTION_NAIF, full_code=_FRACTION,
+        invalid=("3/0",), later_invalid=("1/2/3", "/8")),
+    ToolTask(
+        "couleur", "Convertit une couleur écrite comme #FF8000 en liste [r, g, b] d'entiers. Rend la liste.",
+        easy=(("#FF8000", [255, 128, 0]), ("#000000", [0, 0, 0]), ("#ffffff", [255, 255, 255])),
+        hard=(("#F80", [255, 136, 0]), ("rgb(255, 128, 0)", [255, 128, 0]), ("255, 128, 0", [255, 128, 0])),
+        later=(("#123456", [18, 52, 86]), ("#00FF00", [0, 255, 0]), ("#abc", [170, 187, 204]),
+               ("rgb(0,0,255)", [0, 0, 255]), ("10, 20, 30", [10, 20, 30])),
+        naive_code=_COULEUR_NAIF, full_code=_COULEUR,
+        invalid=("#GG0000",), later_invalid=("#12345", "rgb(300, 0, 0)")),
 )
-# Les mêmes entrées invalides pour toutes les tâches : du texte qui n'est une demande pour aucune d'elles.
+# Deux sortes d'entrées invalides. Les mêmes pour toutes les tâches, du texte qui n'est une demande pour aucune
+# (`???`, puis `abc`, `--`) ; et, propres à chaque tâche, des entrées « presque justes » : elles ont la FORME d'une
+# demande mais aucune lecture défendable (« 25:00 », « 2026-13-05 », « -300C », « 3/0 ») — celles qu'une version qui
+# devine accepterait. Une de chaque sorte entre au carnet ; les autres ne sont jamais vues.
 TOOL_TASKS: tuple[ToolTask, ...] = tuple(
-    dataclasses.replace(tache, invalid=("???",), later_invalid=("abc", "--")) for tache in _TACHES)
+    dataclasses.replace(tache, invalid=("???", *tache.invalid), later_invalid=("abc", "--", *tache.later_invalid))
+    for tache in _TACHES)
 
 
 # ── Le niveau 1 : un constructeur scripté ────────────────────────────────────
@@ -395,6 +666,7 @@ class ToolBenchRow:
             l'erreur d'une construction refusée ; vide sinon.
         accepted_invalid, invalid_total: entrées INVALIDES jamais vues (`later_invalid`) auxquelles l'outil final
             a répondu par une valeur, sur combien. Il devait les refuser.
+        accepted_inputs: LESQUELLES — pour lire un `accepted_invalid` sans le deviner.
     """
 
     task: str
@@ -411,6 +683,7 @@ class ToolBenchRow:
     detail: str = ""
     accepted_invalid: int = 0
     invalid_total: int = 0
+    accepted_inputs: tuple[str, ...] = ()
 
     @property
     def solved(self) -> bool:
@@ -567,12 +840,12 @@ def _unite(provider: LLMProvider, task: ToolTask, essai: int, arms: tuple[str, .
                                   allowed_permissions=set(), max_repairs=max_repairs,
                                   max_build_tokens=max_build_tokens)
 
-    def noter(outil: GeneratedPythonTool) -> tuple[list[bool], int]:
+    def noter(outil: GeneratedPythonTool) -> tuple[list[bool], tuple[str, ...]]:
         """L'outil final sur ce qui arrive ensuite : les entrées valides (justes ?) et les invalides (acceptées ?)."""
         # Ces entrées ne doivent JAMAIS entrer au carnet : `improve` les verrait. L'outil ne sert plus qu'à être jugé.
         outil.recorder = None
         justes = [_juste(outil, {task.param: texte}, attendu) for texte, attendu in task.later]
-        return justes, sum(_repond(outil, {task.param: texte}) for texte in task.later_invalid)
+        return justes, tuple(texte for texte in task.later_invalid if _repond(outil, {task.param: texte}))
 
     with tempfile.TemporaryDirectory(prefix="autoagent_toolbench_", ignore_cleanup_errors=True) as tmp:
         racine = Path(tmp)
@@ -598,11 +871,13 @@ def _unite(provider: LLMProvider, task: ToolTask, essai: int, arms: tuple[str, .
         durs_lus = sum(bien_lu(texte, attendu) for texte, attendu in task.hard)
         reference = noter(premier)          # ce que le premier outil lit des entrées suivantes : le bras `none`
 
-        def ligne(arm: str, statut: str, note: tuple[list[bool], int], jetons: int, detail: str = "") -> ToolBenchRow:
+        def ligne(arm: str, statut: str, note: tuple[list[bool], tuple[str, ...]], jetons: int,
+                  detail: str = "") -> ToolBenchRow:
             justes, acceptees = note
             perdues = sum(1 for avant, apres in zip(reference[0], justes, strict=True) if avant and not apres)
             return ToolBenchRow(task.name, essai, arm, statut, sum(justes), len(justes), perdues, jetons, durs_lus,
-                                len(task.hard), jetons_du_premier, detail, acceptees, len(task.later_invalid))
+                                len(task.hard), jetons_du_premier, detail, len(acceptees), len(task.later_invalid),
+                                acceptees)
 
         def ameliorer(b: DynamicToolBuilder, arm: str, *, refus: bool = False) -> ToolBenchRow:
             resultat = b.improve(task.name, learn_from_refusals=refus)
@@ -644,7 +919,7 @@ def _unite(provider: LLMProvider, task: ToolTask, essai: int, arms: tuple[str, .
             try:
                 refait = autre.build(demande)
             except (ToolValidationError, ToolError) as exc:
-                lignes["rebuild"] = ligne("rebuild", "build_failed", ([False] * len(task.later), 0),
+                lignes["rebuild"] = ligne("rebuild", "build_failed", ([False] * len(task.later), ()),
                                           _jetons(autre.last_build_usage), _pourquoi(exc))
             else:
                 lignes["rebuild"] = ligne("rebuild", "rebuilt", noter(refait), _jetons(autre.last_build_usage))
