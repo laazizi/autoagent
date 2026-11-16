@@ -917,7 +917,7 @@ class Agent:
         ``builder.host_functions`` — voir `DynamicToolBuilder`. Liste blanche, et
         chaque fonction tourne chez l'hôte sur des arguments choisis par le modèle.
 
-        ``auto_improve`` (main, non publié) : la correction AUTOMATIQUE d'un outil de la bibliothèque qui échoue
+        ``auto_improve`` (0.29.0) : la correction AUTOMATIQUE d'un outil de la bibliothèque qui échoue
         EN PLEIN RUN — la boucle lance `builder.improve` aussitôt, au lieu d'attendre que l'hôte le fasse.
         ``"defects"`` : après un défaut de l'outil (plantage, délai dépassé). ``"refusals"`` : aussi après un refus
         que personne n'a jugé (`improve(learn_from_refusals=True)` : ce que l'outil lit en plus n'est PAS vérifié).

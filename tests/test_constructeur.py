@@ -172,7 +172,7 @@ ATTENDUS = {
                "if _fiche.defects:", "print(builder.improve(_fiche.name).summary())",
                # Apprendre aussi des refus (0.28.0) : sans défaut, mais avec des refus non jugés.
                "elif _fiche.refused_calls:", "builder.improve(_fiche.name, learn_from_refusals=True)",
-               # La correction automatique pendant le run (main, non publié).
+               # La correction automatique pendant le run (0.29.0).
                'enable_dynamic_tools(builder, auto_improve="refusals")'),
     "04": ("except TokenBudgetExceeded", "except MaxStepsExceeded", ".resume(borne.state"),
     "11": ("describe=describe", "on_refused=", "on_offtopic="),

@@ -527,7 +527,7 @@ _TACHES: tuple[ToolTask, ...] = (
         later=(("35C", 35), ("15C", 15), ("32 °F", 0), ("100 °C", 100), ("212F", 100)),
         naive_code=_CELSIUS_NAIF, full_code=_CELSIUS,
         invalid=("-300C",), later_invalid=("-500F", "20X")),
-    # ── Huit tâches de plus, d'autres formes de résultat (booléen, texte, liste) ──
+    # ── 0.29.0 : huit tâches de plus, d'autres formes de résultat (booléen, texte, liste) ──
     ToolTask(
         "vitesse", "Lit une vitesse écrite comme 50km/h et la rend en km/h. Rend le nombre.",
         easy=(("50km/h", 50), ("130km/h", 130), ("7.5km/h", 7.5)),

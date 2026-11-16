@@ -21,7 +21,7 @@ Sept choses a voir, sans cle (le « modele » qui ecrit les outils est scripte) 
      que personne n'a juge n'est pas un defaut. Le modele decide si l'entree refusee etait valide ; le code
      prouve que rien de ce qui marchait ne change. Ce qu'il lit en plus est dit « non verifie » ;
   7. la correction AUTOMATIQUE, pendant le run (`enable_dynamic_tools(builder, auto_improve="refusals")`,
-     main, non publie) : l'outil refuse, la boucle lance `improve` aussitot, le resultat le dit au modele,
+     0.29.0) : l'outil refuse, la boucle lance `improve` aussitot, le resultat le dit au modele,
      qui rappelle l'outil - et cette fois il repond. Plus besoin que l'application pense a le faire.
 
     python examples_autoagent/42_outils_surveilles.py

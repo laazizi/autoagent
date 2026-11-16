@@ -583,7 +583,7 @@ const DEFS = {
       {k:"ceil",    l:"permissions que le modèle peut s'accorder (plafond)", kind:"text", def:"", w:"half", hint:"ex. filesystem.*, network — VIDE = aucune. Sans plafond, le modèle choisit lui-même ses droits (réseau compris)."},
       {k:"persist", l:"bibliothèque persistante (réutiliser les outils d'un run à l'autre)", kind:"check", def:false},
       {k:"carnet",  l:"carnet d'appels : derniers appels gardés par outil (vide = aucun)", kind:"number", def:"", w:"half", hint:"0.28.0 — avec la bibliothèque persistante : note ce que chaque outil créé a reçu, l'issue (ok, exception, timeout, host, sandbox, rejected), la cause, la durée ; se relit par builder.calls(nom) et se résume par builder.health(nom) — la fiche de qualité ; builder.improve(nom) en tire une nouvelle version, gardée seulement si du code le prouve. Seuls les défauts de l'outil comptent contre lui. Le carnet peut contenir des données personnelles : passe redact= dans ton code."},
-      {k:"autoimp", l:"correction automatique pendant le run (auto_improve)", kind:"select", opts:["off","defects","refusals"], def:"off", w:"half", hint:"main, non publié — avec le carnet : un outil qui échoue en plein run est corrigé aussitôt (improve), et l'agent peut le rappeler. defects = après un plantage ; refusals = aussi après un refus (ce que l'outil lit en plus n'est pas vérifié). Un essai payant par run, deux par version, rien dans un run teinté"},
+      {k:"autoimp", l:"correction automatique pendant le run (auto_improve)", kind:"select", opts:["off","defects","refusals"], def:"off", w:"half", hint:"0.29.0 — avec le carnet : un outil qui échoue en plein run est corrigé aussitôt (improve), et l'agent peut le rappeler. defects = après un plantage ; refusals = aussi après un refus (ce que l'outil lit en plus n'est pas vérifié). Un essai payant par run, deux par version, rien dans un run teinté"},
       {k:"runpy",   l:"ajouter run_python (extrait de code éphémère, jamais gardé)", kind:"check", def:false},
       {k:"manifest", l:"manifest d'approbation (vide = pas de promotion)", kind:"text", def:"", hint:"ex. approved_tools.json — un outil généré tourne en NATIF seulement si son sha256 y est"},
     ],
@@ -863,7 +863,7 @@ const INFO = {
 const ENV = {gemini:"GEMINI_API_KEY", openai:"OPENAI_API_KEY", anthropic:"ANTHROPIC_API_KEY", deepseek:"DEEPSEEK_API_KEY", groq:"GROQ_API_KEY"};
 // Version de la lib que ce constructeur couvre. Le test headless la compare à
 // autoagent.__version__ : le constructeur ne peut plus prendre de retard en silence.
-const LIB_VERSION = "0.28.0";
+const LIB_VERSION = "0.29.0";
 // Modèle par défaut de chaque fournisseur : changer le provider sans
 // changer le modèle produisait `from_model("deepseek","gemini-…")`.
 const MODELE_DEFAUT = {gemini:"gemini-3.7-flash", openai:"gpt-4o-mini",

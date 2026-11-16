@@ -3,7 +3,7 @@
 > Référence technique complète pour intégrer, étendre et tester `autoagent` dans un projet Python.
 > **Public visé** : devs qui vont écrire des tools, brancher l'agent sur leur app, ou éventuellement contribuer à la lib.
 
-**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-11-14 · **Couvre autoagent** : 0.28.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
+**Auteur** : Mohamed LAAZIZI · **Équipe** : Alyce R&D · **Version** : 2026-11-16 · **Couvre autoagent** : 0.29.0 (publié sur PyPI : [`autoagent-core`](https://pypi.org/project/autoagent-core/))
 
 ---
 
@@ -2157,7 +2157,7 @@ rapport.compare("rebuild", "improve")              # delta, low, high, p, verdic
 ```
 
 **Comment il juge.** Seize tâches fournies (`TOOL_TASKS` : durées, montants, pourcentages, tailles, heures,
-distances, mois, températures — et, sur `main`, vitesses, oui/non, téléphones, dates, chiffres romains, notes,
+distances, mois, températures — et, depuis la 0.29.0, vitesses, oui/non, téléphones, dates, chiffres romains, notes,
 fractions, couleurs). Chacune est décrite par son cas facile — « Convertit une durée écrite comme 1h30
 en nombre de minutes » — et porte trois listes d'entrées, chacune avec son résultat attendu : `easy` (les
 premières), `hard` (d'autres écritures VALIDES qui arrivent ensuite : `"90 min"`, `"1:30"`), `later` (ce qui
@@ -2165,7 +2165,7 @@ arrive APRÈS la réaction : jamais montré au modèle, jamais écrit au carnet)
 la valeur nue ou un objet à une clé, les nombres à 1e-9 près). Une UNITÉ (une tâche, un essai) est résolue quand
 TOUTES ses entrées `later` sont justes ; une entrée que le premier outil lisait et que la réaction a perdue est
 comptée à part (`regressions`). Chaque tâche porte aussi des entrées INVALIDES : du charabia commun (`"???"` avec
-les premières, puis `"abc"` et `"--"`, jamais vues) et, sur `main`, des entrées « presque justes » propres à la
+les premières, puis `"abc"` et `"--"`, jamais vues) et, depuis la 0.29.0, des entrées « presque justes » propres à la
 tâche (`"25:00"`, `"-300C"`…). Un outil qui leur répond par une valeur est compté (`accepted_invalid`, et
 lesquelles : `accepted_inputs`). Deux réactions se comparent par la règle de `compare_configs` (§38), appariée par
 tâche. Tout le code écrit par le modèle tourne dans le bac donné (`sandbox=`), le modèle ne peut s'accorder aucune
@@ -2214,7 +2214,7 @@ Ce que ça dit :
    `max_repairs` (au même plafond, la reprise rendrait la même réponse coupée). Avec 24 000 : 4 améliorations sur
    4, dont une a pris 17 793 jetons.
 
-**Seize tâches, et des entrées invalides « presque justes »** *(sur `main`, non publié — mesuré le 16 nov. 2026)*.
+**Seize tâches, et des entrées invalides « presque justes »** *(0.29.0 — mesuré le 16 nov. 2026)*.
 Huit tâches de plus — vitesses, oui/non, téléphones, dates, chiffres romains, notes, fractions, couleurs — dont les
 résultats ne sont pas que des nombres (un booléen, un texte, une liste). Et, propres à chaque tâche, des entrées
 invalides qui ont la FORME d'une demande sans lecture défendable : « 25:00 », « 31/02/2026 », « -300C », « 3/0 »,
@@ -2355,7 +2355,7 @@ fois même si les seuls refus étaient légitimes. Rien n'appelle `improve` tout
 54 mutations du code, toutes attrapées. Démo 42 (partie 6) ; le preset « Outils dynamiques, version pro » du
 constructeur apprend des refus quand un outil n'a pas de défaut mais des entrées refusées.
 
-### 11.15 La correction automatique, pendant le run *(sur `main`, non publié)*
+### 11.15 La correction automatique, pendant le run *(0.29.0)*
 
 Jusqu'ici `improve` attendait que l'application l'appelle : un outil de la bibliothèque qui échouait en plein run
 restait tel quel, et l'agent faisait avec. Maintenant la boucle peut corriger l'outil AUSSITÔT.
@@ -2736,7 +2736,7 @@ Passe un `post_turn_hook` (§4.7) qui regarde `ctx.tool_calls` et retourne un `M
 
 ### Annexe A — Liste des fichiers de la lib
 
-*(vérifiée contre le disque sur `main` à la 0.28.0 — `autoagent/` : 37 modules + `__init__.py` ; `providers/` : 6 modules + `__init__.py`)*
+*(vérifiée contre le disque sur `main` à la 0.29.0 — `autoagent/` : 37 modules + `__init__.py` ; `providers/` : 6 modules + `__init__.py`)*
 
 ```
 autoagent/
